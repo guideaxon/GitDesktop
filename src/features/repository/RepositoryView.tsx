@@ -114,6 +114,7 @@ import { InsightsPanel } from "./insights/InsightsPanel";
 import { OpRecoveryBanner } from "./OpRecoveryBanner";
 import { PrCreateBanner } from "./PrCreateBanner";
 import { RepoHeader } from "./RepoHeader";
+import { useAutoSwitchGhAccount } from "./useAutoSwitchGhAccount";
 import { usePrNotifications } from "./usePrNotifications";
 import { useRepoVisibilityProbe } from "./useRepoVisibilityProbe";
 import { WorktreeRemovalBanner } from "./WorktreeRemovalBanner";
@@ -443,6 +444,7 @@ export function RepositoryView() {
   const headLabel = branchHead?.detached
     ? `detached @ ${branchHead.oid?.slice(0, 7) ?? "?"}`
     : currentName;
+  useAutoSwitchGhAccount(repoPath ?? null);
   const gh = useForgeStatus(repoPath ?? "");
   // Palette create actions: discussion stays a GitHub-only write; the issue /
   // PR / release creates follow their per-action forge flags (GitHub + GitLab).

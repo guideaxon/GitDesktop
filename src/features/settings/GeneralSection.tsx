@@ -89,6 +89,25 @@ export const GeneralSection = withForm({
           </p>
         </div>
         <div className="space-y-1.5">
+          <form.AppField name="autoSwitchGhAccount">
+            {(field) => (
+              <field.CheckboxField
+                label="Switch GitHub account to match the repository"
+                className="flex cursor-pointer items-center gap-2 text-xs"
+              />
+            )}
+          </form.AppField>
+          <p className="text-xs text-muted-foreground">
+            When you open a repository whose Git config sets{" "}
+            <span className="font-mono">credential.username</span> for GitHub
+            (for example through an <span className="font-mono">includeIf</span>{" "}
+            block per folder), GitDesktop makes the matching account active in
+            the GitHub CLI. The switch applies to the CLI everywhere, not just
+            this repository, and only accounts the CLI is already signed in to
+            are used.
+          </p>
+        </div>
+        <div className="space-y-1.5">
           <form.AppField name="autoFetch">
             {(field) => (
               <field.CheckboxField

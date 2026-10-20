@@ -4,7 +4,11 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { LanguageModel } from "ai";
 import { createOllama } from "ollama-ai-provider-v2";
 import { guardedFetch } from "./guarded-fetch";
-import { GOOGLE_AI_STUDIO_BASE_URL, OLLAMA_CLOUD_HOST } from "./providers";
+import {
+  GOOGLE_AI_STUDIO_BASE_URL,
+  localServerApiRoot,
+  OLLAMA_CLOUD_HOST,
+} from "./providers";
 import type { AiSettings } from "./types";
 
 // All providers go through `guardedFetch` (guarded-fetch.ts) — the Tauri fetch
@@ -59,6 +63,15 @@ export function createModel(
         headers: { Authorization: `Bearer ${apiKey ?? ""}` },
         fetch,
       })(settings.model);
+    case "lm-studio":
+    case "unsloth":
+      // Local OpenAI-compatible server; `.chat()` for the same reason as
+      // `openai-compatible`. The key is a placeholder — these servers ignore it.
+      return createOpenAI({
+        baseURL: localServerApiRoot(settings.provider, settings),
+        apiKey: "local",
+        fetch,
+      }).chat(settings.model);
     case "claude-cli":
     case "codex-cli":
     case "copilot-cli":

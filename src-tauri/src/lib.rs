@@ -562,6 +562,7 @@ pub fn run() {
             forge::forge_bb_environments,
             github::pr::gh_accounts,
             github::pr::gh_switch_account,
+            github::pr::gh_repo_credential_username,
             github::pr::gh_list_repos,
             github::pr::gh_pr_minimize_comment,
             github::pr::gh_pr_unminimize_comment,

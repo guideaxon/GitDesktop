@@ -117,6 +117,14 @@ export const ghAccounts = () => invoke<GhAccounts>("gh_accounts");
 export const ghSwitchAccount = (host: string, login: string) =>
   invoke<void>("gh_switch_account", { host, login });
 
+/** The GitHub username this repo's Git config pins for its host
+ *  (`credential.https://<host>.username`, includeIf files included); null when none. */
+export const ghRepoCredentialUsername = (repoPath: string) =>
+  invoke<{ host: string; username: string } | null>(
+    "gh_repo_credential_username",
+    { repoPath },
+  );
+
 /** The active gh token's OAuth scopes (for "needs gh auth refresh -s …" hints). */
 export const ghTokenScopes = (host?: string) =>
   invoke<GhScopes>("gh_token_scopes", { host: host ?? null });

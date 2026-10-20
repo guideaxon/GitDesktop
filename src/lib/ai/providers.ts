@@ -8,6 +8,8 @@ export const PROVIDER_LABELS: Record<AiProviderId, string> = {
   openrouter: "OpenRouter",
   ollama: "Ollama (local)",
   "ollama-cloud": "Ollama Cloud",
+  "lm-studio": "LM Studio (local)",
+  unsloth: "Unsloth (local)",
   "claude-cli": "Claude Code (CLI)",
   "codex-cli": "Codex (CLI)",
   "copilot-cli": "GitHub Copilot (CLI)",
@@ -90,6 +92,33 @@ export const OPENAI_COMPATIBLE_PRESETS: OpenAiCompatiblePreset[] = [
   },
 ];
 
+/** Local OpenAI-compatible servers: no key, models listed at `<root>/v1/models`. */
+export type LocalServerProviderId = "lm-studio" | "unsloth";
+
+export const LOCAL_SERVER_DEFAULT_URLS: Record<LocalServerProviderId, string> =
+  {
+    "lm-studio": "http://localhost:1234",
+    unsloth: "http://localhost:8888",
+  };
+
+export const isLocalServerProvider = (
+  id: AiProviderId,
+): id is LocalServerProviderId => id === "lm-studio" || id === "unsloth";
+
+/** The `/v1` API root for a local-server provider; tolerates a typed trailing
+ *  slash or `/v1`. */
+export function localServerApiRoot(
+  provider: LocalServerProviderId,
+  settings: { lmStudioBaseUrl?: string; unslothBaseUrl?: string },
+): string {
+  const typed =
+    (provider === "lm-studio"
+      ? settings.lmStudioBaseUrl
+      : settings.unslothBaseUrl
+    )?.trim() || LOCAL_SERVER_DEFAULT_URLS[provider];
+  return `${typed.replace(/\/+$/, "").replace(/\/v1$/, "")}/v1`;
+}
+
 export const PROVIDERS_REQUIRING_KEY: AiProviderId[] = [
   "anthropic",
   "openai",
@@ -117,7 +146,7 @@ export const isCliProvider = (id: AiProviderId): boolean =>
  *  or local Ollama inference — rather than a cloud HTTP API. Concurrency for
  *  these is bound by the machine, not a provider rate limit. */
 export const isLocalProvider = (id: AiProviderId): boolean =>
-  isCliProvider(id) || id === "ollama";
+  isCliProvider(id) || id === "ollama" || isLocalServerProvider(id);
 
 export const ALL_PROVIDER_IDS = Object.keys(PROVIDER_LABELS) as AiProviderId[];
 
@@ -139,6 +168,10 @@ export const MODEL_SUGGESTIONS: Record<AiProviderId, string[]> = {
   ],
   ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
   "ollama-cloud": ["gpt-oss:120b", "qwen3-coder:480b", "deepseek-v3.1:671b"],
+  // LM Studio's head is the stamped default on a provider switch; a blank model
+  // is auto-detected from `/v1/models` at run time (see `resolveLocalModel`).
+  "lm-studio": ["qwen/qwen3.6-35b-a3b"],
+  unsloth: [],
   // CLI model aliases passed straight to `claude --model`.
   "claude-cli": ["sonnet", "opus", "haiku", "fable"],
   // Codex ids are plan-specific (they depend on the ChatGPT plan), so none is a

@@ -2,6 +2,7 @@ import { type UseQueryResult, useQuery } from "@tanstack/react-query";
 import { getSecret } from "@/lib/git/api";
 import { type AgentKind, kindProvider, listAgentModels } from "./agent";
 import { guardedFetch } from "./guarded-fetch";
+import { listLocalServerModels } from "./local-server";
 import { providerErrorMessage } from "./provider-error";
 import {
   GOOGLE_AI_STUDIO_BASE_URL,
@@ -219,6 +220,9 @@ async function fetchProviderModels(
       });
       return shaped(() => catalogIds(json.data, "id").sort());
     }
+    case "lm-studio":
+    case "unsloth":
+      return (await listLocalServerModels(settings, allowedHosts)).sort();
     case "claude-cli":
       // Claude Code has no catalog command; its static aliases are used.
       return [];
@@ -254,6 +258,8 @@ export function useAvailableModels(
       keySaved,
       settings.ollamaBaseUrl,
       settings.openaiCompatibleBaseUrl,
+      settings.lmStudioBaseUrl ?? null,
+      settings.unslothBaseUrl ?? null,
       allowedHosts ?? [],
       settings.cliPath ?? null,
     ] as const,

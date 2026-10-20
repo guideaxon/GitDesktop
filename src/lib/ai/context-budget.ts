@@ -146,6 +146,8 @@ export async function resolveBudgetProfile(
   const baseUrls: Partial<Record<AiProviderId, string>> = {
     ollama: ai.ollamaBaseUrl,
     "openai-compatible": ai.openaiCompatibleBaseUrl,
+    "lm-studio": ai.lmStudioBaseUrl,
+    unsloth: ai.unslothBaseUrl,
   };
   const baseUrl = baseUrls[ai.provider] ?? "";
   const cacheKey = `${ai.provider}#${ai.model}#${baseUrl}`;
@@ -183,6 +185,8 @@ async function resolveAutoProfile(
       // ≈ 75-90K tokens — a deliberate cost ceiling well inside the smallest of them.
       return scaledProfile(3);
     case "openai-compatible":
+    case "lm-studio":
+    case "unsloth":
       // Could be a local llama.cpp server behind an OpenAI-compatible endpoint;
       // no reliable window probe, so stay conservative.
       return scaledProfile(1);

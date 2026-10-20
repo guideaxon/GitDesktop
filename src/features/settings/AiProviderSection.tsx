@@ -54,6 +54,9 @@ import {
   GENERATION_PROVIDER_IDS,
   GOOGLE_AI_STUDIO_KEYS_URL,
   isCliProvider,
+  isLocalServerProvider,
+  LOCAL_SERVER_DEFAULT_URLS,
+  type LocalServerProviderId,
   OPENAI_COMPATIBLE_PRESETS,
   PROVIDER_LABELS,
   PROVIDERS_REQUIRING_KEY,
@@ -229,7 +232,10 @@ function ModelPicker({
             id={`${idPrefix}-model`}
             className="w-full"
             placeholder={
-              defaultModelForProvider(value.provider) || "Account default"
+              defaultModelForProvider(value.provider) ||
+              (isLocalServerProvider(value.provider)
+                ? "Auto-detect from server"
+                : "Account default")
             }
             onFocus={() => setModelsWanted(true)}
           />
@@ -420,6 +426,53 @@ function OllamaConfig({
   );
 }
 
+/** Server-URL field for LM Studio / Unsloth. Models are read from `<url>/v1/models`;
+ *  a blank model field uses the first one the server lists. */
+function LocalServerConfig({
+  idPrefix,
+  value,
+  provider,
+  onChange,
+  allowedHosts,
+  onAllowHost,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  provider: LocalServerProviderId;
+  onChange: (next: AiSettings) => void;
+  allowedHosts: string[];
+  onAllowHost: (url: string) => void;
+}) {
+  const field = provider === "lm-studio" ? "lmStudioBaseUrl" : "unslothBaseUrl";
+  const url = value[field] ?? "";
+  const effective = url.trim() || LOCAL_SERVER_DEFAULT_URLS[provider];
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={`${idPrefix}-local-url`}>
+        {PROVIDER_LABELS[provider]} URL
+      </Label>
+      <Input
+        id={`${idPrefix}-local-url`}
+        autoComplete="off"
+        placeholder={LOCAL_SERVER_DEFAULT_URLS[provider]}
+        value={url}
+        onChange={(e) => onChange({ ...value, [field]: e.target.value })}
+      />
+      <HostAllowNote
+        url={effective}
+        allowedHosts={allowedHosts}
+        onAllowHost={onAllowHost}
+        defaultNote={
+          <>
+            Models are read from <code className="font-mono">/v1/models</code>.
+            Leave the model blank to use the first one the server lists.
+          </>
+        }
+      />
+    </div>
+  );
+}
+
 /**
  * Base-URL + preset picker for the `openai-compatible` provider. Choosing a preset
  * fills the base URL (and a default model); the URL stays editable for any other
@@ -530,6 +583,18 @@ function ProviderUrlConfig({
       <OllamaConfig
         idPrefix={idPrefix}
         value={value}
+        onChange={onChange}
+        allowedHosts={allowedHosts}
+        onAllowHost={onAllowHost}
+      />
+    );
+  }
+  if (isLocalServerProvider(value.provider)) {
+    return (
+      <LocalServerConfig
+        idPrefix={idPrefix}
+        value={value}
+        provider={value.provider}
         onChange={onChange}
         allowedHosts={allowedHosts}
         onAllowHost={onAllowHost}
@@ -733,7 +798,12 @@ export const AiProviderSection = withForm({
       ai.provider,
       reviewAi.provider,
       securityReviewAi?.provider,
-    ].some((p) => p === "ollama" || p === "openai-compatible");
+    ].some(
+      (p) =>
+        p === "ollama" ||
+        p === "openai-compatible" ||
+        (p !== undefined && isLocalServerProvider(p)),
+    );
     // The URLs the selected custom-host providers point at — so a host that's
     // keeping one reachable shows an "in use" hint before it's removed.
     const activeProviderUrls = [
@@ -745,6 +815,13 @@ export const AiProviderSection = withForm({
       securityReviewAi?.provider === "ollama" && securityReviewAi.ollamaBaseUrl,
       securityReviewAi?.provider === "openai-compatible" &&
         securityReviewAi.openaiCompatibleBaseUrl,
+      ...[ai, reviewAi, securityReviewAi].map((s) =>
+        s && isLocalServerProvider(s.provider)
+          ? (s.provider === "lm-studio"
+              ? s.lmStudioBaseUrl
+              : s.unslothBaseUrl) || LOCAL_SERVER_DEFAULT_URLS[s.provider]
+          : false,
+      ),
     ].filter((u): u is string => Boolean(u));
 
     const [confirmClear, setConfirmClear] = useState(false);

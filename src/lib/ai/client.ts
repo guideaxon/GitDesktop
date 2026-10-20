@@ -7,6 +7,7 @@ import {
 } from "ai";
 import { getSecret } from "@/lib/git/api";
 import { probeOllamaWindowTokens } from "./context-budget";
+import { resolveLocalModel } from "./local-server";
 import { providerErrorMessage } from "./provider-error";
 import { isCliProvider, PROVIDERS_REQUIRING_KEY } from "./providers";
 import { httpToolStatusLine } from "./review-tools";
@@ -42,7 +43,8 @@ export async function resolveModel(
   // here, on the first real generation — after the key check above, so the
   // MissingApiKeyError path never pays for (or surfaces) the import.
   const { createModel } = await import("./model-factory");
-  return createModel(settings, apiKey, allowedHostsOverride);
+  const model = await resolveLocalModel(settings, allowedHostsOverride);
+  return createModel({ ...settings, model }, apiKey, allowedHostsOverride);
 }
 
 /**

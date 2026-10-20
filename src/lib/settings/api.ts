@@ -401,6 +401,10 @@ export interface AppSettings {
   autoFetch: boolean;
   /** How often the background fetch runs, in minutes. */
   autoFetchInterval: AutoFetchInterval;
+  /** On opening a repo, switch the active `gh` account to the one the repo's Git config
+   *  names (`credential.https://<host>.username`). Only ever switches to an account
+   *  `gh` already holds; the switch is global to `gh`, not per repo. */
+  autoSwitchGhAccount: boolean;
   /** Run the automated first review when a draft PR is created. Off by default — the review
    *  then waits until the draft is marked ready for review. */
   reviewDraftPrs: boolean;
@@ -517,6 +521,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoCheckUpdates: true,
   autoFetch: true,
   autoFetchInterval: "10",
+  autoSwitchGhAccount: true,
   reviewDraftPrs: false,
   createPrsAsDraft: false,
   fetchLinkPreviews: true,

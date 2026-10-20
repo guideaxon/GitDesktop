@@ -415,6 +415,49 @@ pub async fn gh_switch_account(host: String, login: String) -> AppResult<()> {
     Ok(())
 }
 
+/// The GitHub username the repo's Git config pins for its host
+/// (`credential.https://<host>.username`, includeIf files included), with the host
+/// gh knows it by. `--get-urlmatch` applies git's own URL matching, so a global
+/// `[credential "https://github.com"]` block resolves like it does for a push.
+/// `None` when nothing is pinned or the value isn't a plausible login.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GhRepoUsername {
+    pub host: String,
+    pub username: String,
+}
+
+#[tauri::command]
+pub async fn gh_repo_credential_username(repo_path: String) -> AppResult<Option<GhRepoUsername>> {
+    let host = crate::forge::session::github_host_for_repo(&repo_path).await;
+    // The same host grammar `gh_switch_account` accepts; anything else (a ported
+    // authority) takes no part in URL matching here.
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Ok(None);
+    }
+    let url = format!("https://{host}");
+    let out = run_git_raw(
+        Some(&repo_path),
+        &["config", "--get-urlmatch", "credential.username", &url],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    if out.code != 0 {
+        return Ok(None);
+    }
+    let username = out.stdout_lossy().trim().to_string();
+    let plausible = !username.is_empty()
+        && username.len() <= 39
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    Ok(plausible.then_some(GhRepoUsername { host, username }))
+}
+
 /// One account from a `gh auth status` report.
 pub(crate) struct ParsedAccount {
     pub(crate) host: String,

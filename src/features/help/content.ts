@@ -51,6 +51,12 @@ A few things worth knowing up front:
   \`gh auth login --hostname your.github.example\` and its repos get the same PR, issue,
   and Actions features. **Settings → Accounts** lists every signed-in host and lets you
   switch the active account per host.
+- **Several GitHub accounts.** \`gh\` keeps one active account per host, and GitDesktop
+  follows it. If a repo's Git config pins a username (\`credential.username\` for
+  \`https://github.com\`, for example per folder through \`includeIf\`), opening the repo
+  switches \`gh\` to that account when it is already signed in. The switch applies to
+  \`gh\` everywhere. Turn it off with **Settings → General → Switch GitHub account to
+  match the repository**.
 - **Bitbucket Cloud.** Connect in **Settings → Accounts** with an **Atlassian
   API token** (created at id.atlassian.com, used with your Atlassian account email) —
   the token is stored in your OS keychain. Then browse & clone your repositories, and
@@ -3276,6 +3282,10 @@ Bring your own model:
   for **Vercel AI Gateway, DeepSeek, Mistral, and Z.ai (GLM)**.
 - **Ollama (local or LAN)** — a local model (your code never leaves your machine), or one
   running on another machine on your network — set its URL in Settings.
+- **LM Studio and Unsloth (local)** — keyless local servers. GitDesktop reads the model
+  list from the server's \`/v1/models\` and, when the model field is blank, uses the first
+  model it lists. LM Studio defaults to \`qwen/qwen3.6-35b-a3b\` when you switch to it.
+  Set the server URL in Settings if it isn't the default.
 - **Claude Code, Codex, GitHub Copilot, opencode CLIs** — *keyless*: they reuse your
   existing CLI login, with no API key. Pick **opencode**, **Codex**, or **GitHub
   Copilot** and the model picker fills from the CLI's own catalog (opencode's custom

@@ -301,6 +301,11 @@ export const capabilities: Capability[] = [
   {
     group: "Forges & trackers",
     label:
+      "Per-folder GitHub accounts — the active gh account follows the repo's credential.username",
+  },
+  {
+    group: "Forges & trackers",
+    label:
       "Sign in & reconnect in-app — session-expired detection & token-expiry warnings, rate limits told apart (with GitHub's reset time), plus scope hints that reconnect with the needed scope",
   },
   {

@@ -8,6 +8,8 @@ export type AiProviderId =
   | "openrouter"
   | "ollama"
   | "ollama-cloud"
+  | "lm-studio"
+  | "unsloth"
   | "claude-cli"
   | "codex-cli"
   | "copilot-cli"
@@ -21,6 +23,10 @@ export interface AiSettings {
    *  `/chat/completions` endpoint — set via a preset or typed). The host must be
    *  in the app's network allowlist (`capabilities/default.json`). */
   openaiCompatibleBaseUrl: string;
+  /** Server root for the `lm-studio` / `unsloth` providers (OpenAI-compatible at
+   *  `<root>/v1`). Absent ⇒ the provider's default local URL. */
+  lmStudioBaseUrl?: string;
+  unslothBaseUrl?: string;
   /** Explicit path to the agent CLI binary (CLI providers only); empty/omitted
    *  means auto-detect on PATH and the known install locations. */
   cliPath?: string;
