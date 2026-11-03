@@ -135,8 +135,10 @@ import {
   pendingWriteMatching,
   pendingWriteOfKind,
   prApprovalsOptions,
+  prChecksRecheck,
   prDiffOptions,
   prUpdateBranchKeys,
+  recheckRunsAfterPush,
   repoKeys,
   TRIAGE_ACCESS_ITEM_REASON,
   triageAccessReason,
@@ -231,6 +233,7 @@ import {
   useClearReviewDrafts,
   useReviewDrafts,
 } from "@/lib/pulls/review-drafts";
+import { remoteStateMatches } from "@/lib/remote-state-filter";
 import { useRepoLens } from "@/lib/repo-lens/queries";
 import { useAiEnabled } from "@/lib/settings/queries";
 import { useConfirm } from "@/lib/stores/confirm";
@@ -242,6 +245,7 @@ import { useEntityHold, useRevealGuard } from "@/lib/use-entity-hold";
 import { useKeyedEntityState } from "@/lib/use-keyed-entity-state";
 import { useLatestRef } from "@/lib/use-latest-ref";
 import { useRetained } from "@/lib/use-retained";
+import { useToastClearance } from "@/lib/use-toast-clearance";
 import { cn } from "@/lib/utils";
 import { ChecksRollup } from "./ChecksRollup";
 import { LinkedIssuesField } from "./LinkedIssuesField";
@@ -779,8 +783,8 @@ export function RemotePrView({
   const unrequestChangesPr = useUnrequestChangesPr(repoPath);
   // Auto-merge state (GitLab-only): a null number disables the read (GitHub / closed
   // MRs) and stops its refetchInterval — it polls so the view notices the pipeline
-  // completing and the auto-merge firing. The repoTab gate is load-bearing: an
-  // <Activity>-hidden subtree still renders; staleTime (5s) refetches on return.
+  // completing and the auto-merge firing. The repoTab gate is a backstop (a hidden
+  // <Activity> subtree already fetches nothing); staleTime (5s) refetches on return.
   const mergeState = useGlMrMergeState(
     repoPath,
     repoTab === "pulls" && canAutoMerge && details.data?.state === "OPEN"
@@ -791,8 +795,8 @@ export function RemotePrView({
   const cancelAutoMerge = useGlCancelAutoMerge(repoPath);
   const isOpenPr = details.data?.state === "OPEN";
   // Mergeability against the base — the conflict banner's server truth. Same repoTab
-  // gate as the auto-merge poll above and for the same reason: it polls, and an
-  // <Activity>-hidden subtree still fetches. Non-open PRs have no answer to give.
+  // gate as the auto-merge poll above and for the same reason: it polls (a hidden
+  // <Activity> subtree already fetches nothing). Non-open PRs have no answer.
   const mergeability = usePrMergeability(
     repoPath,
     shownNumber,
@@ -903,8 +907,8 @@ export function RemotePrView({
   // Activity-timeline events (force-pushes, labels, state changes, review requests,
   // approvals) interleaved into the Conversation feed; provider-neutral via the
   // backend's `forge_pr_timeline`. Fetch only while Conversation is showing AND a
-  // provider resolved — the <Activity>-hidden subtree still renders, so the
-  // composite gate is load-bearing.
+  // provider resolved (the section gate is a backstop: a hidden <Activity> subtree
+  // already fetches nothing).
   const timeline = usePrTimeline(
     repoPath,
     shownNumber,
@@ -1302,12 +1306,15 @@ export function RemotePrView({
   // explains THIS PR's missing offer when it would have been its CHILD. The mirror
   // test (a fork whose head is this PR's base) is not specific: fork PRs are
   // routinely opened from `main`, which is most PRs' base, so it would make the note
-  // permanent furniture on ordinary pull requests.
+  // permanent furniture on ordinary pull requests. The row's own state files it,
+  // as in the detector: the open list's membership can lag a merge or close.
   const forkChild =
     currentRow != null &&
     openPrs.some(
       (p) =>
-        p.crossRepository === true && p.baseRefName === currentRow.headRefName,
+        remoteStateMatches(p.state, "open") &&
+        p.crossRepository === true &&
+        p.baseRefName === currentRow.headRefName,
     );
   // Why a chain that may well exist still gets no offer. Only the ADVISORY refusals
   // are named — the detector's structural arms (no chain, ambiguity, a stacked
@@ -1529,6 +1536,13 @@ export function RemotePrView({
           queryClient.invalidateQueries({ queryKey }),
         ),
       );
+      // A job slower than the accept-time run recheck starts the head's runs after
+      // that recheck fired, so the observed move arms it again (one timer per repo).
+      recheckRunsAfterPush(
+        queryClient,
+        repoPath,
+        prChecksRecheck(repoPath, lens, number),
+      );
       // A long update spends the mergeability ladder against the UNKNOWN that GitHub
       // reports throughout, so the refetch above would land on a gave-up arm. The head
       // just moved: the question is new again, and the ladder has to start over with it.
@@ -1640,8 +1654,8 @@ export function RemotePrView({
   const blockedDetailsReady =
     bannerArm === "blocked" && blockedByRules && !detailsPlaceholder;
   // The base branch's required checks, read only for the arm that names them. The
-  // repoTab term is the <Activity> gate every sibling read here carries: a hidden
-  // subtree still refetches, and this one would respawn `gh` on every focus regain.
+  // repoTab term is the <Activity> gate every sibling read here carries, a
+  // backstop: a hidden subtree already holds no query observers.
   const requiredChecks = useBranchRequiredChecks(
     repoPath,
     details.data?.baseRefName ?? "",
@@ -2705,6 +2719,23 @@ export function RemotePrView({
       </HeldFrame>
     </div>
   );
+  // The footers' gates, shared by their JSX and their toast clearance. The
+  // clearance runs above every early return, so it also requires the loaded view
+  // to be the arm painted (no loading frame, offline or error arm, or resolve).
+  const openFooterShown =
+    pr?.state === "OPEN" && (canChangeState || canMerge || canWrite);
+  const reopenFooterShown =
+    pr?.state === "CLOSED" && canChangeState && provider !== "bitbucket";
+  const loadedViewPainted =
+    !showsLoadingFrame &&
+    detailPane !== "offline" &&
+    detailPane !== "error" &&
+    pr !== undefined &&
+    !resolve;
+  const openFooterRef = useRef<HTMLDivElement>(null);
+  const reopenFooterRef = useRef<HTMLDivElement>(null);
+  useToastClearance(openFooterRef, loadedViewPainted && openFooterShown);
+  useToastClearance(reopenFooterRef, loadedViewPainted && reopenFooterShown);
   if (showsLoadingFrame) {
     // The loaded header's controls, held where they will stand and gated on the
     // list row's state as the loaded ones are on the PR's. With no cached row an
@@ -2860,10 +2891,9 @@ export function RemotePrView({
                 variant="outline"
                 size="sm"
                 className="cursor-pointer"
-                disabled={details.isFetching}
                 onClick={() => details.refetch()}
               >
-                {details.isFetching ? "Retrying…" : "Retry"}
+                Retry
               </Button>
             </div>
           ) : undefined
@@ -2922,11 +2952,13 @@ export function RemotePrView({
           queryClient.ensureQueryData(prDiffOptions(repoPath, number, lens)),
           aiExcludePatterns(repoPath, settings.aiIgnorePatterns),
         ]);
+        // The Files tab's own binary verdict, read from the diff just awaited.
+        const bins = binaryRowPaths(prForGen.files, splitUnifiedDiff(text));
         const files = prForGen.files.map((f) => ({
           path: f.path,
           added: f.additions,
           deleted: f.deletions,
-          isBinary: false,
+          isBinary: bins.has(f.path),
         }));
         // A forge-supplied diff arrives whole, so it is filtered client-side.
         // NEVER write the result back into the query cache: the same string
@@ -3740,6 +3772,7 @@ export function RemotePrView({
           onRetryChecks={() => void details.refetch()}
           repoPath={repoPath}
           provider={providerKey}
+          headSha={prHeadSha(pr) ?? null}
           crossRepository={!!pr.crossRepository}
           unmetRequiredContexts={blockedRequirements}
           // Split like the view's own controls: `stale` withdraws the offers, so
@@ -3862,16 +3895,20 @@ export function RemotePrView({
             loadDiff: () =>
               queryClient
                 .ensureQueryData(prDiffOptions(repoPath, shownNumber, lens))
-                .then((text) => ({
-                  text,
-                  truncated: false,
-                  files: pr.files.map((f) => ({
-                    path: f.path,
-                    added: f.additions,
-                    deleted: f.deletions,
-                    isBinary: false,
-                  })),
-                })),
+                .then((text) => {
+                  // The Files tab's own binary verdict, read from this diff.
+                  const bins = binaryRowPaths(pr.files, splitUnifiedDiff(text));
+                  return {
+                    text,
+                    truncated: false,
+                    files: pr.files.map((f) => ({
+                      path: f.path,
+                      added: f.additions,
+                      deleted: f.deletions,
+                      isBinary: bins.has(f.path),
+                    })),
+                  };
+                }),
           }}
           posting={commentPending}
           // The context above is seeded from the rendered PR, so through a switch
@@ -4169,6 +4206,7 @@ export function RemotePrView({
               menu stays hidden; Bitbucket has neither, so the bar hides. */}
           {canComment && (
             <CommentComposer
+              toastClearance
               ref={composerRef}
               value={compose.value}
               onChange={compose.set}
@@ -4472,8 +4510,11 @@ export function RemotePrView({
       {/* The open-MR footer hosts Close + Merge alongside the shared Ready /
           Convert-to-draft pair — shown when any is available, each control gated
           individually. */}
-      {isOpen && (canChangeState || canMerge || canWrite) && (
-        <div className="flex flex-wrap items-center gap-2 border-t p-3">
+      {openFooterShown && (
+        <div
+          ref={openFooterRef}
+          className="flex flex-wrap items-center gap-2 border-t p-3"
+        >
           {/* One Ready / Convert-to-draft pair for all three providers: GitLab
               (`glab mr update`) and Bitbucket (PUT `draft`) via `canToggleDraft`;
               GitHub folds in via `canWrite` and routes the same `setDraft` mutation
@@ -4637,8 +4678,11 @@ export function RemotePrView({
 
       {/* Bitbucket declined PRs can't be reopened — no API or web affordance, so
           hide it (unlike GitHub/GitLab). */}
-      {pr.state === "CLOSED" && canChangeState && provider !== "bitbucket" && (
-        <div className="flex items-center gap-2 border-t p-3">
+      {reopenFooterShown && (
+        <div
+          ref={reopenFooterRef}
+          className="flex items-center gap-2 border-t p-3"
+        >
           <span className="flex-1" />
           <DisabledReasonButton
             variant="outline"

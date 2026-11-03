@@ -462,7 +462,8 @@ async fn run_git_spawn(
     }
     let git = git_bin().await?;
     let mut cmd = Command::new(&git);
-    // Also covers the credential helpers git spawns in turn.
+    // Also covers the credential helpers git spawns in turn, and puts the login-shell
+    // PATH on hooks, filter drivers, ssh and by-name helpers.
     crate::agent::sanitize_child_env(&mut cmd);
     // Git for Windows gates long-path support on core.longpaths — the OS
     // LongPathsEnabled flag alone is not enough (probe-proven). Per-invocation so
@@ -484,6 +485,10 @@ async fn run_git_spawn(
         "diff.dstPrefix=b/",
         "-c",
         "diff.mnemonicPrefix=false",
+        // Machine-read log/show output must not carry signature text; an explicit
+        // `--show-signature` on the command line still overrides it.
+        "-c",
+        "log.showSignature=false",
     ]);
     cmd.args(args);
     if let Some(repo) = repo_path {

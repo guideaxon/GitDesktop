@@ -1,5 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import * as api from "../api";
 import { repoKeys } from "./core";
 
@@ -12,6 +15,7 @@ export function repoStatusOptions(repo: string) {
     // A local git read, so it must not park on the default "online" mode the way
     // a forge call does — gates that hold until this answers would never lift.
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -38,12 +42,14 @@ export function workingLineStatsOptions(repo: string) {
     queryKey: [...repoKeys.status(repo), "line-stats"] as const,
     queryFn: () => api.gitWorkingLineStats(repo),
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
 
-/** `enabled` gates it on the Changes tab being active and the tree being dirty; a
- *  `<TabPanel>`-hidden panel still renders and would otherwise poll. */
+/** `enabled` gates it on the Changes tab being active and the tree being dirty;
+ *  the tab gate is a backstop, since a `<TabPanel>`-hidden panel holds no query
+ *  observers. */
 export function useWorkingLineStats(repo: string, enabled: boolean) {
   return useQuery({
     ...workingLineStatsOptions(repo),
@@ -60,7 +66,7 @@ export function useWorkingLineStats(repo: string, enabled: boolean) {
  *  invalidation refetches it. */
 export function useUnpushedCount(repo: string, enabled: boolean) {
   return useQuery({
-    queryKey: ["repo", repo, "unpushed-count"] as const,
+    queryKey: repoKeys.unpushedCount(repo),
     queryFn: () => api.gitUnpushedCount(repo),
     enabled: enabled && Boolean(repo),
     staleTime: 10_000,

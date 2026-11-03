@@ -6,16 +6,20 @@ import {
   XIcon,
 } from "@phosphor-icons/react";
 import { useSelector } from "@tanstack/react-store";
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import {
+  ignoreHeldEnter,
+  useConfirmSwapFocus,
+} from "@/components/confirm-swap-focus";
 import { StatusDetailChip } from "@/components/status-detail-chip";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { isHostAllowed, normalizeHost } from "@/lib/ai/allowed-hosts";
 import { clipTitleFromText } from "@/lib/clip-title";
 import { withForm } from "@/lib/form";
-import { deleteMcpSecret } from "@/lib/git/api";
 import { repoIdentity } from "@/lib/git/repo-identity";
+import { hasChordModifier } from "@/lib/hotkeys/binding";
 import { listKeyboardNav } from "@/lib/list-keyboard-nav";
 import { asMcpServerArray, type McpServer } from "@/lib/settings/api";
 import {
@@ -35,17 +39,24 @@ import { GitDesktopAsServer } from "./mcp/GitDesktopAsServer";
 import { ImportMcpDialog } from "./mcp/ImportMcpDialog";
 import { McpServerDialog } from "./mcp/McpServerDialog";
 import { PerRepoStateControl } from "./mcp/PerRepoStateControl";
+import type { McpSecretsHandle, McpStagedSecret } from "./mcp/secret-ops";
 import { settingsFormOpts } from "./settings-form";
 
 /** The row's small warning chip, restyled from the Badge base it rides. Its
  *  hover/open tint is warning-keyed: the secondary variant's own tint matches
- *  this bg-muted in dark themes, so it would never show. */
+ *  this bg-muted in dark themes, so it would never show. Light uses /10 to keep
+ *  the warning text's contrast on the tint, dark /20 so the tint stays visible. */
 const MCP_CHIP_CLASS =
-  "h-auto shrink-0 rounded border-0 bg-muted px-1.5 py-0.5 text-[10px] text-warning hover:bg-warning/20 aria-expanded:bg-warning/20";
+  "h-auto shrink-0 rounded border-0 bg-muted px-1.5 py-0.5 text-[10px] text-warning hover:bg-warning/10 aria-expanded:bg-warning/10 dark:hover:bg-warning/20 dark:aria-expanded:bg-warning/20";
 
 export const McpServersSection = withForm({
   ...settingsFormOpts,
-  render: function McpServersSectionRender({ form }) {
+  props: {
+    /** The screen's Save buffer for typed secret values. Required, so a missed
+     *  wiring fails at the first stage rather than silently dropping values. */
+    secrets: undefined as unknown as McpSecretsHandle,
+  },
+  render: function McpServersSectionRender({ form, secrets }) {
     // The registry as an array whatever the stored container is: `loadSettings`
     // preserves a corrupt non-array rather than destroying it, so this section
     // renders empty and every edit below BUILDS FROM this guarded view — writing a
@@ -66,6 +77,38 @@ export const McpServersSection = withForm({
     const [importOpen, setImportOpen] = useState(false);
     const [activeIndex, setActiveIndex] = useState(-1);
     const listRef = useRef<HTMLDivElement>(null);
+    const addRef = useRef<HTMLButtonElement>(null);
+    // A removed row hands focus to the next row itself (Enter there edits),
+    // else the previous one, else Add server; never to another Remove.
+    const swapFocus = useConfirmSwapFocus();
+    // An edit's Save lands focus on the saved row itself, after its write: a
+    // scope change remounts the row in another group, so the dialog's own
+    // return (which resolves at close, before the write) would find a node that
+    // is about to leave. `saveClosing` tells that return to stand down.
+    const saveClosing = useRef(false);
+    const savedRowFocus = useRef<string | null>(null);
+    useLayoutEffect(() => {
+      const id = savedRowFocus.current;
+      if (id === null) return;
+      savedRowFocus.current = null;
+      const listEl = listRef.current;
+      // Claims only unclaimed focus: anything the user focused during the
+      // write (another row, a switch) keeps it. The roving stop is index-keyed
+      // and the write may have regrouped rows under it, so it re-syncs to the
+      // row holding focus.
+      const active = document.activeElement;
+      if (active !== null && active !== document.body) {
+        const row = active.closest("[data-mcp-row]");
+        if (listEl === null || row === null || !listEl.contains(row)) return;
+        const rows = Array.from(listEl.querySelectorAll("[data-mcp-row]"));
+        setActiveIndex(rows.indexOf(row));
+        return;
+      }
+      // Its onFocus makes it the roving tab stop.
+      listEl
+        ?.querySelector<HTMLElement>(`[data-mcp-row="${CSS.escape(id)}"]`)
+        ?.focus();
+    });
     const repoPath = useUiStore((s) => s.repoPath);
     const repoName = useUiStore((s) => s.repoName);
     // Scope/override lookup keys for the open repo: [repoPath] while the identity
@@ -101,9 +144,20 @@ export const McpServersSection = withForm({
       return admitted;
     }
 
-    function addServers(added: McpServer[]) {
+    function addServers(added: McpServer[], writes: McpStagedSecret[]) {
       const admitted = admitServers(added);
       if (admitted.length) setServers([...list, ...admitted]);
+      // Stage exactly what landed in the draft: a refused server's values would
+      // only sit in the buffer until a Save pruned them.
+      for (const server of admitted) {
+        const own = writes.filter((w) => w.serverId === server.id);
+        if (own.length)
+          secrets.stage(
+            server.id,
+            own.map(({ key, value }) => ({ key, value })),
+            server.secretKeys,
+          );
+      }
       setImportOpen(false);
     }
 
@@ -117,10 +171,15 @@ export const McpServersSection = withForm({
       ]);
     }
 
-    async function saveServer(server: McpServer) {
+    async function saveServer(
+      server: McpServer,
+      secretWrites: { key: string; value: string }[],
+    ) {
       // Refuse before the optimistic close, so a rejected draft stays on screen
       // for the user to fix rather than vanishing with its edits.
       if (admitServers([server]).length === 0) return;
+      const wasEdit = editing !== null && editing !== "new";
+      if (wasEdit) saveClosing.current = true;
       // Close optimistically FIRST: foldServerScopeKeys' cold repoIdentity IPC
       // call would otherwise visibly delay the dialog closing. It never rejects,
       // and the write below composes via the functional setter, so closing before
@@ -134,20 +193,55 @@ export const McpServersSection = withForm({
       const folded = await foldServerScopeKeys(server);
       // Re-read via the functional setter so this async write composes with any
       // interleaving edit instead of clobbering it.
+      // Armed in the same tick as the write, so the commit that renders it
+      // (in the row's new group, for a scope change) is the one that lands.
+      if (wasEdit) savedRowFocus.current = folded.id;
       form.setFieldValue("mcpServers", (prev) => {
         const cur = asMcpServerArray(prev);
         return cur.some((s) => s.id === folded.id)
           ? cur.map((s) => (s.id === folded.id ? folded : s))
           : [...cur, folded];
       });
+      // Staged in the same tick as the row lands, so a Save pressed during the
+      // fold above commits neither half and the next Save commits both: that
+      // Save skips its post-write reset when the form changed during the write,
+      // so a fold landing during it stays on screen like one landing after it.
+      // A Discard during that write reverts the row (a new one leaves the
+      // list); a secret staged after the Discard keeps the Save bar up, and the
+      // next Save writes it only if the reverted row still names its key, else
+      // drops it.
+      secrets.stage(folded.id, secretWrites, folded.secretKeys);
     }
 
     function removeServer(server: McpServer) {
       setServers(list.filter((s) => s.id !== server.id));
-      // Tidy up any keychain secrets the server owned (best-effort).
-      for (const key of server.secretKeys)
-        void deleteMcpSecret(server.id, key).catch(() => undefined);
+      // Its saved secrets are deleted by the Save that commits the removal; its
+      // unsaved typed values just leave the buffer.
+      secrets.pruneServer(server.id);
       toast.success(`Removed "${server.name}"`);
+    }
+
+    // The edit dialog unmounts outright, so this runs with the props of its last
+    // render. Only a row that is the tab stop: Base UI sends a non-tabbable
+    // target on to its first tabbable child, an arbitrary control in the row.
+    function closeFocusTarget(
+      target: McpServer | "new",
+    ): HTMLElement | null | false {
+      if (target === "new") return addRef.current;
+      // A Save lands on the saved row after its write (savedRowFocus).
+      if (saveClosing.current) {
+        saveClosing.current = false;
+        return false;
+      }
+      const listEl = listRef.current;
+      const row = listEl?.querySelector<HTMLElement>(
+        `[data-mcp-row="${CSS.escape(target.id)}"]`,
+      );
+      if (row?.tabIndex === 0) return row;
+      const stop = listEl?.querySelector<HTMLElement>(
+        '[data-mcp-row][tabindex="0"]',
+      );
+      return stop ?? null;
     }
 
     function toggleEnabled(server: McpServer, enabled: boolean) {
@@ -247,7 +341,7 @@ export const McpServersSection = withForm({
     });
 
     return (
-      <section className="space-y-4">
+      <section data-confirm-section className="space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-sm font-medium">MCP servers</h2>
@@ -277,9 +371,12 @@ export const McpServersSection = withForm({
               <DownloadSimpleIcon data-icon="inline-start" /> Import
             </Button>
             <Button
+              ref={addRef}
+              data-confirm-fallback
               variant="outline"
               size="sm"
               onClick={() => setEditing("new")}
+              onKeyDown={ignoreHeldEnter}
             >
               <PlusIcon data-icon="inline-start" /> Add server
             </Button>
@@ -334,6 +431,8 @@ export const McpServersSection = withForm({
                     <div
                       key={server.id}
                       data-mcp-row={server.id}
+                      data-confirm-row
+                      data-confirm-swap
                       aria-label={`${server.name}, ${server.transport}, ${effectiveMcpState(
                         server,
                         repoKeys,
@@ -345,11 +444,13 @@ export const McpServersSection = withForm({
                       }
                       onFocus={() => setActiveIndex(i)}
                       onKeyDown={(e) => {
+                        if (hasChordModifier(e)) return;
                         // Only the row itself edits on Enter — not when a child
                         // control (the state picker / switch / buttons) is focused.
+                        // An auto-repeated Enter is still held from elsewhere.
                         if (e.key === "Enter" && e.target === e.currentTarget) {
                           e.preventDefault();
-                          setEditing(server);
+                          if (!e.repeat) setEditing(server);
                         }
                       }}
                       className="flex items-center gap-2 rounded border px-3 py-2 outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -418,6 +519,7 @@ export const McpServersSection = withForm({
                           <PencilSimpleIcon />
                         </Button>
                         <Button
+                          ref={swapFocus(server.id)}
                           variant="ghost"
                           size="icon-sm"
                           aria-label={`Remove ${server.name}`}
@@ -449,6 +551,7 @@ export const McpServersSection = withForm({
             onAllowHost={allowHost}
             onSave={saveServer}
             onClose={() => setEditing(null)}
+            finalFocus={() => closeFocusTarget(editing)}
           />
         )}
 

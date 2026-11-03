@@ -3,7 +3,12 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { keepPreviousDataForRepo, repoKeys } from "@/lib/git/queries";
+import {
+  keepPreviousDataForKeyAxes,
+  prChecksRecheck,
+  recheckRunsAfterPush,
+  repoKeys,
+} from "@/lib/git/queries";
 import {
   type CancelRunVars,
   type DispatchVars,
@@ -17,6 +22,14 @@ import type { RemoteLens } from "@/lib/git/types";
 import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
 import { useMutation } from "@/lib/started-mutation";
 import { invoke } from "@/lib/tauri/invoke";
+import {
+  listRunsPollIntervalMs,
+  type PollRun,
+  runDetailPollIntervalMs,
+  runJobsPollIntervalMs,
+  runsPollIntervalMs,
+} from "./run-poll";
+import { isRunActive } from "./run-status";
 
 // ── Types (mirror the Rust structs in github/actions.rs) ─────────────────────
 
@@ -101,16 +114,7 @@ export interface CiRunPage {
 
 // ── Status helpers ───────────────────────────────────────────────────────────
 
-const ACTIVE_STATUSES = new Set([
-  "queued",
-  "in_progress",
-  "waiting",
-  "requested",
-  "pending",
-]);
-
-/** A run/job still executing (so the UI keeps polling and offers Cancel). */
-export const isRunActive = (status: string) => ACTIVE_STATUSES.has(status);
+export { isRunActive } from "./run-status";
 
 // ── API wrappers ─────────────────────────────────────────────────────────────
 //
@@ -148,6 +152,16 @@ export const forgeCiRunPage = (
 
 export const forgeCiRunView = (repoPath: string, runId: number | string) =>
   invoke<RunDetail>("forge_ci_run_view", { repoPath, runId: String(runId) });
+
+/** Every run of one commit (GitHub-only): one conditional GET whose unchanged
+ *  answer costs no rate-limit budget, the PR checks rollup's completion watch. */
+export const ghRunsForHead = (repoPath: string, headSha: string) =>
+  invoke<WorkflowRun[]>("gh_runs_for_head", { repoPath, headSha });
+
+/** One run's jobs and steps (GitHub-only), read apart from the run so only the
+ *  surfaces showing steps pay for them. */
+export const ghRunJobs = (repoPath: string, runId: number | string) =>
+  invoke<RunJob[]>("gh_run_jobs", { repoPath, runId: String(runId) });
 
 /** Re-run a finished run (`failed` = its failed jobs only). Ids stay strings over
  *  IPC — they can exceed JS's safe-integer range. `lens` is GitHub-only (fork
@@ -243,9 +257,11 @@ export const forgeBbCustomPipelines = (repoPath: string) =>
 
 // ── Queries ──────────────────────────────────────────────────────────────────
 
-/** Polls every 5s while any listed run is active, otherwise stays idle. `active`
- *  (the Actions tab being visible) gates the fetch so a hidden tab stops polling;
- *  cached runs render instantly on return since React Query keeps the cache. */
+/** Polls at `listRunsPollIntervalMs` while a listed run is active, otherwise
+ *  stays idle, and an errored read stops polling until a retry, invalidation,
+ *  reconnect or focus refetch resumes it. `active` (the Actions tab being
+ *  visible) gates the fetch so a hidden tab stops polling; cached runs render
+ *  instantly on return since React Query keeps the cache. */
 export function useWorkflowRuns(
   repo: string,
   enabled: boolean,
@@ -258,16 +274,16 @@ export function useWorkflowRuns(
     enabled: enabled && active,
     staleTime: 10_000,
     refetchInterval: (query) =>
-      (query.state.data ?? []).some((r) => isRunActive(r.status))
-        ? 5000
-        : false,
+      query.state.status !== "error" &&
+      listRunsPollIntervalMs(query.state.data ?? [], Date.now()),
   });
 }
 
 /** The Actions panel's run list, paged so the repo's whole history is reachable.
  *  `active` (the Actions tab being visible) gates the fetch so a hidden tab stops
  *  fetching; the key stays inside the `["repo", repo, "actions"]` subtree the panel's
- *  mutations invalidate. */
+ *  mutations invalidate. Page 1 polls at `listRunsPollIntervalMs`, and an errored
+ *  read (a refresh or a Load more) stops it, as in {@link useWorkflowRuns}. */
 export function useWorkflowRunPages(
   repo: string,
   enabled: boolean,
@@ -284,7 +300,7 @@ export function useWorkflowRunPages(
     getNextPageParam: (last, pages) =>
       last.hasMore ? pages.length + 1 : undefined,
     enabled: enabled && active,
-    // Three paths replay EVERY loaded page serially — the 5s poll, a window-focus
+    // Three paths replay EVERY loaded page serially — the run poll, a window-focus
     // refetch, and a remount past staleTime (leaving and re-entering the Actions tab
     // flips `enabled`) — so their cost scales with how deep the user has paged, and the
     // budget they spend is GitHub's shared 5,000 requests/hour that every other gh
@@ -301,10 +317,11 @@ export function useWorkflowRunPages(
         : 10_000,
     refetchInterval: (query) => {
       const pages = query.state.data?.pages ?? [];
-      return pages.length === 1 &&
-        pages[0].runs.some((r) => isRunActive(r.status))
-        ? 5000
-        : false;
+      return (
+        query.state.status !== "error" &&
+        pages.length === 1 &&
+        listRunsPollIntervalMs(pages[0].runs, Date.now())
+      );
     },
     refetchOnWindowFocus: (query) => (query.state.data?.pages.length ?? 0) <= 1,
   });
@@ -324,12 +341,50 @@ export function useRunDetail(
     // An errored read stops polling: each poll would flip `isFetching` and
     // remount the failure notice and its Retry. Retry, invalidation, reconnect,
     // and focus refetches still resume it, and a success re-arms the poll.
+    refetchInterval: (query) => {
+      const d = query.state.data;
+      if (query.state.status === "error" || !d) return false;
+      return runDetailPollIntervalMs(d, Date.now());
+    },
+  });
+}
+
+/** Every run of a pull request's head commit (GitHub-only), polled at the
+ *  fastest ladder tier among its active runs, and stopped once none is active
+ *  or a read errors. Keyed inside the `["repo", repo, "actions"]` subtree, so
+ *  every Actions mutation's invalidation re-reads it. */
+export function useHeadRuns(
+  repo: string,
+  headSha: string | null,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "head-runs", headSha] as const,
+    queryFn: () => ghRunsForHead(repo, headSha ?? ""),
+    enabled: enabled && headSha !== null,
+    staleTime: 10_000,
     refetchInterval: (query) =>
       query.state.status !== "error" &&
-      query.state.data &&
-      isRunActive(query.state.data.status)
-        ? 5000
-        : false,
+      runsPollIntervalMs(query.state.data, Date.now()),
+  });
+}
+
+/** One run's jobs (GitHub-only), polled per `runJobsPollIntervalMs`. `run` is
+ *  the run's row from the head list, or null when there is none. */
+export function useRunJobs(
+  repo: string,
+  runId: string,
+  enabled: boolean,
+  run: PollRun | null,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "run", runId, "jobs"] as const,
+    queryFn: () => ghRunJobs(repo, runId),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: (query) =>
+      query.state.status !== "error" &&
+      runJobsPollIntervalMs(query.state.data, run, Date.now()),
   });
 }
 
@@ -343,24 +398,71 @@ export function latestRunOptions(repo: string, branch: string | null) {
   };
 }
 
+/** A branch's recent runs, the run-notification poll's read. The ONE spelling of
+ *  this query: the notifier owns its interval, and the header badge reads the same
+ *  entry through `select` while notifications are on. Cached as a shell read: the
+ *  notifier never primes from a snapshot fetched before it enabled. */
+export function runNotifyOptions(repo: string, branch: string | null) {
+  return {
+    queryKey: ["repo", repo, "actions", "notify", branch ?? ""] as const,
+    queryFn: () => forgeCiRunList(repo, 20, branch ?? undefined),
+    staleTime: 40_000,
+    retry: false,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+/** Which read the header badge rides: the notifier's shared list ("notify") or
+ *  its own limit-1 read ("latest", while run notifications are off or muted). */
+export type LatestRunMode = "notify" | "latest";
+
+/** The badge's mode from whether run notifications deliver: undefined while that
+ *  is unresolved, so the badge waits instead of flipping modes on open. */
+export function latestRunMode(
+  notifyEnabled: boolean | undefined,
+): LatestRunMode | undefined {
+  if (notifyEnabled === undefined) return undefined;
+  return notifyEnabled ? "notify" : "latest";
+}
+
+type BadgeRunData = WorkflowRun[] | WorkflowRun | null;
+
+/** The list's newest run, or the limit-1 read's run as it is. */
+const firstRun = (data: BadgeRunData): WorkflowRun | null =>
+  Array.isArray(data) ? (data[0] ?? null) : data;
+
 /**
- * The single most recent run on a branch, for the header CI badge. Polls fast
- * while it's active, slowly otherwise so a freshly-pushed run still shows up.
+ * The single most recent run on a branch, for the header CI badge. In "notify"
+ * mode it reads the notifier's entry and polls nothing itself; in "latest" mode it
+ * polls fast while the run is active, slowly otherwise so a freshly-pushed run
+ * still shows up. An undefined mode (its inputs unresolved) stays disabled, so a
+ * muted repo never flips modes on open.
  */
 export function useLatestRun(
   repo: string,
   enabled: boolean,
   branch: string | null,
+  mode: LatestRunMode | undefined,
 ) {
-  return useQuery({
-    ...latestRunOptions(repo, branch),
-    enabled: enabled && Boolean(branch),
+  const notify = mode === "notify";
+  return useQuery<BadgeRunData, Error, WorkflowRun | null, readonly unknown[]>({
+    ...(notify
+      ? runNotifyOptions(repo, branch)
+      : latestRunOptions(repo, branch)),
+    enabled: enabled && Boolean(branch) && mode !== undefined,
     // The same repo's last run, across branches, is the badge's "this repo has
     // runs" signal for reserving its slot; callers gate run data on
-    // `!isPlaceholderData` so another branch's run never renders.
-    placeholderData: keepPreviousDataForRepo(repo),
-    refetchInterval: (query) =>
-      query.state.data && isRunActive(query.state.data.status) ? 8000 : 30_000,
+    // `!isPlaceholderData` so another branch's run never renders. The mode is a
+    // placeholder axis (the key's index 3): a flip never hands one read's shape
+    // to the other's.
+    placeholderData: keepPreviousDataForKeyAxes(repo, [[3, mode ?? "latest"]]),
+    select: firstRun,
+    refetchInterval: notify
+      ? undefined
+      : (query) => {
+          const run = query.state.data ? firstRun(query.state.data) : null;
+          return run && isRunActive(run.status) ? 8000 : 30_000;
+        },
   });
 }
 
@@ -458,11 +560,13 @@ function useActionsMutation<TArgs>(
   repo: string,
   mutationFn: (args: TArgs) => Promise<void>,
   kind: RunWriteKind,
+  onSuccess?: () => void,
 ) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationKey: runWriteKey(kind, repo),
     mutationFn,
+    onSuccess,
     // The awaited refresh is Actions' own; re-run/cancel/dispatch don't touch git
     // state. The two CI surfaces the `actions` prefix can't reach (a PR's own
     // checks, the list's `pr-ci` badges) ride along UNAWAITED — neither should
@@ -477,12 +581,21 @@ function useActionsMutation<TArgs>(
   });
 }
 
+/** Re-run, re-run job and play job arm the delayed run recheck: the attempt's
+ *  status can flip after the settle-time read. Their variables name no PR and
+ *  carry at most an optional `lens`, so they hand both lenses' PR checks reads. */
 export function useRerunRun(repo: string) {
+  const queryClient = useQueryClient();
   return useActionsMutation(
     repo,
     (args: RerunRunVars) =>
       forgeCiRunRerun(repo, args.runId, args.failed, args.lens),
     "rerun-run",
+    () =>
+      recheckRunsAfterPush(queryClient, repo, [
+        ...prChecksRecheck(repo, "origin"),
+        ...prChecksRecheck(repo, "upstream"),
+      ]),
   );
 }
 
@@ -495,32 +608,52 @@ export function useCancelRun(repo: string) {
 }
 
 /** Re-run one finished job (GitHub + GitLab). Invalidating the Actions subtree
- *  refreshes the run detail + list; the run goes active and the existing 5s poll
- *  takes over. */
+ *  refreshes the run detail + list; once the run reads active the run poll
+ *  takes over, and the recheck covers a status flip the settle missed (see
+ *  {@link useRerunRun}). */
 export function useRerunJob(repo: string) {
+  const queryClient = useQueryClient();
   return useActionsMutation(
     repo,
     (args: RerunJobVars) => forgeCiJobRerun(repo, args.jobId, args.lens),
     "rerun-job",
+    () =>
+      recheckRunsAfterPush(queryClient, repo, [
+        ...prChecksRecheck(repo, "origin"),
+        ...prChecksRecheck(repo, "upstream"),
+      ]),
   );
 }
 
 /** Play a manual GitLab CI job (GitLab-only). Invalidating the Actions subtree
- *  refreshes the run detail + list; the job goes active and the existing 5s
- *  poll takes over. */
+ *  refreshes the run detail + list; once the job reads active the run poll
+ *  takes over, and the recheck covers a status flip the settle missed (see
+ *  {@link useRerunRun}). */
 export function usePlayCiJob(repo: string) {
+  const queryClient = useQueryClient();
   return useActionsMutation(
     repo,
     (jobId: PlayJobVars) => forgeGlCiPlayJob(repo, jobId),
     "play-job",
+    () =>
+      recheckRunsAfterPush(queryClient, repo, [
+        ...prChecksRecheck(repo, "origin"),
+        ...prChecksRecheck(repo, "upstream"),
+      ]),
   );
 }
 
+/** GitHub creates a dispatched run only after it accepts the dispatch, so the run
+ *  can start after the settle-time read and a dispatch arms the delayed run
+ *  recheck like a push. GitLab and Bitbucket create the pipeline within the call,
+ *  so there the recheck costs one extra read of each active run list. */
 export function useRunWorkflow(repo: string) {
+  const queryClient = useQueryClient();
   return useActionsMutation(
     repo,
     (args: DispatchVars) =>
       forgeCiDispatch(repo, args.workflow, args.gitRef, args.inputs),
     "dispatch",
+    () => recheckRunsAfterPush(queryClient, repo),
   );
 }

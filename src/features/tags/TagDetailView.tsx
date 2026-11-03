@@ -4,9 +4,10 @@ import {
   TrashIcon,
   UploadSimpleIcon,
 } from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { DIALOG_SCROLL } from "@/components/dialog-scroll";
 import { DisabledReasonButton } from "@/components/disabled-reason-button";
@@ -29,13 +30,16 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { useRetryFocusRescue } from "@/features/conversations/ConversationListPanel";
 import { useMentionCandidates } from "@/features/conversations/useMentionCandidates";
+import { useFocusOnControlsSwap } from "@/features/diff/use-hidden-trigger-focus";
 import {
   checkoutDetachedConfirm,
   checkoutTagSuccessToast,
 } from "@/features/history/commit-confirms";
 import { PROMOTION_BLOCKS_CHECKOUT } from "@/features/repository/checkout-copy";
 import { formatBytes } from "@/features/repository/insights/primitives";
+import { refuseWhilePublishing } from "@/features/repository/PublishPendingBanner";
 import { presentError } from "@/lib/error-summary";
 import { UPDATER_MANIFEST_NAME } from "@/lib/git/api";
 import {
@@ -80,12 +84,18 @@ import { promotionBlocksCheckout } from "@/lib/stores/worktree-removal";
 import { parseableDate } from "@/lib/time";
 import { toastError } from "@/lib/toast";
 import { useLatestRef } from "@/lib/use-latest-ref";
+import { useToastClearance } from "@/lib/use-toast-clearance";
 import { cn, PLACEHOLDER_FADE } from "@/lib/utils";
 import { CreateReleaseDialog } from "./CreateReleaseDialog";
+import { tagReleasePhase } from "./tag-detail-phase";
 
 /** Every asset row's Delete holds while one row's delete runs (one shared
  *  mutation), so the line names the operation, not the pressed row's write. */
 const ASSET_DELETE_PENDING_REASON = "Deleting an asset…";
+
+/** The plain view's line while this tag's first release read runs, and the
+ *  reason its dialog openers hold for it. */
+const CHECKING_RELEASE_COPY = "Checking for a release…";
 
 export function TagDetailView({
   repoPath,
@@ -94,6 +104,7 @@ export function TagDetailView({
   repoPath: string;
   tag: string;
 }) {
+  const queryClient = useQueryClient();
   const gh = useForgeStatus(repoPath);
   // Release reads are provider-neutral; a tag with no release stays just a tag.
   const ghReady = forgeFeatureReady(gh.data, "releases");
@@ -177,6 +188,9 @@ export function TagDetailView({
   const [createReleaseOpen, setCreateReleaseOpen] = useState(false);
   const [deleteTagOpen, setDeleteTagOpen] = useState(false);
   const [deleteTagRemote, setDeleteTagRemote] = useState(false);
+  // Set once the plain view has painted for this tag: from then on the pane
+  // waits for the release in place, never behind a skeleton.
+  const [paintedLocal, setPaintedLocal] = useState(false);
 
   // A different tag must never inherit this one's dialogs or its typed release
   // edit (which would save into the new tag once its release loads) — a
@@ -199,6 +213,7 @@ export function TagDetailView({
     setCreateReleaseOpen(false);
     setDeleteTagOpen(false);
     setDeleteTagRemote(false);
+    setPaintedLocal(false);
   }
   // Live identity for write continuations: one started on a tag the user has
   // since left must not close or disarm the next tag's dialogs.
@@ -223,11 +238,11 @@ export function TagDetailView({
       ? undefined
       : release.data;
   const tagInfo = tagList.data?.find((t) => t.name === tag);
-  const isLatest =
-    (releaseList.data ?? []).find((r) => r.tagName === tag)?.isLatest ?? false;
-  // A tag switch paints the PREVIOUS tag's release as placeholder data (success,
-  // never `isLoading`, even disabled), so every release write holds on this until
-  // the two agree. Read off `rel`, so a placeholder it drops holds nothing.
+  const listedRelease = (releaseList.data ?? []).find((r) => r.tagName === tag);
+  const isLatest = listedRelease?.isLatest ?? false;
+  // The release arm admits only a release named for this tag, but placeholder
+  // data can still be one: this tag's older answer, served back after a reset
+  // cleared its read. Every release write holds on it until the read settles.
   const relStale = rel !== undefined && release.isPlaceholderData;
   const staleDim = relStale && "opacity-80";
   // Why the rendered release can't be acted on at all — it gates DOWNLOAD too,
@@ -276,16 +291,55 @@ export function TagDetailView({
     }
   })();
 
-  // Never over an open Create-release dialog, whose draft a skeleton would
-  // unmount: a no-release (404) refetch drops the read back to pending, and a
-  // query reset also zeroes `isFetched`.
-  if (release.isLoading && !release.isFetched && !createReleaseOpen) {
+  // The local view paints at once unless the release list already shows this
+  // tag with a release; only this tag's own release (never another tag's
+  // placeholder) reaches the release arm. `isFetched` keeps a post-404 refetch
+  // from counting as a first load.
+  const detailFirstLoad = release.isFetching && !release.isFetched;
+  const { phase, checkingLine, errorLine, latchLocal } = tagReleasePhase({
+    ghReady,
+    listLoading: releaseList.isLoading,
+    listHasRelease: listedRelease !== undefined,
+    detailFirstLoad,
+    detailFetching: release.isFetching,
+    detailErrored: release.isError,
+    heldRelease: rel !== undefined && rel.tagName === tag,
+    createReleaseOpen,
+    paintedLocal,
+  });
+  if (latchLocal && !paintedLocal) setPaintedLocal(true);
+  // The action bar belongs to the plain-tag arm alone.
+  const tagBarRef = useRef<HTMLDivElement>(null);
+  useToastClearance(tagBarRef, phase === "plain");
+  // The Retry leaves the DOM when pressed (the checking line replaces it).
+  const { hostRef, retryRef } = useRetryFocusRescue(errorLine);
+  // Any arm can swap in under focus; the leaving arm's control drops it.
+  const releaseRootRef = useRef<HTMLDivElement>(null);
+  const plainRootRef = useRef<HTMLDivElement>(null);
+  const skeletonRootRef = useRef<HTMLDivElement>(null);
+  useFocusOnControlsSwap(phase === "release", releaseRootRef);
+  useFocusOnControlsSwap(phase === "plain", plainRootRef);
+  useFocusOnControlsSwap(phase === "skeleton", skeletonRootRef);
+  if (phase === "skeleton") {
     return (
-      <div className="space-y-3 p-4">
-        <Skeleton className="h-5 w-2/3" />
-        <Skeleton className="h-4 w-1/3" />
-        <Skeleton className="h-32 w-full" />
-      </div>
+      <>
+        {/* Outside the aria-busy subtree: busy suppresses descendant
+            live-region announcements, and this box unmounts instead of
+            flipping. */}
+        <span role="status" className="sr-only">
+          Loading release…
+        </span>
+        <div
+          ref={skeletonRootRef}
+          tabIndex={-1}
+          aria-busy="true"
+          className="space-y-3 p-4 outline-none"
+        >
+          <Skeleton className="h-5 w-2/3" />
+          <Skeleton className="h-4 w-1/3" />
+          <Skeleton className="h-32 w-full" />
+        </div>
+      </>
     );
   }
 
@@ -328,8 +382,8 @@ export function TagDetailView({
   // Shared by both provider arms, which differ in what is actually lost: GitHub's
   // uploaded binary is gone for good, while a GitLab asset link can be re-added.
   async function onDeleteAsset(assetName: string, kind: "asset" | "link") {
-    // The name comes off the rendered release, which is the previous tag's
-    // during a switch — refuse before the confirm can name the wrong asset.
+    // The name comes off the rendered release, which may be an older answer
+    // still settling, so refuse before the confirm can name a gone asset.
     if (relStale) return;
     const deleteIn = repoPath;
     const ok = await useConfirm.getState().ask({
@@ -381,13 +435,15 @@ export function TagDetailView({
 
   async function onPushTag() {
     if (tagPush || refuseWhileOffline()) return;
+    if (refuseWhilePublishing(queryClient, repoPath)) return;
+    const pushedIn = repoPath;
     try {
       await pushTag.mutateAsync(tag);
     } catch (e) {
       onError(e);
       return;
     }
-    toast.success(`Pushed ${tag}`);
+    toast.success(`Pushed ${tag}${landedIn(pushedIn).away}`);
   }
 
   // `selectTag` is global — deselect only while THIS tag in THIS repo is still
@@ -401,7 +457,9 @@ export function TagDetailView({
   async function onDeleteTag() {
     // Only the remote arm is held: the local-only delete runs offline.
     if (deleteTagRemote && refuseWhileOffline()) return;
+    if (deleteTagRemote && refuseWhilePublishing(queryClient, repoPath)) return;
     const startedFor = tagKey;
+    const deletedIn = repoPath;
     try {
       await (deleteTagRemote ? deleteTagOnOrigin : deleteLocalTag).mutateAsync(
         tag,
@@ -411,13 +469,13 @@ export function TagDetailView({
       if (isLiveTag(startedFor)) setDeleteTagOpen(false);
       return;
     }
-    toast.success(`Deleted ${tag}`);
+    toast.success(`Deleted ${tag}${landedIn(deletedIn).away}`);
     if (isLiveTag(startedFor)) setDeleteTagOpen(false);
     deselectIfStillHere();
   }
 
   // ── Release view ───────────────────────────────────────────────────────────
-  if (rel) {
+  if (phase === "release" && rel !== undefined) {
     // The updater manifest is a GitHub-only Tauri asset, so the sync affordance only
     // makes sense on a release that actually ships one. Deliberately STRICTER than
     // the other release writes (`canManage` also opens on a ready GitLab repo):
@@ -458,7 +516,7 @@ export function TagDetailView({
 
     const saveEdit = async () => {
       // `draft`/`latest` below are read off the rendered release at submit
-      // time, so a switch behind the open dialog holds the save.
+      // time, so an older answer behind the open dialog holds the save.
       if (relStale || refuseWhileOffline()) return;
       // Empty notes leave the body untouched (the edit skips `--notes`), so
       // there's nothing to carry into the manifest either.
@@ -558,7 +616,12 @@ export function TagDetailView({
     };
 
     return (
-      <div className="flex h-full flex-col" aria-busy={Boolean(staleDim)}>
+      <div
+        ref={releaseRootRef}
+        tabIndex={-1}
+        className="flex h-full flex-col outline-none"
+        aria-busy={Boolean(staleDim)}
+      >
         <header className="space-y-2 border-b px-4 py-3">
           <div className="flex items-start gap-2">
             <h2
@@ -925,7 +988,7 @@ export function TagDetailView({
             <DialogHeader>
               {/* Labelled from the `tag` PROP, which is also what the delete
                   targets — the rendered release can be the previous tag's. */}
-              <DialogTitle>Delete release {tag}?</DialogTitle>
+              <DialogTitle className="pr-8">Delete release {tag}?</DialogTitle>
               <DialogDescription>
                 Removes the {remoteLabel} release. This cannot be undone.
               </DialogDescription>
@@ -959,17 +1022,29 @@ export function TagDetailView({
 
   // ── Plain tag view (no release) ────────────────────────────────────────────
   return (
-    <div className="flex h-full flex-col">
+    <div
+      ref={(node) => {
+        plainRootRef.current = node;
+        hostRef(node);
+      }}
+      tabIndex={-1}
+      className="flex h-full flex-col outline-none"
+    >
       <header className="space-y-2 border-b px-4 py-3">
         <div className="flex items-start gap-2">
           <h2 className="font-mono text-sm font-medium">{tag}</h2>
           <span className="flex-1" />
+          {/* Both dialog openers hold through the first release read: a release
+              landing swaps in the release view, which would unmount the dialog. */}
           {ghReady && canCreate && (
             <DisabledReasonButton
               variant="outline"
               size="xs"
-              disabled={writeBlocked}
-              reason={writeReason}
+              disabled={writeBlocked || detailFirstLoad}
+              reason={
+                writeReason ??
+                (detailFirstLoad ? CHECKING_RELEASE_COPY : undefined)
+              }
               onClick={() => setCreateReleaseOpen(true)}
             >
               Create release
@@ -999,8 +1074,33 @@ export function TagDetailView({
         {!ghReady && (
           <p className="text-[11px] text-muted-foreground">{publishNote}</p>
         )}
+        {/* Quiet by design: no live region, so nothing announces the wait or
+            its end. */}
+        {checkingLine && (
+          <p className="text-[11px] text-muted-foreground">
+            {CHECKING_RELEASE_COPY}
+          </p>
+        )}
+        {errorLine && (
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+            <p>Couldn't load this tag's release.</p>
+            <Button
+              ref={retryRef}
+              variant="ghost"
+              size="xs"
+              aria-label="Retry loading the release"
+              className="cursor-pointer"
+              onClick={() => void release.refetch()}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
       </div>
-      <div className="flex flex-wrap items-center gap-2 border-t p-3">
+      <div
+        ref={tagBarRef}
+        className="flex flex-wrap items-center gap-2 border-t p-3"
+      >
         <Button
           variant="outline"
           size="sm"
@@ -1023,16 +1123,18 @@ export function TagDetailView({
           Push tag
         </DisabledReasonButton>
         <span className="flex-1" />
-        <Button
+        <DisabledReasonButton
           variant="outline"
           size="sm"
+          disabled={detailFirstLoad}
+          reason={detailFirstLoad ? CHECKING_RELEASE_COPY : undefined}
           onClick={() => {
             setDeleteTagRemote(false);
             setDeleteTagOpen(true);
           }}
         >
           Delete tag
-        </Button>
+        </DisabledReasonButton>
       </div>
 
       <CreateReleaseDialog
@@ -1045,7 +1147,7 @@ export function TagDetailView({
       <Dialog open={deleteTagOpen} onOpenChange={setDeleteTagOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete tag {tag}?</DialogTitle>
+            <DialogTitle className="pr-8">Delete tag {tag}?</DialogTitle>
             <DialogDescription>
               Deletes the local tag. This cannot be undone.
             </DialogDescription>

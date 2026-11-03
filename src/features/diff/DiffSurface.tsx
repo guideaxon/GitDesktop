@@ -13,10 +13,14 @@ import {
 } from "@git-diff-view/react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  type Ref,
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -33,6 +37,12 @@ import {
   refreshFailed,
 } from "@/features/conversations/remote-section-state";
 import { decodeBase64Utf8 } from "@/lib/git/api";
+import {
+  classifyHeaderOnlyDiff,
+  type HeaderOnlyDiff,
+  headerOnlyMessage,
+  modeChangeMessage,
+} from "@/lib/git/diff-split";
 import { useFileAtRev } from "@/lib/git/queries";
 import type { FileDiff } from "@/lib/git/types";
 import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
@@ -43,12 +53,16 @@ import { useEffectiveSyntax } from "@/lib/syntax/queries";
 import { toastError } from "@/lib/toast";
 import { useContainerWidth } from "@/lib/use-container-width";
 import { useIsDark } from "@/lib/use-is-dark";
+import { useRetained } from "@/lib/use-retained";
 import {
   capDiffText,
   DIFF_LINE_CAP,
   DIFF_MAX_LINE_CHARS,
   DIFF_MEGA_LINE_CHARS,
+  HIGHLIGHT_MAX_LINES,
+  highlightCostLength,
   longestLineLength,
+  realLineCount,
   shortenLongLines,
 } from "./cap-diff";
 import { DiffErrorBoundary } from "./DiffErrorBoundary";
@@ -60,8 +74,16 @@ import {
   useInDiffPaneSlot,
   useReportPaneSettled,
 } from "./diff-pane-hold";
+import { HOLD_BOUND_MS } from "./diff-pane-slots";
 import "./code-highlight.css";
 import { diffRendersRows } from "./diff-rows";
+import {
+  changesSince,
+  contentBuildGate,
+  contentReadsKey,
+  type Painted,
+  paintedAfter,
+} from "./file-content-gate";
 import { HUNK_SCOPED_MAX_LINES, hunkScopedProcessAST } from "./gap-isolation";
 import { djb2 } from "./highlight-worker-shared";
 import {
@@ -138,6 +160,32 @@ type SideRange = { side: "old" | "new"; from: number; to: number };
 const sideTag = (side: SplitSide): "new" | "old" =>
   side === SplitSide.old ? "old" : "new";
 
+/** A (lineNumber, side)'s counterpart-side line number via the library's
+ *  unified index, or null on any missing step or throw. Module scope: the
+ *  React Compiler can't lower value blocks inside a try/catch. */
+function crossSideLine(
+  viewRef: { readonly current: DiffViewWithMultiSelectRef | null },
+  lineNumber: number,
+  fromSide: "old" | "new",
+  toSide: "old" | "new",
+): number | null {
+  try {
+    const instance = viewRef.current?.getDiffFileInstance();
+    if (!instance) return null;
+    const splitSide = fromSide === "old" ? SplitSide.old : SplitSide.new;
+    const index = instance.getUnifiedLineIndexByLineNumber(
+      lineNumber,
+      splitSide,
+    );
+    if (index == null || index < 0) return null;
+    const item = instance.getUnifiedLine(index);
+    const mapped = toSide === "old" ? item?.oldLineNumber : item?.newLineNumber;
+    return typeof mapped === "number" ? mapped : null;
+  } catch {
+    return null;
+  }
+}
+
 /** User syntax preferences threaded into diff building. */
 export interface SyntaxPrefs {
   syntaxMap?: Record<string, string>;
@@ -156,7 +204,10 @@ export interface DiffContentRevs {
   newRev?: string | null;
 }
 
-/** Lines in a string, allocation-free (mirrors cap-diff's counter). */
+/** `\n`-split segments in a string, allocation-free. A final newline's empty
+ *  segment counts too: the coverage check is unaffected (it compares against
+ *  the last real line) and the read-back budget errs one line tight.
+ *  Diff-size gates use cap-diff's realLineCount instead. */
 function countLines(s: string): number {
   let n = 1;
   for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
@@ -259,6 +310,7 @@ export function DiffModeToggle({
  */
 export function GitDiffView({
   filePath,
+  oldPath,
   text,
   repoPath,
   contentRevs,
@@ -267,6 +319,9 @@ export function GitDiffView({
   forceUnified,
 }: {
   filePath: string;
+  /** The path the old side's whole-file read uses (a rename's source).
+   *  Omitted = `filePath`, for hosts with no old side to read. */
+  oldPath?: string;
   text: string;
   /** The diff's own repo, for reading full file text (highlight context). */
   repoPath?: string;
@@ -283,6 +338,7 @@ export function GitDiffView({
     <DiffErrorBoundary resetKey={`${filePath} ${text.length}`}>
       <RenderedDiff
         filePath={filePath}
+        oldPath={oldPath}
         text={text}
         repoPath={repoPath}
         contentRevs={contentRevs}
@@ -319,6 +375,10 @@ export function overHighlightBudget(
   return textLength > maxChars;
 }
 
+// useShikiRouting's rebuild key while a diff is worker-routed: one stable
+// identity, so a grammar load then never re-triggers a build.
+const WORKER_ROUTED_GRAMMAR_STATE: Record<string, "ready" | "failed"> = {};
+
 // An empty tree for a side whose AST the worker didn't supply; the renderer
 // treats it as "no highlighting" (that side plain — fail-open).
 const EMPTY_WORKER_AST: DiffAST = { type: "root", children: [] };
@@ -352,9 +412,6 @@ function precomputedHighlighter(asts: WorkerAsts): DiffFileHighlighter {
 // Content mode reads and highlights BOTH whole files over IPC (≈2× the hunk
 // path's cost), so it keeps the original, tighter 100KB budget.
 const CONTENT_HIGHLIGHT_MAX_CHARS = 100_000;
-// Content-mode line gate: past this a file isn't read in full (hunk-only path).
-// Deliberately tighter than the 15_000 renderer cap — same 2× reason as above.
-export const HIGHLIGHT_MAX_LINES = 2000;
 
 // Pin the highlight.js singleton's line cap: the core gates its whole-buffer
 // pass on the RECONSTRUCTED file's line count — the library's default 2000
@@ -369,7 +426,8 @@ highlighter.setMaxLineToIgnoreSyntax(SYNTAX_LINE_CAP);
 // tree-shaken.
 installHljsGapIsolation();
 // Before any tokenize, and before ensureCustomLanguages (createDiffFile) so a
-// user grammar registered under `typescript`/`tsx`/`javascript` still wins.
+// user grammar registered under `typescript`/`tsx`/`javascript`/`markdown`
+// still wins.
 installPatchedJsGrammars(highlighter.getHighlighterEngine());
 
 /**
@@ -406,7 +464,8 @@ export function createDiffFile(
     // Built-in Shiki grammars load lazily (useShikiRouting kicks that off), so
     // this synchronous build can only route to Shiki once the grammar is already
     // loaded. Until then a built-in Shiki language falls back to highlight.js /
-    // plain; useShikiRouting's grammarState triggers the rebuild that picks it up.
+    // plain; the rebuild that picks it up rides useShikiRouting's
+    // `holdForGrammar` turning false.
     const useShiki = lang ? isShikiLang(lang) : false;
     const data = {
       oldFile: {
@@ -424,9 +483,13 @@ export function createDiffFile(
     const file = DiffFile.createInstance(data);
     file.initRaw();
     // Gate on the char budget for the engine this diff routes to (~8× apart —
-    // see the constants). Line count only picks the hljs highlighter: the
+    // see the constants), counting both whole files in content mode since this
+    // pass tokenizes them. Line count only picks the hljs highlighter: the
     // singleton's whole-buffer pass below the cap, the hunk-scoped one past it.
-    if (lang && !overHighlightBudget(text.length, useShiki)) {
+    if (
+      lang &&
+      !overHighlightBudget(highlightCostLength(text.length, content), useShiki)
+    ) {
       if (useShiki) {
         file.initSyntax({ registerHighlighter: shikiDiffHighlighter() });
       } else if (pastSyntaxCap(text)) {
@@ -447,27 +510,41 @@ export function createDiffFile(
  * content mode shouldn't apply (no revs, unreadable side, or a diff too big in
  * lines/chars). `pending` is true only while content mode WANTS to apply but
  * its reads haven't settled — callers gate on it so the diff is painted ONCE in
- * its final layout instead of hunk-only then rebuilt. The rev pair MUST match
- * the diff's own old/new. `diffText`/`filePath` should already be deferred.
+ * its final layout instead of hunk-only then rebuilt. `hold` is true while a
+ * refresh's text and reads still disagree (see file-content-gate.ts): callers
+ * keep their previous build on screen rather than build a paint the rest of
+ * the refresh would restructure, so each refresh paints once. The rev pair MUST
+ * match the diff's own old/new. `diffText`/`filePath` should already be
+ * deferred.
  */
 export function useFileContent(
   repoPath: string | undefined,
   filePath: string,
+  // The old side's path: the diff's rename source, else `filePath`.
+  oldPath: string,
   diffText: string,
   contentRevs?: DiffContentRevs,
-  // Max diff size before content mode engages. The read-only surface caps its
-  // render at DIFF_LINE_CAP; the staging view renders every hunk regardless, so
-  // it passes the larger highlight budget instead of falling back to hunk-only.
+  // Max diff size before content mode engages: each host's render cap, so a
+  // capped render is never content mode. The staging view passes
+  // stagingContentMaxLines(showFull), its own cap until Show full diff.
   maxDiffLines: number = DIFF_LINE_CAP,
-): { content: { old: string; new: string } | null; pending: boolean } {
+  // Keep the shown build whatever its reads do (a view held on purpose).
+  frozen = false,
+): {
+  content: { old: string; new: string } | null;
+  pending: boolean;
+  hold: boolean;
+  /** An enabled side read is fetching, a refetch of cached data included. */
+  fetching: boolean;
+} {
   const oldRev = contentRevs?.oldRev;
   const newRev = contentRevs?.newRev;
   const wantContent =
-    !!repoPath && !!contentRevs && countLines(diffText) <= maxDiffLines;
+    !!repoPath && !!contentRevs && realLineCount(diffText) <= maxDiffLines;
   const oldQ = useFileAtRev(
     repoPath ?? "",
     oldRev ?? null,
-    filePath,
+    oldPath,
     wantContent && oldRev !== undefined,
   );
   const newQ = useFileAtRev(
@@ -493,8 +570,10 @@ export function useFileContent(
   );
   // Usable once the enabled side-reads settle and both files fit the highlight
   // budget (a 1-line change in a huge file stays hunk-only, no whole-file walk).
-  const oldSettled = oldRev === undefined || !oldQ.isPending;
-  const newSettled = newRev === undefined || !newQ.isPending;
+  const oldSettled =
+    oldRev === undefined || !(oldQ.isPending && oldQ.errorUpdateCount === 0);
+  const newSettled =
+    newRev === undefined || !(newQ.isPending && newQ.errorUpdateCount === 0);
   const fitsBudget = (s: string) =>
     s.length <= CONTENT_HIGHLIGHT_MAX_CHARS &&
     countLines(s) <= HIGHLIGHT_MAX_LINES;
@@ -512,15 +591,57 @@ export function useFileContent(
     covers(newText, maxNewLine) &&
     covers(oldText, maxOldLine);
   // Content mode wants to apply but its reads are in flight — the caller holds
-  // the paint rather than build a hunk-only diff it will restructure. isPending,
-  // NOT isFetching: a background refetch of cached data must never re-blank.
+  // the paint rather than build a hunk-only diff it will restructure. Only a
+  // first read pends: a background refetch of cached data must never re-blank,
+  // nor one of a failed read, which react-query resets to pending each time.
   const pending = wantContent && (!oldSettled || !newSettled);
+
+  // The inputs of the build on screen, and the one whose hold ran its bound.
+  const [painted, setPainted] = useState<Painted | null>(null);
+  const [expiredFor, setExpiredFor] = useState<Painted | null>(null);
+  const now = {
+    reads: contentReadsKey(filePath, oldRev, newRev, oldPath),
+    text: diffText,
+    oldText,
+    newText,
+  };
+  const oldFetching = oldRev !== undefined && oldQ.isFetching;
+  const newFetching = newRev !== undefined && newQ.isFetching;
+  const decision = contentBuildGate({
+    wantContent,
+    oldSettled,
+    newSettled,
+    oldFetching,
+    newFetching,
+    ...changesSince(painted, now),
+    boundExpired: painted !== null && expiredFor === painted,
+    frozen,
+  });
+  const nextPainted = paintedAfter(painted, decision, pending, now, {
+    wantContent,
+    inFlight: oldFetching || newFetching,
+  });
+  if (nextPainted !== painted) setPainted(nextPainted);
+  const hold = decision === "hold-previous";
+  // The bound runs from the hold's start: no render during a hold moves
+  // `painted`.
+  useEffect(() => {
+    if (!hold || frozen || painted === null) return;
+    const bound = window.setTimeout(
+      () => setExpiredFor(painted),
+      HOLD_BOUND_MS,
+    );
+    return () => window.clearTimeout(bound);
+  }, [hold, frozen, painted]);
+  const fetching = oldFetching || newFetching;
   return useMemo(
     () => ({
       content: useContent ? { old: oldText, new: newText } : null,
       pending,
+      hold,
+      fetching,
     }),
-    [useContent, oldText, newText, pending],
+    [useContent, oldText, newText, pending, hold, fetching],
   );
 }
 
@@ -530,9 +651,10 @@ export function useFileContent(
  * and off-thread worker ASTs for an over-budget Shiki-routed diff. Shared by
  * both {@link createDiffFile} call sites so they apply the same routing rules.
  *
- * Contract: callers must list `grammarState` in their {@link createDiffFile}
- * memo's deps — it's read only via module state (isShikiLang), so listing it
- * explicitly is what forces the rebuild that picks the loaded grammar up.
+ * Contract: the rebuild that picks a loaded grammar up rides `holdForGrammar`
+ * turning false. Callers still list `grammarState` in their
+ * {@link createDiffFile} memo's deps for biome and an uncompiled caller; the
+ * compiler derives a compiled caller's keys from the body and drops it.
  * `workerHighlighter` goes to the view as its `registerHighlighter` prop and
  * must NOT be a build dep: keeping the DiffFile identity stable across the
  * ASTs' arrival is what preserves the view's expansion state.
@@ -588,8 +710,11 @@ export function useShikiRouting({
       grammarState[lang] !== undefined ||
       // Over the Shiki budget (a builtin-Shiki lang is Shiki-routed, so that's
       // the budget that applies) the main thread never tokenizes this file —
-      // the worker loads its own grammar copy. Loading here too would waste the
-      // fetch AND flip grammarState, rebuilding the interim hljs paint to plain.
+      // the worker loads its own grammar copy. Deliberately judged on the diff
+      // text alone, so a content-mode mount fetches in parallel with its reads;
+      // a fetch the content then routes to the worker can't rebuild the paint:
+      // over budget `holdForGrammar` stays false, so its settle flips nothing
+      // (the frozen rebuild key below backstops an uncompiled caller).
       overHighlightBudget(text.length, true)
     )
       return;
@@ -630,7 +755,14 @@ export function useShikiRouting({
   const useShikiWorker =
     !!lang &&
     (isShikiLang(lang) || isBuiltinShikiLang(lang) || tmGrammar != null);
-  const overBudget = !!lang && overHighlightBudget(text.length, useShikiWorker);
+  // Content-aware like createDiffFile's sync gate, so the worker takes exactly
+  // the content-mode paints the main thread won't tokenize.
+  const overBudget =
+    !!lang &&
+    overHighlightBudget(
+      highlightCostLength(text.length, content),
+      useShikiWorker,
+    );
   const workerAsts = useWorkerHighlight({
     // Shiki-routed + over budget only. Don't request while whole-file reads are
     // still settling — the worker input would be built on interim text and
@@ -655,7 +787,15 @@ export function useShikiRouting({
   // budget, hold — so the lazy-grammar rebuild still lands in one paint.
   const holdForGrammar = grammarPending && !overBudget;
 
-  return { holdForGrammar, grammarState, workerHighlighter };
+  // Over budget the main thread never Shiki-tokenizes, so a grammar settling
+  // then must not rebuild the interim paint. `holdForGrammar` staying false
+  // holds that for compiled callers, whose memo keys drop `grammarState`; the
+  // frozen key backstops an uncompiled caller that still keys on it.
+  return {
+    holdForGrammar,
+    grammarState: overBudget ? WORKER_ROUTED_GRAMMAR_STATE : grammarState,
+    workerHighlighter,
+  };
 }
 
 /** The per-side line -> render() maps the vendored DiffView consumes. */
@@ -663,6 +803,7 @@ type AnchorExtendData = Record<string, { data: { render: () => ReactNode } }>;
 
 function RenderedDiff({
   filePath,
+  oldPath,
   text,
   repoPath,
   contentRevs,
@@ -671,6 +812,7 @@ function RenderedDiff({
   forceUnified,
 }: {
   filePath: string;
+  oldPath?: string;
   text: string;
   repoPath?: string;
   contentRevs?: DiffContentRevs;
@@ -705,6 +847,7 @@ function RenderedDiff({
   // screen and builds the new one at low priority, coalescing fast steps.
   const deferredText = useDeferredValue(text);
   const deferredPath = useDeferredValue(filePath);
+  const deferredOldPath = useDeferredValue(oldPath ?? filePath);
 
   // Reset on the DEFERRED path, not the urgent `filePath`: `blocked` derives
   // from `deferredText`, so an urgent reset would re-block the OUTGOING mega
@@ -729,10 +872,16 @@ function RenderedDiff({
 
   // Whole-file highlight context + collapsible expand for small diffs (`content`
   // null = capped hunk-only). Hold the whole paint while `contentPending` so the
-  // diff is built ONCE in its final layout rather than rebuilt (the "flash").
-  const { content, pending: contentPending } = useFileContent(
+  // diff is built ONCE in its final layout rather than rebuilt (the "flash"),
+  // and keep the previous build up through a refresh's `contentHold`.
+  const {
+    content,
+    pending: contentPending,
+    hold: contentHold,
+  } = useFileContent(
     repoPath,
     deferredPath,
+    deferredOldPath,
     deferredText,
     // Shortened hunk text (long lines cut) would no longer line up with the
     // whole-file reads content mode maps syntax onto, and the two whole-file
@@ -777,17 +926,17 @@ function RenderedDiff({
     filePath: deferredPath,
     text: shown,
     content: content ?? null,
-    contentPending,
+    contentPending: contentPending || contentHold,
     blocked,
     syntaxMap,
     customLanguages,
   });
 
-  // grammarState: rebuild-trigger dep — see useShikiRouting's contract.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: grammarState is an intentional rebuild trigger, read via module state not directly
-  const diffFile = useMemo(
+  // grammarState: inert once compiled; see useShikiRouting's contract.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: grammarState stays listed for the uncompiled path; the rebuild rides holdForGrammar
+  const builtDiffFile = useMemo(
     () =>
-      blocked || contentPending || holdForGrammar
+      blocked || contentPending || holdForGrammar || contentHold
         ? null
         : createDiffFile(
             deferredPath,
@@ -804,9 +953,14 @@ function RenderedDiff({
       blocked,
       contentPending,
       holdForGrammar,
+      contentHold,
       grammarState,
     ],
   );
+  // Through a refresh's hold, the build already on screen, with the worker
+  // highlighting painted on it (the worker answers nothing while held).
+  const diffFile = useRetained(builtDiffFile, !contentHold);
+  const shownHighlighter = useRetained(workerHighlighter, !contentHold);
 
   // Per-side extendData maps, keyed by String(line). Memoized for referential
   // stability: the vendored DiffView is store-based and a fresh object each
@@ -924,32 +1078,13 @@ function RenderedDiff({
     [],
   );
 
-  // Map a (lineNumber, side) to its counterpart-side line number using the
-  // library's unified index. Guards every step (instance/indices may be
-  // null/undefined) and returns null rather than throwing.
   const mapCrossSideLine = useCallback(
     (
       lineNumber: number,
       fromSide: "old" | "new",
       toSide: "old" | "new",
-    ): number | null => {
-      try {
-        const instance = multiSelectRef.current?.getDiffFileInstance();
-        if (!instance) return null;
-        const splitSide = fromSide === "old" ? SplitSide.old : SplitSide.new;
-        const index = instance.getUnifiedLineIndexByLineNumber(
-          lineNumber,
-          splitSide,
-        );
-        if (index == null || index < 0) return null;
-        const item = instance.getUnifiedLine(index);
-        const mapped =
-          toSide === "old" ? item?.oldLineNumber : item?.newLineNumber;
-        return typeof mapped === "number" ? mapped : null;
-      } catch {
-        return null;
-      }
-    },
+    ): number | null =>
+      crossSideLine(multiSelectRef, lineNumber, fromSide, toSide),
     [],
   );
 
@@ -1113,11 +1248,15 @@ function RenderedDiff({
     mo.observe(host, { childList: true, subtree: true });
     return () => mo.disconnect();
   }, [diffFile]);
+  // A refresh's hold over a paint that never built (a grammar was still
+  // loading) has nothing to keep, so it renders nothing too.
+  const holdBlank = contentHold && diffFile === null;
   // The blocked placeholder is final; the pending arm below renders nothing.
   useReportPaneSettled(
     blocked ||
       (!contentPending &&
         !holdForGrammar &&
+        !holdBlank &&
         (diffFile === null ||
           !diffRendersRows(diffFile) ||
           rowsFor === diffFile)),
@@ -1147,7 +1286,7 @@ function RenderedDiff({
   // placeholder so loading never reads as "No changes to show". Over budget
   // `holdForGrammar` is never true — the interim hljs paint isn't delayed for a
   // grammar only the worker needs.
-  if (contentPending || holdForGrammar) return null;
+  if (contentPending || holdForGrammar || holdBlank) return null;
   if (!diffFile) return <DiffPlaceholder message="No changes to show" />;
   return (
     <>
@@ -1160,7 +1299,7 @@ function RenderedDiff({
           diffFile={diffFile}
           // Worker ASTs land as a highlighter PROP, not a rebuild: the view's
           // effect applies them to its own clone, so expansion state survives.
-          registerHighlighter={workerHighlighter}
+          registerHighlighter={shownHighlighter}
           diffViewMode={diffViewMode}
           diffViewTheme={isDark ? "dark" : "light"}
           diffViewHighlight
@@ -1187,7 +1326,7 @@ function RenderedDiff({
       ) : (
         <DiffView<{ render: () => ReactNode }>
           diffFile={diffFile}
-          registerHighlighter={workerHighlighter}
+          registerHighlighter={shownHighlighter}
           diffViewMode={diffViewMode}
           diffViewTheme={isDark ? "dark" : "light"}
           diffViewHighlight
@@ -1197,33 +1336,81 @@ function RenderedDiff({
           renderExtendLine={renderExtendLine}
         />
       )}
-      {(hidden > 0 || shortened > 0) && (
-        <div className="flex items-center justify-center gap-3 border-t bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          {hidden > 0 && (
-            <span>
-              {hidden.toLocaleString()} more {hidden === 1 ? "line" : "lines"}{" "}
-              hidden for performance
-            </span>
-          )}
-          {shortened > 0 && (
-            <span>
-              {shortened.toLocaleString()} long{" "}
-              {shortened === 1 ? "line" : "lines"} shortened
-              {hidden > 0 ? "" : " for performance"}
-            </span>
-          )}
-          {hidden > 0 && (
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => setShowFull(true)}
-            >
-              Show full diff
-            </Button>
-          )}
-        </div>
-      )}
+      <DiffCapFooter
+        hidden={hidden}
+        shortened={shortened}
+        onShowFull={() => setShowFull(true)}
+      />
     </>
+  );
+}
+
+const SHOW_FULL_DIFF_LABEL = "Show full diff";
+
+/**
+ * The strip under a capped or shortened diff: what was hidden or shortened, and
+ * Show full diff while lines are hidden. The one source of this copy for every
+ * diff host. A host that holds its diff's actions passes `held`/`heldReason`
+ * (the button then explains its hold and keeps its tab stop) and its own
+ * `onButtonKeyDown`; without them the button is a plain Button.
+ */
+export function DiffCapFooter({
+  hidden,
+  shortened,
+  onShowFull,
+  onButtonKeyDown,
+  held,
+  heldReason,
+  buttonRef,
+}: {
+  hidden: number;
+  shortened: number;
+  onShowFull: (e: ReactMouseEvent<HTMLElement>) => void;
+  onButtonKeyDown?: (e: ReactKeyboardEvent<HTMLElement>) => void;
+  held?: boolean;
+  heldReason?: string;
+  buttonRef?: Ref<HTMLButtonElement>;
+}) {
+  if (hidden <= 0 && shortened <= 0) return null;
+  return (
+    <div className="flex items-center justify-center gap-3 border-t bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+      {hidden > 0 && (
+        <span>
+          {hidden.toLocaleString()} more {hidden === 1 ? "line" : "lines"}{" "}
+          hidden for performance
+        </span>
+      )}
+      {shortened > 0 && (
+        <span>
+          {shortened.toLocaleString()} long {shortened === 1 ? "line" : "lines"}{" "}
+          shortened
+          {hidden > 0 ? "" : " for performance"}
+        </span>
+      )}
+      {hidden > 0 &&
+        (held === undefined && heldReason === undefined ? (
+          <Button
+            ref={buttonRef}
+            size="xs"
+            variant="outline"
+            onClick={onShowFull}
+          >
+            {SHOW_FULL_DIFF_LABEL}
+          </Button>
+        ) : (
+          <DisabledReasonButton
+            ref={buttonRef}
+            size="xs"
+            variant="outline"
+            disabled={held}
+            reason={heldReason}
+            onKeyDown={onButtonKeyDown}
+            onClick={onShowFull}
+          >
+            {SHOW_FULL_DIFF_LABEL}
+          </DisabledReasonButton>
+        ))}
+    </div>
   );
 }
 
@@ -1366,13 +1553,21 @@ export function DiffContent({
   // the text is trimmed once) because the registrations below are hooks: offer
   // each action only in the states that actually render its control.
   const emptyDiff = data !== undefined && data.text.trim() === "";
+  // A section that changed no content (an empty file, a mode change, a pure
+  // rename or copy) has no body for a toolbar to configure.
+  const dataText = data?.text;
+  const headerOnly = useMemo(
+    () => (dataText === undefined ? null : classifyHeaderOnlyDiff(dataText)),
+    [dataText],
+  );
   // A failed refresh keeps the diff, and its toolbar, on screen.
   const showsToolbar =
     !isPending &&
     data !== undefined &&
     data.filePath === filePath &&
     !data.isBinary &&
-    !emptyDiff;
+    !emptyDiff &&
+    headerOnly === null;
   // Preview's rev source: the diff's own pair where there is one, else the
   // new-side-only `previewRev`. Deliberately not merged into `contentRevs` — a
   // previewRev host has no old side and must not light up content mode.
@@ -1383,6 +1578,33 @@ export function DiffContent({
     showsToolbar && canPreviewMarkdown(filePath, repoPath, previewRevs);
   const previewOn = canPreview && mdView === "preview";
   useFocusOnControlsSwap(previewOn, controlsRef);
+  // A refetch can take the toolbar away (the file emptied, a mode-only change
+  // left), unmounting the control that held focus: it lands on the arm that
+  // replaced it.
+  const armLandingRef = useRef<HTMLDivElement | null>(null);
+  useFocusOnControlsSwap(showsToolbar, armLandingRef);
+  // Bringing the toolbar back unmounts that arm: only focus it held as it left
+  // (read in its ref cleanup, which runs before removal) lands on the toolbar's
+  // own landing, so a cold load or another file's swap never takes focus.
+  const armHeldFocus = useRef(false);
+  const armRef = useCallback((node: HTMLDivElement | null) => {
+    armLandingRef.current = node;
+    return () => {
+      armHeldFocus.current =
+        node !== null && node.contains(document.activeElement);
+      armLandingRef.current = null;
+    };
+  }, []);
+  const toolbarWasShown = useRef(showsToolbar);
+  useLayoutEffect(() => {
+    const was = toolbarWasShown.current;
+    toolbarWasShown.current = showsToolbar;
+    if (was || !showsToolbar) return;
+    const owned = armHeldFocus.current;
+    armHeldFocus.current = false;
+    if (owned && document.activeElement === document.body)
+      controlsRef.current?.focus({ preventScroll: true });
+  }, [showsToolbar, controlsRef]);
   // False only inside a held or preparing diff-pane slot, which `inert` can't
   // shield from global hotkeys.
   const { interactive } = useDiffPaneHold();
@@ -1425,6 +1647,10 @@ export function DiffContent({
   if (!data) {
     return <DiffPlaceholder message="Could not load diff for this file" />;
   }
+  // The old side's whole-file reads follow the diff's own pairing. A placeholder
+  // never lends its `oldPath`: it is another key's diff (another commit's, for
+  // the same path), while the revs already name the new selection.
+  const oldSidePath = dataIsPlaceholder ? filePath : (data.oldPath ?? filePath);
 
   // Error + fetching (a reconnect's resumed read) is unsettled: no notice. A
   // settled error says it failed, with Retry; a park (alone, or over an error)
@@ -1444,10 +1670,18 @@ export function DiffContent({
       className="shrink-0 border-b py-1.5"
     />
   );
-  // The binary, image and empty arms draw retained data too, so they carry the
-  // same notice as the text diff.
-  const withNotice = (arm: ReactNode) => (
-    <div className="flex h-full flex-col">
+  // The binary, image, empty and header-only arms draw retained data too, so
+  // they carry the same notice as the text diff. A placeholder arm is the
+  // focus landing for a toolbar swap (not the image arm: a focusable ancestor
+  // would take every click into its scroller), keyed apart from the toolbar
+  // arm, whose reuse of the node would drop its tabIndex under held focus.
+  const withNotice = (arm: ReactNode, landing = true) => (
+    <div
+      key={landing ? "arm-landing" : "arm-image"}
+      ref={landing ? armRef : undefined}
+      tabIndex={landing ? -1 : undefined}
+      className="flex h-full flex-col outline-none"
+    >
       {notice}
       <div className="min-h-0 flex-1">{arm}</div>
     </div>
@@ -1455,7 +1689,13 @@ export function DiffContent({
   if (data.isBinary) {
     if (repoPath && imageRevs && imageMime(filePath)) {
       return withNotice(
-        <ImageDiff repoPath={repoPath} filePath={filePath} revs={imageRevs} />,
+        <ImageDiff
+          repoPath={repoPath}
+          filePath={filePath}
+          oldPath={oldSidePath}
+          revs={imageRevs}
+        />,
+        false,
       );
     }
     return withNotice(
@@ -1463,7 +1703,26 @@ export function DiffContent({
     );
   }
   if (emptyDiff) {
-    return withNotice(<DiffPlaceholder message="No changes to show" />);
+    // An untracked empty file's --no-index diff is header-only, which the arm
+    // below names; an empty answer for one still never reads as unchanged.
+    return withNotice(
+      <DiffPlaceholder
+        message={
+          stagingSide === "untracked"
+            ? headerOnlyMessage({ kind: "new-empty" })
+            : "No changes to show"
+        }
+      />,
+    );
+  }
+  // Ahead of the preview arms, so a new empty Markdown file never opens Preview.
+  if (headerOnly !== null) {
+    return withNotice(
+      <DiffPlaceholder
+        message={headerOnlyMessage(headerOnly)}
+        action={<HeaderOnlyDetail diff={headerOnly} />}
+      />,
+    );
   }
 
   // SVGs are text, but they're also images: show the rendered old/new
@@ -1555,6 +1814,7 @@ export function DiffContent({
           <MarkdownDocPreview
             repoPath={repoPath}
             filePath={filePath}
+            oldPath={oldSidePath}
             revs={previewRevs}
           />
         ) : (
@@ -1564,12 +1824,14 @@ export function DiffContent({
                 <ImagePanes
                   repoPath={repoPath}
                   filePath={filePath}
+                  oldPath={oldSidePath}
                   revs={imageRevs}
                 />
               </div>
             )}
             <GitDiffView
               filePath={filePath}
+              oldPath={oldSidePath}
               text={data.text}
               repoPath={repoPath}
               // A truncated diff was cut by the byte cap and can't line up
@@ -1586,6 +1848,34 @@ export function DiffContent({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/** A rename or copy's two ends under its header-only message (the toolbar,
+ *  the only other full-path row, isn't shown), and the mode change when one
+ *  rides along. Nothing for the other kinds. */
+function HeaderOnlyDetail({ diff }: { diff: HeaderOnlyDiff }) {
+  if (diff.kind !== "rename" && diff.kind !== "copy") return null;
+  const mode = modeChangeMessage(diff);
+  return (
+    <div className="flex w-full max-w-md min-w-0 flex-col items-center gap-1 px-4 text-xs">
+      {diff.oldPath !== undefined && (
+        <HeaderOnlyPathRow label="From" path={diff.oldPath} />
+      )}
+      {diff.newPath !== undefined && (
+        <HeaderOnlyPathRow label="To" path={diff.newPath} />
+      )}
+      {mode !== null && <p>{mode}</p>}
+    </div>
+  );
+}
+
+function HeaderOnlyPathRow({ label, path }: { label: string; path: string }) {
+  return (
+    <div className="flex max-w-full min-w-0 gap-1.5">
+      <span className="shrink-0">{label}</span>
+      <PathText path={path} className="font-mono" />
     </div>
   );
 }

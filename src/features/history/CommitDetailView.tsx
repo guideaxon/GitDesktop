@@ -1,6 +1,13 @@
 import { CopyIcon, DotsThreeVerticalIcon } from "@phosphor-icons/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useDeferredValue, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  useDeferredValue,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 import { CommitAuthorAvatar } from "@/components/commit-author-avatar";
 import { DetailRail, DetailRailRow } from "@/components/detail-rail";
@@ -20,18 +27,38 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AmendForcePushDialog } from "@/features/commit/AmendForcePushDialog";
+import {
+  DegradedListNotice,
+  useRetryFocusRescue,
+} from "@/features/conversations/ConversationListPanel";
+import {
+  detailNoticeMessage,
+  refreshFailed,
+  resolveDetailPane,
+} from "@/features/conversations/remote-section-state";
 import { DiffPlaceholder } from "@/features/diff/DiffPlaceholder";
 import { DiffSurface, type LineWidget } from "@/features/diff/DiffSurfaceLazy";
+import {
+  FileSlots,
+  keyedPaneView,
+  placeholderPaneView,
+  type SlotRead,
+  useFileSlots,
+  useSlotRead,
+  useSlotWidget,
+} from "@/features/diff/file-slot";
 import { JiraRefRow } from "@/features/issues/JiraRefRow";
 import {
   CommitComments,
   CommitLineComposer,
+  type DiffSections,
   useCommitCommentsGate,
   useCommitLineAnchors,
 } from "@/features/pulls/CommitComments";
 import { usePrCapabilities } from "@/features/pulls/usePrCapabilities";
 import { PROMOTION_BLOCKS_CHECKOUT } from "@/features/repository/checkout-copy";
 import { copyText } from "@/lib/clipboard";
+import { presentError } from "@/lib/error-summary";
 import type { CommitParent } from "@/lib/git/api";
 import { splitUnifiedDiff } from "@/lib/git/diff-split";
 import {
@@ -52,7 +79,12 @@ import {
   useRemoteCommitDiff,
   useRevertCommit,
 } from "@/lib/git/queries";
-import { providerLabel, type RepoStatus } from "@/lib/git/types";
+import {
+  type CommitCommentOut,
+  type ForgeProvider,
+  providerLabel,
+  type RepoStatus,
+} from "@/lib/git/types";
 import { listKeyboardNav } from "@/lib/list-keyboard-nav";
 import { useConfirm } from "@/lib/stores/confirm";
 import { refuseIfSwitched } from "@/lib/stores/notifications";
@@ -61,11 +93,11 @@ import { toastError } from "@/lib/toast";
 import { useLatestRef } from "@/lib/use-latest-ref";
 import { cn, PLACEHOLDER_FADE } from "@/lib/utils";
 import {
+  AMEND_HOLD_HINT,
   CHERRY_PICK_ALREADY_APPLIED,
   checkoutCommitConfirm,
   checkoutCommitSuccessToast,
   cherryPickCommitConfirm,
-  HISTORY_REFRESHING_HINT,
   type MergeParentOp,
   revertCommitConfirm,
 } from "./commit-confirms";
@@ -119,11 +151,18 @@ export function CommitDetailView({
   // Fetch only once the path is one this commit actually changed. The path comes
   // FROM the file list, so it's the previous commit's both while that list is a
   // placeholder AND for the deferred frame after it settles — and a fetch there
-  // "succeeds" with an empty diff, flashing "No changes to show".
-  const diffEnabled =
+  // "succeeds" with an empty diff, flashing "No changes to show". Per slot path:
+  // a held slot's file stays in the list it settled with, since a new list means
+  // a new commit, which never holds.
+  const diffEnabledFor = (path: string) =>
     !files.isPlaceholderData &&
-    (files.data?.some((f) => f.path === deferredPath) ?? false);
-  const diff = useCommitFileDiff(repoPath, hash, deferredPath, diffEnabled);
+    (files.data?.some((f) => f.path === path) ?? false);
+  // The file's diff swaps through the pane's two-slot hold, within this commit;
+  // another commit re-targets the shown slot in place.
+  const diffTarget = deferredPath
+    ? keyedPaneView(repoPath, hash, deferredPath, deferredPath)
+    : placeholderPaneView(hash);
+  const diffSlots = useFileSlots(diffTarget);
   // The commit the header shows: while the selected one's details are still a
   // placeholder, the last one whose details settled (the placeholder's source).
   const [settledHash, setSettledHash] = useState(hash);
@@ -165,19 +204,38 @@ export function CommitDetailView({
   // GitHub commit-comment `position` mapping must walk GitHub's OWN patch (local
   // git's diff can differ — rename detection, context), so we fetch the forge's
   // diff only for GitHub. GitLab/Bitbucket anchor by plain line and need none.
+  // Fetched only when needed: a comment anchored by position alone, or pointer or
+  // focus entering this commit's diff (the line composer's prerequisite).
+  const needsPatchWalk =
+    comments.data?.some(
+      (c) => c.path != null && c.line == null && c.position != null,
+    ) ?? false;
+  const [diffIntentHash, setDiffIntentHash] = useState<string | null>(null);
+  const diffIntent = diffIntentHash === renderedHash;
+  const armDiff = () => {
+    if (!diffIntent) setDiffIntentHash(renderedHash);
+  };
+  // Keyboard parity with a resting pointer's move: focus already inside the diff
+  // when the commit changes re-arms the new one, since no focus event fires.
+  const diffRegion = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (diffRegion.current?.contains(document.activeElement))
+      setDiffIntentHash(renderedHash);
+  }, [renderedHash]);
   const remoteDiff = useRemoteCommitDiff(
     repoPath,
-    providerKey === "github" && commentsReady ? renderedHash : null,
+    providerKey === "github" && commentsReady && (needsPatchWalk || diffIntent)
+      ? renderedHash
+      : null,
   );
   const remoteSections = useMemo(
     () => splitUnifiedDiff(remoteDiff.data ?? ""),
     [remoteDiff.data],
   );
 
-  // Line-anchored comments + the inline composer target the RENDERED file, which
-  // the diff drives off `deferredPath` (not effectivePath) — so use deferredPath
-  // throughout, letting anchors/widget follow the file the diff actually shows
-  // while rapid arrow-keying settles.
+  // Line-anchored comments + the inline composer target the RENDERED file: each
+  // diff slot computes them for its own path (CommitFileDiffSlot), so a held
+  // file never shows the next one's anchors.
   // Inline comment bodies linkify against the same origin-lens repo they were
   // read from; the resolved provider only, never `providerKey`'s GitHub default.
   const commentRefs: MarkdownRefs | undefined = provider
@@ -187,62 +245,9 @@ export function CommitDetailView({
   // only as long as the file list is a placeholder too: a settled list starts
   // the selected commit's diff, which must not take the rendered one's anchors.
   const anchorsMatchDiff = renderedHash === hash || files.isPlaceholderData;
-  const lineAnchors = useCommitLineAnchors(
-    comments.data,
-    providerKey === "github" ? remoteSections : undefined,
-    commentsReady && anchorsMatchDiff ? deferredPath : null,
-    commentRefs,
-  );
   // Both commit queries keep serving the PREVIOUS commit while the selected one
   // loads, so everything derived from them is that commit's until it lands.
   const stale = details.isPlaceholderData || files.isPlaceholderData;
-  // The diff query outlasts that window with the previous FILE's diff, so the
-  // rendered lines can belong to another file or commit than `hash`+`deferredPath`.
-  const diffStale = stale || diff.isPlaceholderData;
-  const lineWidget = useMemo<LineWidget | undefined>(() => {
-    if (!commentsReady || !deferredPath) return undefined;
-    // A line click while stale would address `hash` — the newly selected commit —
-    // with a path and line read off the previous one's diff.
-    if (diffStale) return undefined;
-    // On GitHub the composer recovers its `position` from the FORGE diff; until
-    // that fetch succeeds `remoteSections` is empty, so every line would open the
-    // composer disabled with "This line isn't in the commit's diff for this file"
-    // — a reason that blames the line rather than the missing patch. So keep the
-    // line numbers un-clickable (read-only diff) until the remote diff loads; the
-    // whole-commit composer in the pane below still works. GitLab/Bitbucket anchor
-    // by plain line and need no remote diff, so they're unaffected.
-    if (providerKey === "github" && !remoteDiff.isSuccess) return undefined;
-    return {
-      enabled: true,
-      render: ({ side, line, fromLine, onClose }) => (
-        <CommitLineComposer
-          repoPath={repoPath}
-          sha={hash}
-          path={deferredPath}
-          side={side}
-          line={line}
-          fromLine={fromLine}
-          provider={providerKey}
-          fileSection={
-            providerKey === "github"
-              ? remoteSections.get(deferredPath)
-              : undefined
-          }
-          onClose={onClose}
-          lens="origin"
-        />
-      ),
-    };
-  }, [
-    commentsReady,
-    diffStale,
-    deferredPath,
-    repoPath,
-    hash,
-    providerKey,
-    remoteSections,
-    remoteDiff.isSuccess,
-  ]);
 
   // Same actions as the history list's right-click menu (minus the
   // dialog-driven ones), surfaced behind a visible ⋯ for discoverability.
@@ -274,17 +279,99 @@ export function CommitDetailView({
   const isHead = isLatest && headAgrees(logTop, head?.oid);
   const onError = (e: unknown) => toastError(e);
 
-  if (details.isPending || files.isPending) {
-    return (
+  // The commit renders only with both reads loaded, so the ladder merges them:
+  // a failure beside the other read's refetch in flight hasn't settled.
+  const pane = resolveDetailPane({
+    pending: details.isPending || files.isPending,
+    error: details.isError || files.isError,
+    hasData: details.data !== undefined && files.data !== undefined,
+    paused: details.isPaused || files.isPaused,
+    fetching: details.isFetching || files.isFetching,
+  });
+  const failed =
+    (details.isError || files.isError) &&
+    !details.isFetching &&
+    !files.isFetching &&
+    !details.isPaused &&
+    !files.isPaused;
+  // Only the failed read refetches: a healthy one would churn its placeholder.
+  const retryErrored = () => {
+    if (details.isError) void details.refetch();
+    if (files.isError) void files.refetch();
+  };
+  // Retry resets the failed read to pending, swapping the error arm for the
+  // skeleton; every arm renders in the same host div, so focus lands there.
+  const { hostRef, retryRef } = useRetryFocusRescue(
+    pane === "error" && (details.isError || files.isError),
+  );
+  // Degraded content is the same arm, so a failed or recovered refresh never
+  // moves focus.
+  const arm = pane === "content-degraded" ? "content" : pane;
+  // An arm swap or record switch that unmounts the focused node would drop
+  // focus to <body>; land it on the host. Change-only, so a mount never takes
+  // focus from elsewhere.
+  const focusHost = useRef<HTMLDivElement | null>(null);
+  const viewFrame = `${arm}:${hash}`;
+  const lastViewFrame = useRef(viewFrame);
+  useLayoutEffect(() => {
+    if (lastViewFrame.current === viewFrame) return;
+    lastViewFrame.current = viewFrame;
+    if (document.activeElement === document.body)
+      focusHost.current?.focus({ preventScroll: true });
+  }, [viewFrame]);
+  const shell = (content: ReactNode) => (
+    <div
+      ref={(node) => {
+        hostRef(node);
+        focusHost.current = node;
+      }}
+      tabIndex={-1}
+      className="flex h-full flex-col outline-none"
+    >
+      {content}
+    </div>
+  );
+
+  // Both reads are local ("always" networkMode), so they never park offline;
+  // that arm keeps the loading state rather than claim a network wait.
+  if (pane === "skeleton" || pane === "offline") {
+    return shell(
       <div className="space-y-3 p-4">
         <Skeleton className="h-5 w-2/3" />
         <Skeleton className="h-4 w-1/3" />
         <Skeleton className="h-32 w-full" />
-      </div>
+      </div>,
     );
   }
-  if (details.isError || files.isError) {
-    return <DiffPlaceholder message="Could not load this commit" />;
+  if (pane === "error" || !details.data || !files.data) {
+    const reason = details.isError
+      ? details.error
+      : files.isError
+        ? files.error
+        : null;
+    return shell(
+      <DiffPlaceholder
+        message="Could not load this commit"
+        action={
+          reason ? (
+            <div className="flex flex-col items-center gap-2">
+              <p className="max-w-md text-center text-xs">
+                {presentError(reason).summary}
+              </p>
+              <Button
+                ref={retryRef}
+                variant="outline"
+                size="sm"
+                className="cursor-pointer"
+                onClick={retryErrored}
+              >
+                Retry
+              </Button>
+            </div>
+          ) : undefined
+        }
+      />,
+    );
   }
 
   const commit = details.data;
@@ -295,9 +382,15 @@ export function CommitDetailView({
   const staleDim = stale && "opacity-80";
   // The diff pane keeps serving the previous file's diff for longer than the rest
   // (its query stays on placeholder data through the gated window above), so it
-  // fades on its own state. Never nested inside another dim — 0.8² reads as
-  // disabled.
-  const diffDim = (staleDim || diff.isPlaceholderData) && "opacity-80";
+  // fades on its own state, and never over a held slot, which carries its own
+  // dim: 0.8² reads as disabled.
+  const diffDim =
+    !diffSlots.holding &&
+    (staleDim || diffSlots.read.placeholder) &&
+    "opacity-80";
+  // Busy through a hold too, and through the blank a slow file promotes into.
+  const diffBusy =
+    Boolean(diffDim) || diffSlots.holding || diffSlots.read.loading;
 
   // Identity comes from the `hash` PROP, never `commit.hash`: while the next
   // commit's details load, `details.data` is still the previous commit's
@@ -413,230 +506,408 @@ export function CommitDetailView({
     rowAttr: "data-path",
   });
 
-  return (
-    <div className="flex h-full flex-col" aria-busy={Boolean(staleDim)}>
-      <header className="flex flex-col gap-1 border-b px-4 py-3">
-        <h2 className={cn("text-sm font-medium", PLACEHOLDER_FADE, staleDim)}>
-          {commit.subject}
-        </h2>
-        {commit.body && (
-          <p
-            className={cn(
-              "max-h-24 overflow-y-auto text-xs whitespace-pre-wrap text-muted-foreground",
-              PLACEHOLDER_FADE,
-              staleDim,
-            )}
-          >
-            {commit.body}
-          </p>
-        )}
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span
-            className={cn(
-              "flex items-center gap-2",
-              PLACEHOLDER_FADE,
-              staleDim,
-            )}
-          >
-            <CommitAuthorAvatar
-              name={commit.author}
-              email={commit.authorEmail}
-            />
-            <span>{commit.author}</span>
-            <span>•</span>
-            <span>
-              <RelativeTime date={commit.date} />
-            </span>
-            <span>•</span>
-          </span>
-          <button
-            type="button"
-            className="inline-flex items-center gap-1 font-mono hover:text-foreground"
-            onClick={copyHash}
-            title="Copy full hash"
-          >
-            {hash.slice(0, 7)}
-            <CopyIcon className="size-3" />
-          </button>
-          <span className="flex-1" />
-          <DiffStat
-            added={totalAdded}
-            deleted={totalDeleted}
-            className={cn(
-              "flex items-center gap-2",
-              PLACEHOLDER_FADE,
-              staleDim,
-            )}
-          />
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label="Commit actions"
-                />
-              }
+  return shell(
+    <>
+      <div
+        className="flex min-h-0 flex-1 flex-col"
+        aria-busy={Boolean(staleDim)}
+      >
+        <header className="flex flex-col gap-1 border-b px-4 py-3">
+          <h2 className={cn("text-sm font-medium", PLACEHOLDER_FADE, staleDim)}>
+            {commit.subject}
+          </h2>
+          {commit.body && (
+            <p
+              className={cn(
+                "max-h-24 overflow-y-auto text-xs whitespace-pre-wrap text-muted-foreground",
+                PLACEHOLDER_FADE,
+                staleDim,
+              )}
             >
-              <DotsThreeVerticalIcon />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent className="min-w-56" align="end">
-              <DropdownMenuItem
-                className={MENU_HELD_ROW_CLASS}
-                disabled={!isHead}
-                onClick={() => requestAmend(hash)}
+              {commit.body}
+            </p>
+          )}
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span
+              className={cn(
+                "flex items-center gap-2",
+                PLACEHOLDER_FADE,
+                staleDim,
+              )}
+            >
+              <CommitAuthorAvatar
+                name={commit.author}
+                email={commit.authorEmail}
+              />
+              <span>{commit.author}</span>
+              <span>•</span>
+              <span>
+                <RelativeTime date={commit.date} />
+              </span>
+              <span>•</span>
+            </span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 font-mono hover:text-foreground"
+              onClick={copyHash}
+              title="Copy full hash"
+            >
+              {hash.slice(0, 7)}
+              <CopyIcon className="size-3" />
+            </button>
+            <span className="flex-1" />
+            <DiffStat
+              added={totalAdded}
+              deleted={totalDeleted}
+              className={cn(
+                "flex items-center gap-2",
+                PLACEHOLDER_FADE,
+                staleDim,
+              )}
+            />
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Commit actions"
+                  />
+                }
               >
-                Amend commit…
-                {isLatest && !isHead && HISTORY_REFRESHING_HINT}
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={doCheckoutCommit}>
-                Checkout commit
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={doRevertCommit}>
-                Revert changes in commit
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={doCherryPick}>
-                Cherry-pick commit
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => copyText(hash, "SHA copied")}>
-                Copy SHA
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-        {/* Inert as well as faded while the details are a placeholder: these
+                <DotsThreeVerticalIcon />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent className="min-w-56" align="end">
+                <DropdownMenuItem
+                  className={MENU_HELD_ROW_CLASS}
+                  disabled={!isHead}
+                  onClick={() => requestAmend(hash)}
+                >
+                  Amend commit…
+                  {(() => {
+                    // Only HEAD can be amended; until the log and status agree
+                    // on it, the row waits rather than claiming out of reach.
+                    // A log that failed with nothing loaded (and isn't retrying)
+                    // isn't refreshing.
+                    if (isHead) return null;
+                    if (log.data === undefined && refreshFailed(log))
+                      return AMEND_HOLD_HINT["log-unread"];
+                    if (logTop === undefined || isLatest || hash === head?.oid)
+                      return AMEND_HOLD_HINT.refreshing;
+                    return AMEND_HOLD_HINT["not-latest"];
+                  })()}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={doCheckoutCommit}>
+                  Checkout commit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={doRevertCommit}>
+                  Revert changes in commit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={doCherryPick}>
+                  Cherry-pick commit
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => copyText(hash, "SHA copied")}>
+                  Copy SHA
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+          {/* Inert as well as faded while the details are a placeholder: these
             are CLICKABLE links mined from the previous commit's message, kept
             only to hold their space. `empty:hidden` drops the wrapper when no
             key matches, so the header's gap never spaces an empty row. */}
-        <div
-          inert={details.isPlaceholderData}
-          className={cn(
-            "empty:hidden",
-            PLACEHOLDER_FADE,
-            details.isPlaceholderData && "opacity-80",
-          )}
-        >
-          <JiraRefRow
-            repoPath={repoPath}
-            sources={[
-              { label: "commit subject", text: commit.subject },
-              { label: "commit message body", text: commit.body },
-            ]}
-          />
-        </div>
-      </header>
-
-      <DetailRailRow>
-        <DetailRail
-          ariaLabel="Changed files"
-          className={cn(PLACEHOLDER_FADE, staleDim)}
-          header={
-            <p className="truncate text-xs text-muted-foreground">
-              {files.data.length} changed file
-              {files.data.length === 1 ? "" : "s"}
-            </p>
-          }
-        >
-          {/* overflow-hidden contains the list's natural height (vendored Root is
-              `relative`-only) so a long file list can't leak a window scrollbar. */}
-          <ScrollArea className="min-h-0 flex-1 overflow-hidden">
-            <FileRowActions
+          <div
+            inert={details.isPlaceholderData}
+            className={cn(
+              "empty:hidden",
+              PLACEHOLDER_FADE,
+              details.isPlaceholderData && "opacity-80",
+            )}
+          >
+            <JiraRefRow
               repoPath={repoPath}
-              blameRev={hash}
-              onKeyDown={onFilesKeyDown}
-            >
-              {files.data.map((file) => (
-                <button
-                  type="button"
-                  key={file.path}
-                  data-path={file.path}
-                  className={cn(
-                    "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs",
-                    effectivePath === file.path
-                      ? "bg-accent text-accent-foreground"
-                      : "hover:bg-muted/60",
-                  )}
-                  onClick={() => setSelectedPath(file.path)}
-                  onMouseEnter={() =>
-                    hoverPrefetch(() => prefetchFileDiff(hash, file.path))
-                  }
-                >
-                  <PathText path={file.path} className="flex-1 font-mono" />
-                  <DiffStat
-                    added={file.added}
-                    deleted={file.deleted}
-                    isBinary={file.isBinary}
-                  />
-                </button>
-              ))}
-            </FileRowActions>
-          </ScrollArea>
-        </DetailRail>
-        <main
-          aria-busy={Boolean(diffDim)}
-          className={cn("min-w-0 flex-1", PLACEHOLDER_FADE, diffDim)}
-        >
-          {deferredPath ? (
-            <DiffSurface
-              filePath={deferredPath}
-              diff={diff}
-              repoPath={repoPath}
-              imageRevs={{ old: `${hash}~1`, new: hash }}
-              contentRevs={{ oldRev: `${hash}~1`, newRev: hash }}
-              lineAnchors={lineAnchors}
-              lineWidget={lineWidget}
+              sources={[
+                { label: "commit subject", text: commit.subject },
+                { label: "commit message body", text: commit.body },
+              ]}
             />
-          ) : (
-            <DiffPlaceholder message="Select a file to see its changes" />
-          )}
-        </main>
-      </DetailRailRow>
+          </div>
+        </header>
 
-      {/* Mounted for every commit, rendering only where comments are supported:
+        <DegradedListNotice
+          noun="this commit"
+          degraded={pane === "content-degraded"}
+          message={detailNoticeMessage({
+            noun: "commit",
+            isError: failed,
+            stale,
+          })}
+          onRetry={failed ? retryErrored : undefined}
+          className="shrink-0 border-b px-4 py-1.5"
+        />
+        <DetailRailRow>
+          <DetailRail
+            ariaLabel="Changed files"
+            className={cn(PLACEHOLDER_FADE, staleDim)}
+            header={
+              <p className="truncate text-xs text-muted-foreground">
+                {files.data.length} changed file
+                {files.data.length === 1 ? "" : "s"}
+              </p>
+            }
+          >
+            {/* overflow-hidden contains the list's natural height (vendored Root is
+              `relative`-only) so a long file list can't leak a window scrollbar. */}
+            <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+              <FileRowActions
+                repoPath={repoPath}
+                blameRev={hash}
+                onKeyDown={onFilesKeyDown}
+              >
+                {files.data.map((file) => (
+                  <button
+                    type="button"
+                    key={file.path}
+                    data-path={file.path}
+                    aria-current={effectivePath === file.path || undefined}
+                    className={cn(
+                      "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs",
+                      effectivePath === file.path
+                        ? "bg-accent text-accent-foreground"
+                        : "hover:bg-muted/60",
+                    )}
+                    onClick={() => setSelectedPath(file.path)}
+                    onMouseEnter={() =>
+                      hoverPrefetch(() => prefetchFileDiff(hash, file.path))
+                    }
+                  >
+                    <PathText path={file.path} className="flex-1 font-mono" />
+                    <DiffStat
+                      added={file.added}
+                      deleted={file.deleted}
+                      isBinary={file.isBinary}
+                    />
+                  </button>
+                ))}
+              </FileRowActions>
+            </ScrollArea>
+          </DetailRail>
+          <main
+            ref={diffRegion}
+            aria-busy={diffBusy}
+            className={cn("min-w-0 flex-1", PLACEHOLDER_FADE, diffDim)}
+            // Move as well as enter: a pointer resting here while the commit
+            // changes must still arm the new one before it reaches a line.
+            onPointerEnter={armDiff}
+            onPointerMove={armDiff}
+            onFocusCapture={armDiff}
+          >
+            <FileSlots slots={diffSlots} target={diffTarget}>
+              {(view) =>
+                view.kind === "file" ? (
+                  <CommitFileDiffSlot
+                    repoPath={repoPath}
+                    hash={hash}
+                    path={view.file}
+                    enabled={diffEnabledFor(view.file)}
+                    stale={stale}
+                    comments={comments.data}
+                    commentsReady={commentsReady}
+                    anchorsOn={commentsReady && anchorsMatchDiff}
+                    commentRefs={commentRefs}
+                    providerKey={providerKey}
+                    remoteSections={remoteSections}
+                    remoteDiffReady={remoteDiff.isSuccess}
+                    reportRead={diffSlots.reportRead}
+                  />
+                ) : (
+                  <DiffPlaceholder message="Select a file to see its changes" />
+                )
+              }
+            </FileSlots>
+          </main>
+        </DetailRailRow>
+
+        {/* Mounted for every commit, rendering only where comments are supported:
           arrowing through history must not tear down its per-commit drafts. */}
-      <CommitComments
-        enabled={showComments}
-        held={verdictHeld}
-        repoPath={repoPath}
-        sha={renderedHash}
-        canComment={canCommentCommits}
+        <CommitComments
+          enabled={showComments}
+          held={verdictHeld}
+          repoPath={repoPath}
+          sha={renderedHash}
+          canComment={canCommentCommits}
+          remoteLabel={remoteLabel}
+          diffSections={providerKey === "github" ? remoteSections : undefined}
+          // Only GitHub resolves a comment's line through the fetched patch, so only
+          // GitHub has to wait for it; the others anchor by plain line and are always
+          // ready.
+          diffReady={providerKey !== "github" || remoteDiff.isSuccess}
+          // Inline anchors are off while the diff isn't the rendered commit's, so
+          // the list keeps that file's comments too.
+          selectedPath={anchorsMatchDiff ? deferredPath : null}
+          onSelectFile={selectFileFromComments}
+          lens="origin"
+          stale={stale}
+        />
+
+        <AmendForcePushDialog {...forcePushDialog} />
+        <MergeParentDialog
+          repoPath={repoPath}
+          target={mergePick}
+          openedIn={mergePick?.repo ?? null}
+          onClose={() => setMergePick(null)}
+        />
+      </div>
+      {/* Outside the content's aria-busy, which would withhold its live line. */}
+      <CommitRemoteVerdictFooter
+        gate={gate}
+        onRemote={onRemote}
         remoteLabel={remoteLabel}
-        diffSections={providerKey === "github" ? remoteSections : undefined}
-        // Only GitHub resolves a comment's line through the fetched patch, so only
-        // GitHub has to wait for it; the others anchor by plain line and are always
-        // ready.
-        diffReady={providerKey !== "github" || remoteDiff.isSuccess}
-        // Inline anchors are off while the diff isn't the rendered commit's, so
-        // the list keeps that file's comments too.
-        selectedPath={anchorsMatchDiff ? deferredPath : null}
-        onSelectFile={selectFileFromComments}
-        lens="origin"
-        stale={stale}
       />
-      {gate && onRemote.data === false ? (
-        // Appears once a verdict has resolved false, so a cold load of a pushed
-        // commit shows no flash. While the next commit's verdict resolves it keeps
-        // the previous one, dimmed after a delay so a fast settle shows no pulse.
-        <p
-          aria-busy={verdictHeld}
-          className={cn(
-            "border-t px-4 py-2 text-xs text-muted-foreground",
-            PLACEHOLDER_FADE,
-            verdictHeld && "opacity-80 delay-100",
-          )}
-        >
+    </>,
+  );
+}
+
+/** One file's diff in the commit's pane slot: its own read, comment anchors and
+ *  line composer, so a held slot paints only from what it settled with. */
+function CommitFileDiffSlot({
+  repoPath,
+  hash,
+  path,
+  enabled,
+  stale,
+  comments,
+  commentsReady,
+  anchorsOn,
+  commentRefs,
+  providerKey,
+  remoteSections,
+  remoteDiffReady,
+  reportRead,
+}: {
+  repoPath: string;
+  hash: string;
+  path: string;
+  enabled: boolean;
+  /** The commit's details or file list are still the previous commit's. */
+  stale: boolean;
+  comments: CommitCommentOut[] | undefined;
+  commentsReady: boolean;
+  /** Inline anchors are on: the diff is the rendered commit's. */
+  anchorsOn: boolean;
+  commentRefs: MarkdownRefs | undefined;
+  providerKey: ForgeProvider;
+  remoteSections: DiffSections;
+  remoteDiffReady: boolean;
+  reportRead: (read: SlotRead) => void;
+}) {
+  const diff = useCommitFileDiff(repoPath, hash, path, enabled);
+  useSlotRead(reportRead, diff);
+  const lineAnchors = useCommitLineAnchors(
+    comments,
+    providerKey === "github" ? remoteSections : undefined,
+    anchorsOn ? path : null,
+    commentRefs,
+  );
+  // The diff query outlasts the commit's own stale window with the previous
+  // FILE's diff, so the rendered lines can belong to another file or commit than
+  // `hash`+`path`.
+  const diffStale = stale || diff.isPlaceholderData;
+  const widget = useMemo<LineWidget | undefined>(() => {
+    if (!commentsReady) return undefined;
+    // A line click while stale would address `hash` — the newly selected commit —
+    // with a path and line read off the previous one's diff.
+    if (diffStale) return undefined;
+    // On GitHub the composer recovers its `position` from the FORGE diff; until
+    // that fetch succeeds `remoteSections` is empty, so every line would open the
+    // composer disabled with "This line isn't in the commit's diff for this file"
+    // — a reason that blames the line rather than the missing patch. So keep the
+    // line numbers un-clickable (read-only diff) until the remote diff loads; the
+    // whole-commit composer in the pane below still works. GitLab/Bitbucket anchor
+    // by plain line and need no remote diff, so they're unaffected.
+    if (providerKey === "github" && !remoteDiffReady) return undefined;
+    return {
+      enabled: true,
+      render: ({ side, line, fromLine, onClose }) => (
+        <CommitLineComposer
+          repoPath={repoPath}
+          sha={hash}
+          path={path}
+          side={side}
+          line={line}
+          fromLine={fromLine}
+          provider={providerKey}
+          fileSection={
+            providerKey === "github" ? remoteSections.get(path) : undefined
+          }
+          onClose={onClose}
+          lens="origin"
+        />
+      ),
+    };
+  }, [
+    commentsReady,
+    diffStale,
+    path,
+    repoPath,
+    hash,
+    providerKey,
+    remoteSections,
+    remoteDiffReady,
+  ]);
+  const lineWidget = useSlotWidget(widget);
+  return (
+    <DiffSurface
+      filePath={path}
+      diff={diff}
+      repoPath={repoPath}
+      imageRevs={{ old: `${hash}~1`, new: hash }}
+      contentRevs={{ oldRev: `${hash}~1`, newRev: hash }}
+      lineAnchors={lineAnchors}
+      lineWidget={lineWidget}
+    />
+  );
+}
+
+/** The footer under a commit's comments. "Isn't on {remote} yet" renders only
+ *  from this commit's own settled false, never a previous commit's held
+ *  verdict; a failed check says it couldn't tell and offers Retry, unless a
+ *  retained true already shows the comments, since a pushed commit doesn't
+ *  become unpushed. */
+function CommitRemoteVerdictFooter({
+  gate,
+  onRemote,
+  remoteLabel,
+}: {
+  gate: boolean;
+  onRemote: ReturnType<typeof useCommitOnRemote>;
+  remoteLabel: string;
+}) {
+  const checkFailed = gate && onRemote.data !== true && refreshFailed(onRemote);
+  return (
+    <div className="shrink-0">
+      {/* Always mounted, so a failure arising while shown is announced; its
+          wrapper is the focus landing spot when Retry unmounts. */}
+      <DegradedListNotice
+        noun={remoteLabel}
+        degraded={checkFailed}
+        message={`Couldn't check whether this commit is on ${remoteLabel}.`}
+        retryLabel={`Retry checking ${remoteLabel}`}
+        onRetry={checkFailed ? () => void onRemote.refetch() : undefined}
+        className="border-t px-4 py-2"
+      />
+      {/* The raw error gate keeps the claim from flashing back mid-Retry: a
+          refetch over an errored read stays isError until it lands. A held
+          placeholder is another commit's verdict, so it claims nothing. */}
+      {gate &&
+      onRemote.data === false &&
+      !onRemote.isError &&
+      !onRemote.isPlaceholderData ? (
+        <p className="border-t px-4 py-2 text-xs text-muted-foreground">
           This commit isn't on {remoteLabel} yet — push it to comment.
         </p>
       ) : null}
-
-      <AmendForcePushDialog {...forcePushDialog} />
-      <MergeParentDialog
-        repoPath={repoPath}
-        target={mergePick}
-        openedIn={mergePick?.repo ?? null}
-        onClose={() => setMergePick(null)}
-      />
     </div>
   );
 }

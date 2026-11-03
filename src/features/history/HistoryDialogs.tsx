@@ -1,4 +1,5 @@
 import { formOptions } from "@tanstack/react-form";
+import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useId, useState } from "react";
 import { toast } from "sonner";
 import { DisabledReasonButton } from "@/components/disabled-reason-button";
@@ -26,14 +27,16 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { PROMOTION_BLOCKS_CHECKOUT } from "@/features/repository/checkout-copy";
+import { refuseWhilePublishing } from "@/features/repository/PublishPendingBanner";
 import { clipTitleFromText } from "@/lib/clip-title";
 import { required, withForm } from "@/lib/form";
-import type { CherryPickRangeResult } from "@/lib/git/api";
+import { type CherryPickRangeResult, headBranchPin } from "@/lib/git/api";
 import {
   pendingWriteMatching,
   RELEASE_WRITES_FAMILY,
   type ReleaseWriteKind,
   releaseWriteTag,
+  repoStatusOptions,
   useCherryPick,
   useCherryPickOnto,
   useCommitParents,
@@ -44,12 +47,13 @@ import {
   useRevertCommit,
 } from "@/lib/git/queries";
 import { refNameWarning } from "@/lib/git/ref-name";
+import type { RepoStatus } from "@/lib/git/types";
 import {
   ACT_PENDING_REASON,
   refuseWhileOffline,
   useOfflineHold,
 } from "@/lib/offline-writes";
-import { refuseIfSwitched } from "@/lib/stores/notifications";
+import { landedIn, refuseIfSwitched } from "@/lib/stores/notifications";
 import { promotionBlocksCheckout } from "@/lib/stores/worktree-removal";
 import { isAppError } from "@/lib/tauri/invoke";
 import { toastError, toastErrorWithNote } from "@/lib/toast";
@@ -93,6 +97,7 @@ export function DeleteTagDialog({
   onRemoteChange: (v: boolean) => void;
   onClose: () => void;
 }) {
+  const queryClient = useQueryClient();
   const deleteLocalTag = useDeleteLocalTag(repoPath);
   const deleteTagOnOrigin = useDeleteTagOnOrigin(repoPath);
   // Offline holds only the origin arm; the local-only delete runs offline.
@@ -120,6 +125,7 @@ export function DeleteTagDialog({
       return;
     }
     if (remote && refuseWhileOffline()) return;
+    if (remote && refuseWhilePublishing(queryClient, repoPath)) return;
     const startedFor = name;
     const startedIn = repoPath;
     const closeIfStillOpen = () => {
@@ -133,7 +139,9 @@ export function DeleteTagDialog({
       closeIfStillOpen();
       return;
     }
-    toast.success(`Deleted tag ${name}${remote ? " (local and origin)" : ""}`);
+    toast.success(
+      `Deleted tag ${name}${remote ? " (local and origin)" : ""}${landedIn(startedIn).away}`,
+    );
     closeIfStillOpen();
   }
   return (
@@ -145,7 +153,7 @@ export function DeleteTagDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete tag {shownName}?</DialogTitle>
+          <DialogTitle className="pr-8">Delete tag {shownName}?</DialogTitle>
           <DialogDescription>
             Removes the tag from this repository. The commit it points at is not
             affected.
@@ -186,18 +194,22 @@ export function DeleteTagDialog({
   );
 }
 
-/** Mixed-reset the current branch to a commit. Owns its mutation. */
+/** Mixed-reset the current branch to a commit. Owns its mutation. `pin` is the
+ *  HEAD the host opened it on; the reset refuses once HEAD is elsewhere. */
 export function ResetCommitDialog({
   repoPath,
   hash,
   openedIn,
+  pin,
   onClose,
 }: {
   repoPath: string;
   hash: string | null;
   openedIn: string | null;
+  pin: { expectedHead: string; expectedBranch: string } | null;
   onClose: () => void;
 }) {
+  const queryClient = useQueryClient();
   const resetMutation = useResetToCommit(repoPath);
   const shownHash = useRetained(hash);
   const liveHash = useLatestRef(hash);
@@ -205,6 +217,22 @@ export function ResetCommitDialog({
   async function run() {
     if (!hash || !openedIn) return;
     if (refuseIfSwitched(openedIn, "nothing was reset")) {
+      onClose();
+      return;
+    }
+    if (!pin) return;
+    // A move the status poll has already seen refuses here; the backend's pin
+    // covers the rest, the window between this click and its repo lock. Wording
+    // kept in step with the reset-to-upstream twins.
+    const shownHead = queryClient.getQueryData<RepoStatus>(
+      repoStatusOptions(repoPath).queryKey,
+    )?.branch;
+    if (
+      shownHead &&
+      (shownHead.oid !== pin.expectedHead ||
+        headBranchPin(shownHead) !== pin.expectedBranch)
+    ) {
+      toast.info("HEAD moved while the dialog was open — nothing was reset.");
       onClose();
       return;
     }
@@ -219,7 +247,11 @@ export function ResetCommitDialog({
         onClose();
     };
     try {
-      await resetMutation.mutateAsync(hash);
+      await resetMutation.mutateAsync({
+        hash,
+        expectedHead: pin.expectedHead,
+        expectedBranch: pin.expectedBranch,
+      });
     } catch (e) {
       onError(e);
       closeIfStillOpen();
@@ -249,13 +281,15 @@ export function ResetCommitDialog({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button
+          <DisabledReasonButton
             variant="destructive"
             disabled={resetMutation.isPending}
+            reason={resetMutation.isPending ? ACT_PENDING_REASON : undefined}
             onClick={() => void run()}
           >
+            {resetMutation.isPending && <Spinner data-icon="inline-start" />}
             Reset
-          </Button>
+          </DisabledReasonButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -653,7 +687,7 @@ export function MergeParentDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{prompt.title}</DialogTitle>
+          <DialogTitle className="pr-8">{prompt.title}</DialogTitle>
           <DialogDescription>{prompt.body}</DialogDescription>
         </DialogHeader>
         <div className="min-w-0">
@@ -720,7 +754,7 @@ export const CreateRefFromCommitDialog = withForm({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{title}</DialogTitle>
+            <DialogTitle className="pr-8">{title}</DialogTitle>
             <DialogDescription>{description}</DialogDescription>
           </DialogHeader>
           <form

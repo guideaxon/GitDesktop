@@ -2,12 +2,14 @@ import {
   type MutationCache,
   type QueryClient,
   useQuery,
+  useQueryClient,
 } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { toast } from "sonner";
 import { isDirtyTreeRefusal } from "@/lib/error-summary";
 import * as api from "../api";
 import { useMutationCacheSnapshot, useRepoMutation } from "./internal";
+import { prChecksRecheck } from "./pr-actions";
 import { pendingMutationEntries } from "./pr-writes";
 import {
   BRANCH_PUSH_ACTIVE_MESSAGE,
@@ -16,6 +18,7 @@ import {
   branchPushKey,
   type PushVars,
   pendingBranchPushesFor,
+  recheckRunsAfterPush,
 } from "./push-writes";
 
 export {
@@ -27,24 +30,32 @@ export {
   branchPushLabel,
   nextPushLatch,
   type PushVars,
+  recheckRunsAfterPush,
 } from "./push-writes";
 
+/** Fetch, pull and switch here are `localOnly`: they move HEAD, refs or the working
+ *  tree but change no forge state, so forge reads keep their own clocks. Push,
+ *  merge and rebase keep the whole-repo default. */
 export function useFetchRemote(repo: string) {
-  return useRepoMutation(repo, () => api.gitFetch(repo));
+  return useRepoMutation(repo, () => api.gitFetch(repo), { localOnly: true });
 }
 
 export function usePull(repo: string) {
-  return useRepoMutation(repo, (mode: api.PullMode = "ffOnly") =>
-    api.gitPull(repo, mode),
+  return useRepoMutation(
+    repo,
+    (mode: api.PullMode = "ffOnly") => api.gitPull(repo, mode),
+    { localOnly: true },
   );
 }
 
-/** Stash → run → reapply variants of pull, merge, rebase, and switch. Whole-repo
- *  invalidation like their plain counterparts: each moves HEAD and rewrites the
- *  working tree, and the stash list changes too. */
+/** Stash → run → reapply variants of pull, merge, rebase, and switch, invalidating
+ *  like their plain counterparts: each moves HEAD and rewrites the working tree,
+ *  and the stash list changes too. */
 export function usePullAutostash(repo: string) {
-  return useRepoMutation(repo, (mode: api.PullMode = "ffOnly") =>
-    api.gitPullAutostash(repo, mode),
+  return useRepoMutation(
+    repo,
+    (mode: api.PullMode = "ffOnly") => api.gitPullAutostash(repo, mode),
+    { localOnly: true },
   );
 }
 
@@ -90,12 +101,13 @@ export function useSwitchAutostash(repo: string) {
     {
       // Local git write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
 
 /** Phase B of a guarded rebase pull, plus its stash → run → reapply twin. Same
- *  whole-repo invalidation as the plain pull: both move HEAD and rewrite the
+ *  local-only invalidation as the plain pull: both move HEAD and rewrite the
  *  working tree. */
 export function usePullRebaseDecided(repo: string) {
   return useRepoMutation(
@@ -104,6 +116,7 @@ export function usePullRebaseDecided(repo: string) {
     {
       // Local git write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -116,6 +129,7 @@ export function usePullRebaseDecidedAutostash(repo: string) {
     {
       // Local git write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -144,8 +158,8 @@ export type UpstreamUpdateOutcome =
  * report "already up to date" instead of a no-op merge. Never auto-pushes —
  * the Push affordance lights up on its own afterward.
  *
- * Default (whole-repo) invalidation, matching the pull/merge flows, so
- * branches, status, and history all refresh.
+ * Default (whole-repo) invalidation, matching the merge flow, so branches,
+ * status, and history all refresh.
  */
 export function useUpdateFromUpstream(repo: string) {
   return useRepoMutation<void, UpstreamUpdateOutcome>(repo, async () => {
@@ -244,9 +258,11 @@ export function useSetSubmoduleBranch(repo: string) {
 }
 
 /** Keyed per repo with the branch in the variables: {@link usePendingBranchPushes}
- *  reads every push in flight, whichever mount fired it. `source` stays on the
- *  client; the backend gets exactly the push's own arguments. */
+ *  reads every push in flight, whichever mount fired it. The client-only vars
+ *  (`source`, `startedOn`) stay on the client; the backend gets exactly the
+ *  push's own arguments. */
 export function usePush(repo: string) {
+  const queryClient = useQueryClient();
   return useRepoMutation(
     repo,
     (args: PushVars) =>
@@ -258,7 +274,18 @@ export function usePush(repo: string) {
         args.remote,
         args.remoteBranch,
       ),
-    { identity: branchPushKey(repo) },
+    {
+      identity: branchPushKey(repo),
+      // The whole-repo default: a push moves the pushed branch's PR head, checks,
+      // mergeability and runs, and only active observers refetch. The push names
+      // no PR or lens, so the recheck re-reads every PR's details in both lenses:
+      // only on-screen PR views and active list CI maps refetch.
+      onSuccess: () =>
+        recheckRunsAfterPush(queryClient, repo, [
+          ...prChecksRecheck(repo, "origin"),
+          ...prChecksRecheck(repo, "upstream"),
+        ]),
+    },
   );
 }
 

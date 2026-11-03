@@ -7,11 +7,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::github::gh_unreadable;
-use crate::github::runner::{run_gh, run_gh_raw, GH_NETWORK_TIMEOUT};
+use crate::github::runner::{
+    gh_auth_epoch, gh_host_for_repo, gh_output_ok, run_gh, run_gh_cached_get,
+    run_gh_cached_get_raw_on_host, run_gh_on_host, run_gh_raw, GH_NETWORK_TIMEOUT,
+};
 
 // Job ids can exceed JS's safe integer range, so the frontend handles them as
 // strings — serialize the u64 as a string here.
@@ -57,6 +61,15 @@ fn validate_ref(name: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_head_sha(sha: &str) -> AppResult<String> {
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidArgument(format!(
+            "Invalid head sha: {sha}"
+        )));
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
 /// One workflow run in the list view.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,7 +112,7 @@ pub struct WorkflowRun {
     pub head_sha: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunStep {
     #[serde(default)]
@@ -116,7 +129,7 @@ pub struct RunStep {
     pub completed_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunJob {
     #[serde(rename(serialize = "id", deserialize = "databaseId"))]
@@ -147,7 +160,7 @@ pub struct RunJob {
 }
 
 /// A run plus its jobs/steps, for the detail view.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunDetail {
     #[serde(rename(serialize = "id", deserialize = "databaseId"))]
@@ -203,7 +216,7 @@ pub struct Workflow {
     pub state: String,
 }
 
-const RUN_VIEW_FIELDS: &str = "databaseId,number,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt,url,headSha,jobs";
+const RUN_VIEW_FIELDS: &str = "databaseId,number,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt,url,headSha,jobs,updatedAt";
 /// Failed-step logs can run to many MB; keep the tail (failures land at the end).
 const RUN_LOG_CAP: usize = 200_000;
 
@@ -291,7 +304,13 @@ fn from_rest_run(r: RestRun, workflow_names: &HashMap<u64, String>) -> WorkflowR
 /// `-f` and never `-F` (`-F`'s leading-`@` magic reads host files), and
 /// `exclude_pull_requests=true` — what `gh run list` itself sends — suppresses a per-run
 /// array nothing here consumes. `branch` must already be validated.
-fn run_page_args(endpoint: &str, limit: u32, page: u32, branch: Option<&str>) -> Vec<String> {
+fn run_page_args(
+    endpoint: &str,
+    limit: u32,
+    page: u32,
+    branch: Option<&str>,
+    head_sha: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "api".into(),
         "--method".into(),
@@ -307,6 +326,10 @@ fn run_page_args(endpoint: &str, limit: u32, page: u32, branch: Option<&str>) ->
     if let Some(b) = branch.filter(|s| !s.is_empty()) {
         args.push("-f".into());
         args.push(format!("branch={b}"));
+    }
+    if let Some(sha) = head_sha {
+        args.push("-f".into());
+        args.push(format!("head_sha={sha}"));
     }
     args
 }
@@ -455,10 +478,10 @@ pub async fn gh_run_page(
     if let Some(b) = branch {
         validate_ref(b)?;
     }
-    let args = run_page_args(&endpoint, limit, page, branch);
+    let args = run_page_args(&endpoint, limit, page, branch, None);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (out, workflow_names) = tokio::join!(
-        run_gh(Some(&repo_path), &arg_refs, GH_NETWORK_TIMEOUT),
+        run_gh_cached_get(Some(&repo_path), &arg_refs, GH_NETWORK_TIMEOUT),
         workflow_name_index(&repo_path, &slug),
     );
     let parsed: RestRunPage = serde_json::from_str(&out?.stdout_lossy()).map_err(|e| {
@@ -480,6 +503,31 @@ pub async fn gh_run_page(
     })
 }
 
+/// At most 100 runs for one head; callers retain per-run reads for absent watch ids.
+#[tauri::command]
+pub async fn gh_runs_for_head(repo_path: String, head_sha: String) -> AppResult<Vec<WorkflowRun>> {
+    let head_sha = validate_head_sha(&head_sha)?;
+    let slug = crate::github::gh_origin_slug(&repo_path).await?;
+    let endpoint = format!("repos/{slug}/actions/runs");
+    let args = run_page_args(&endpoint, 100, 1, None, Some(&head_sha));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (out, workflow_names) = tokio::join!(
+        run_gh_cached_get(Some(&repo_path), &arg_refs, GH_NETWORK_TIMEOUT),
+        workflow_name_index(&repo_path, &slug),
+    );
+    let parsed: RestRunPage = serde_json::from_str(&out?.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the workflow runs",
+            format!("could not parse the workflow runs: {e}"),
+        )
+    })?;
+    Ok(parsed
+        .workflow_runs
+        .into_iter()
+        .map(|r| from_rest_run(r, &workflow_names))
+        .collect())
+}
+
 /// Recent workflow runs, newest first; optionally scoped to one branch — the first
 /// page of [`gh_run_page`]. One fetch path, so the badge, notifications, MCP, and the
 /// Actions panel can't drift on the field mapping.
@@ -491,22 +539,361 @@ pub async fn gh_run_list(
     Ok(gh_run_page(repo_path, limit, 1, branch).await?.runs)
 }
 
+const COMPLETED_RUN_CACHE_MAX_AGE: Duration = Duration::from_secs(3600);
+const COMPLETED_RUN_CACHE_MAX: usize = 16;
+
+/// The update timestamp rides a second parse of stdout so RunDetail's shared
+/// wire shape and the other forge providers' struct literals stay unchanged.
+#[derive(Deserialize, Default)]
+struct GhRunUpdatedAt {
+    #[serde(default, rename = "updatedAt", deserialize_with = "de_null_string")]
+    updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct RestRunProbe {
+    #[serde(default, deserialize_with = "de_null_string")]
+    status: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    updated_at: String,
+}
+
+fn parse_run_updated_at(raw: &str) -> Option<DateTime<Utc>> {
+    let time = DateTime::parse_from_rfc3339(raw).ok()?;
+    // Go's zero time marks absent data despite being valid RFC 3339.
+    let go_zero = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z").ok()?;
+    (time != go_zero).then(|| time.with_timezone(&Utc))
+}
+
+type CompletedRunKey = (String, Option<String>, String, u64);
+
+#[derive(Clone)]
+struct CachedRunDetail {
+    updated_at: DateTime<Utc>,
+    epoch: u64,
+    // TTL starts at fill; only the LRU clock advances on serve.
+    filled_at: Instant,
+    touched: Instant,
+    detail: RunDetail,
+}
+
+static COMPLETED_RUN_CACHE: OnceLock<Mutex<HashMap<CompletedRunKey, CachedRunDetail>>> =
+    OnceLock::new();
+
+#[derive(Debug, PartialEq, Eq)]
+enum CacheVerdict {
+    Serve,
+    EvictAndRefetch,
+}
+
+fn completed_cache_verdict(
+    probe: &RestRunProbe,
+    entry_updated_at: DateTime<Utc>,
+    entry_epoch: u64,
+    current_epoch: u64,
+    age_since_fill: Duration,
+) -> CacheVerdict {
+    if probe.status == "completed"
+        && parse_run_updated_at(&probe.updated_at) == Some(entry_updated_at)
+        && entry_epoch == current_epoch
+        && age_since_fill <= COMPLETED_RUN_CACHE_MAX_AGE
+    {
+        CacheVerdict::Serve
+    } else {
+        CacheVerdict::EvictAndRefetch
+    }
+}
+
+// An absent or unreadable timestamp leaves the cache empty; unfinished jobs must
+// remain live even when the run record already reports completion.
+fn run_detail_fill_ok(detail: &RunDetail, updated_at: Option<DateTime<Utc>>) -> bool {
+    detail.status == "completed"
+        && updated_at.is_some()
+        && detail.jobs.iter().all(|job| job.status == "completed")
+}
+
+// A concurrent refill owns its own touch and eviction decisions.
+fn settle_checked_entry(
+    cache: &mut HashMap<CompletedRunKey, CachedRunDetail>,
+    key: &CompletedRunKey,
+    checked: &CachedRunDetail,
+    verdict: &CacheVerdict,
+    now: Instant,
+) {
+    let same_entry = cache.get(key).is_some_and(|current| {
+        current.updated_at == checked.updated_at && current.filled_at == checked.filled_at
+    });
+    if same_entry {
+        match verdict {
+            CacheVerdict::Serve => {
+                if let Some(current) = cache.get_mut(key) {
+                    current.touched = now;
+                }
+            }
+            CacheVerdict::EvictAndRefetch => {
+                cache.remove(key);
+            }
+        }
+    }
+}
+
+// No refill after a failed check: while the check keeps failing, a refill makes each read
+// pay that check plus the full read, where an empty cache pays only the read.
+fn fill_timestamp(
+    probe_failed: bool,
+    detail: &RunDetail,
+    updated_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    if !probe_failed && run_detail_fill_ok(detail, updated_at) {
+        updated_at
+    } else {
+        None
+    }
+}
+
+fn completed_cache_put(
+    cache: &mut HashMap<CompletedRunKey, CachedRunDetail>,
+    key: CompletedRunKey,
+    entry: CachedRunDetail,
+) {
+    if !cache.contains_key(&key) && cache.len() >= COMPLETED_RUN_CACHE_MAX {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.touched)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, entry);
+}
+
+async fn run_updated_at_probe(
+    repo_path: &str,
+    host: Option<&str>,
+    slug: &str,
+    run_id: &str,
+) -> AppResult<RestRunProbe> {
+    let endpoint = format!("repos/{slug}/actions/runs/{run_id}");
+    let out = gh_output_ok(
+        run_gh_cached_get_raw_on_host(
+            Some(repo_path),
+            host,
+            &["api", &endpoint],
+            GH_NETWORK_TIMEOUT,
+            gh_auth_epoch(),
+        )
+        .await?,
+    )?;
+    serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the workflow run",
+            format!("could not parse the run update timestamp: {e}"),
+        )
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RestJobsPage {
+    #[serde(default, deserialize_with = "de_null_u64")]
+    total_count: u64,
+    #[serde(default, deserialize_with = "de_null_vec")]
+    jobs: Vec<RestJob>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RestJob {
+    #[serde(default, deserialize_with = "de_null_u64")]
+    id: u64,
+    #[serde(default, deserialize_with = "de_null_string")]
+    name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    status: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    conclusion: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    started_at: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    completed_at: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    html_url: String,
+    #[serde(default, deserialize_with = "de_null_vec")]
+    steps: Vec<RestStep>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RestStep {
+    #[serde(default, deserialize_with = "de_null_string")]
+    name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    status: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    conclusion: String,
+    #[serde(default)]
+    number: Option<i64>,
+    #[serde(default, deserialize_with = "de_null_string")]
+    started_at: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    completed_at: String,
+}
+
+fn from_rest_job(job: RestJob) -> RunJob {
+    RunJob {
+        id: job.id,
+        name: job.name,
+        status: job.status,
+        conclusion: job.conclusion,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+        url: job.html_url,
+        steps: job
+            .steps
+            .into_iter()
+            .map(|step| RunStep {
+                name: step.name,
+                status: step.status,
+                conclusion: step.conclusion,
+                number: step.number.unwrap_or_default(),
+                started_at: step.started_at,
+                completed_at: step.completed_at,
+            })
+            .collect(),
+        log_ref: None,
+    }
+}
+
+fn run_jobs_args(endpoint: &str, page: u32) -> Vec<String> {
+    let mut args = vec![
+        "api".into(),
+        "--method".into(),
+        "GET".into(),
+        endpoint.into(),
+        "-f".into(),
+        "per_page=100".into(),
+    ];
+    if page > 1 {
+        args.push("-f".into());
+        args.push(format!("page={page}"));
+    }
+    args
+}
+
+fn next_jobs_page(total: u64, fetched: usize, last_page_len: usize, page: u32) -> Option<u32> {
+    // The ten-page cap bounds a wrong total_count.
+    if fetched as u64 >= total || last_page_len < 100 || page >= 10 {
+        None
+    } else {
+        Some(page + 1)
+    }
+}
+
+/// Job reads follow every page, like `gh run view`'s job list, up to the paging cap.
+/// Each page revalidates independently; a failed page fails the whole read.
+#[tauri::command]
+pub async fn gh_run_jobs(repo_path: String, run_id: String) -> AppResult<Vec<RunJob>> {
+    let id: u64 = run_id
+        .parse()
+        .map_err(|_| AppError::InvalidArgument(format!("Invalid run id: {run_id}")))?;
+    let slug = crate::github::gh_origin_slug(&repo_path).await?;
+    let endpoint = format!("repos/{slug}/actions/runs/{id}/jobs");
+    let mut jobs = Vec::new();
+    let mut page = 1;
+    loop {
+        let args = run_jobs_args(&endpoint, page);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_gh_cached_get(Some(&repo_path), &arg_refs, GH_NETWORK_TIMEOUT).await?;
+        let parsed: RestJobsPage = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+            gh_unreadable(
+                "the workflow run jobs",
+                format!("could not parse the workflow run jobs: {e}"),
+            )
+        })?;
+        let last_page_len = parsed.jobs.len();
+        jobs.extend(parsed.jobs.into_iter().map(from_rest_job));
+        match next_jobs_page(parsed.total_count, jobs.len(), last_page_len, page) {
+            Some(next) => page = next,
+            None => return Ok(jobs),
+        }
+    }
+}
+
 /// One run with its jobs and steps.
 pub async fn gh_run_view(repo_path: String, run_id: u64) -> AppResult<RunDetail> {
     let id = run_id.to_string();
     let slug = crate::github::gh_origin_slug(&repo_path).await?;
-    let out = run_gh(
+    let host = gh_host_for_repo(&repo_path).await;
+    let key = (repo_path.clone(), host.clone(), slug.clone(), run_id);
+    let cache = COMPLETED_RUN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned();
+    let mut probe_failed = false;
+    if let Some(entry) = entry {
+        // Every serve revalidates updated_at under the live token: approvals,
+        // reruns, and lost access must remain visible without an app auth change.
+        let verdict = if entry.epoch != gh_auth_epoch()
+            || entry.filled_at.elapsed() > COMPLETED_RUN_CACHE_MAX_AGE
+        {
+            CacheVerdict::EvictAndRefetch
+        } else {
+            match run_updated_at_probe(&repo_path, host.as_deref(), &slug, &id).await {
+                Ok(probe) => completed_cache_verdict(
+                    &probe,
+                    entry.updated_at,
+                    entry.epoch,
+                    gh_auth_epoch(),
+                    entry.filled_at.elapsed(),
+                ),
+                Err(_) => {
+                    probe_failed = true;
+                    CacheVerdict::EvictAndRefetch
+                }
+            }
+        };
+        {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            settle_checked_entry(&mut cache, &key, &entry, &verdict, Instant::now());
+        }
+        if verdict == CacheVerdict::Serve {
+            return Ok(entry.detail);
+        }
+    }
+    let epoch = gh_auth_epoch();
+    let out = run_gh_on_host(
         Some(&repo_path),
+        host.as_deref(),
         &["run", "view", "-R", &slug, &id, "--json", RUN_VIEW_FIELDS],
         GH_NETWORK_TIMEOUT,
     )
     .await?;
-    serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+    let stdout = out.stdout_lossy();
+    let detail: RunDetail = serde_json::from_str(&stdout).map_err(|e| {
         gh_unreadable(
             "the workflow run",
             format!("could not parse gh run view: {e}"),
         )
-    })
+    })?;
+    let updated_at = serde_json::from_str::<GhRunUpdatedAt>(&stdout)
+        .unwrap_or_default()
+        .updated_at;
+    let updated_at = parse_run_updated_at(&updated_at);
+    if let Some(updated_at) = fill_timestamp(probe_failed, &detail, updated_at) {
+        let now = Instant::now();
+        completed_cache_put(
+            &mut cache.lock().unwrap_or_else(|p| p.into_inner()),
+            key,
+            CachedRunDetail {
+                updated_at,
+                epoch,
+                filled_at: now,
+                touched: now,
+                detail: detail.clone(),
+            },
+        );
+    }
+    Ok(detail)
 }
 
 /// The `gh run rerun` argv: `--failed` appends only when asked, never as an
@@ -1008,6 +1395,422 @@ pub async fn gh_workflow_run(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn cache_updated_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-24T16:37:10Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn completed_probe() -> RestRunProbe {
+        RestRunProbe {
+            status: "completed".into(),
+            updated_at: "2026-10-24T16:37:10Z".into(),
+        }
+    }
+
+    fn cache_detail() -> RunDetail {
+        serde_json::from_value(json!({
+            "databaseId": 42, "status": "completed",
+            "jobs": [{"databaseId": 7, "status": "completed"}]
+        }))
+        .unwrap()
+    }
+
+    fn cache_entry(now: Instant) -> CachedRunDetail {
+        CachedRunDetail {
+            updated_at: cache_updated_at(),
+            epoch: 3,
+            filled_at: now,
+            touched: now,
+            detail: cache_detail(),
+        }
+    }
+
+    fn cache_key(id: u64) -> CompletedRunKey {
+        ("repo".into(), Some("github.com".into()), "o/r".into(), id)
+    }
+
+    fn assert_cached_entry_eq(actual: &CachedRunDetail, expected: &CachedRunDetail) {
+        assert_eq!(actual.updated_at, expected.updated_at);
+        assert_eq!(actual.epoch, expected.epoch);
+        assert_eq!(actual.filled_at, expected.filled_at);
+        assert_eq!(actual.touched, expected.touched);
+        assert_eq!(
+            serde_json::to_value(&actual.detail).unwrap(),
+            serde_json::to_value(&expected.detail).unwrap()
+        );
+    }
+
+    #[test]
+    fn settle_checked_entry_serves_by_touching_only_the_checked_entry() {
+        let now = Instant::now();
+        let checked = cache_entry(now);
+        let other = cache_entry(now);
+        let mut cache = HashMap::from([
+            (cache_key(1), checked.clone()),
+            (cache_key(2), other.clone()),
+        ]);
+        let later = now + Duration::from_secs(1);
+        settle_checked_entry(
+            &mut cache,
+            &cache_key(1),
+            &checked,
+            &CacheVerdict::Serve,
+            later,
+        );
+        let mut expected = checked;
+        expected.touched = later;
+        assert_eq!(cache.len(), 2);
+        assert_cached_entry_eq(&cache[&cache_key(1)], &expected);
+        assert_cached_entry_eq(&cache[&cache_key(2)], &other);
+    }
+
+    #[test]
+    fn settle_checked_entry_evicts_only_the_checked_entry() {
+        let now = Instant::now();
+        let checked = cache_entry(now);
+        let other = cache_entry(now);
+        let mut cache = HashMap::from([
+            (cache_key(1), checked.clone()),
+            (cache_key(2), other.clone()),
+        ]);
+        settle_checked_entry(
+            &mut cache,
+            &cache_key(1),
+            &checked,
+            &CacheVerdict::EvictAndRefetch,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key(&cache_key(1)));
+        assert_cached_entry_eq(&cache[&cache_key(2)], &other);
+    }
+
+    fn assert_refill_survives(checked: &CachedRunDetail, replacement: &CachedRunDetail) {
+        for verdict in [CacheVerdict::Serve, CacheVerdict::EvictAndRefetch] {
+            let mut cache = HashMap::from([(cache_key(1), replacement.clone())]);
+            settle_checked_entry(
+                &mut cache,
+                &cache_key(1),
+                checked,
+                &verdict,
+                replacement.touched + Duration::from_secs(1),
+            );
+            assert_eq!(cache.len(), 1);
+            assert_cached_entry_eq(&cache[&cache_key(1)], replacement);
+        }
+    }
+
+    #[test]
+    fn settle_checked_entry_preserves_a_concurrent_fill_timestamp() {
+        let checked = cache_entry(Instant::now());
+        let mut replacement = checked.clone();
+        replacement.filled_at += Duration::from_secs(1);
+        assert_refill_survives(&checked, &replacement);
+    }
+
+    #[test]
+    fn settle_checked_entry_preserves_a_changed_update_timestamp() {
+        let checked = cache_entry(Instant::now());
+        let mut replacement = checked.clone();
+        replacement.updated_at += chrono::Duration::seconds(1);
+        assert_refill_survives(&checked, &replacement);
+    }
+
+    #[test]
+    fn fill_timestamp_refuses_probe_errors_and_unfillable_details() {
+        let mut detail = cache_detail();
+        let timestamp = Some(cache_updated_at());
+        assert_eq!(fill_timestamp(false, &detail, timestamp), timestamp);
+        assert_eq!(fill_timestamp(true, &detail, timestamp), None);
+        assert_eq!(fill_timestamp(false, &detail, None), None);
+        detail.jobs[0].status = "in_progress".into();
+        assert_eq!(fill_timestamp(false, &detail, timestamp), None);
+    }
+
+    #[test]
+    fn run_view_fields_request_updated_at_as_a_whole_field() {
+        assert!(RUN_VIEW_FIELDS.split(',').any(|field| field == "updatedAt"));
+    }
+
+    const RUN_VIEW_FIXTURE: &str = r#"{
+        "databaseId": 40112384090,
+        "number": 42,
+        "displayTitle": "Test workflow",
+        "status": "completed",
+        "conclusion": "success",
+        "workflowName": "CI",
+        "headBranch": "main",
+        "event": "pull_request",
+        "createdAt": "2026-10-24T16:36:00Z",
+        "url": "https://github.com/o/r/actions/runs/40112384090",
+        "headSha": "0123456789012345678901234567890123456789",
+        "jobs": [{
+            "databaseId": 70000000001,
+            "name": "test",
+            "status": "completed",
+            "conclusion": "success",
+            "startedAt": "2026-10-24T16:36:01Z",
+            "completedAt": "2026-10-24T16:37:09Z",
+            "url": "https://github.com/o/r/actions/runs/40112384090/job/70000000001",
+            "steps": [{
+                "name": "Run tests",
+                "status": "completed",
+                "conclusion": "success",
+                "number": 1,
+                "startedAt": "2026-10-24T16:36:02Z",
+                "completedAt": "2026-10-24T16:37:08Z"
+            }]
+        }],
+        "updatedAt": "2026-10-24T16:37:10Z"
+    }"#;
+
+    #[test]
+    fn run_view_fixture_parses_detail_and_fill_timestamp() {
+        let value: serde_json::Value = serde_json::from_str(RUN_VIEW_FIXTURE).unwrap();
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut requested: Vec<_> = RUN_VIEW_FIELDS.split(',').collect();
+        keys.sort_unstable();
+        requested.sort_unstable();
+        assert_eq!(keys, requested);
+        let detail: RunDetail = serde_json::from_str(RUN_VIEW_FIXTURE).unwrap();
+        let twin: GhRunUpdatedAt = serde_json::from_str(RUN_VIEW_FIXTURE).unwrap();
+        assert_eq!(detail.id, 40_112_384_090);
+        assert_eq!(detail.jobs.len(), 1);
+        assert_eq!(detail.jobs[0].steps.len(), 1);
+        assert_eq!(detail.jobs[0].steps[0].name, "Run tests");
+        let timestamp = parse_run_updated_at(&twin.updated_at);
+        assert_eq!(timestamp, Some(cache_updated_at()));
+        assert_eq!(fill_timestamp(false, &detail, timestamp), timestamp);
+    }
+
+    #[test]
+    fn run_probe_null_strings_parse_as_empty() {
+        let valid: RestRunProbe =
+            serde_json::from_str(r#"{"status":"completed","updated_at":"2026-10-24T16:37:10Z"}"#)
+                .unwrap();
+        assert_eq!(valid.status, "completed");
+        assert_eq!(
+            parse_run_updated_at(&valid.updated_at),
+            Some(cache_updated_at())
+        );
+        let probe: RestRunProbe =
+            serde_json::from_str(r#"{"status":null,"updated_at":null}"#).unwrap();
+        assert_eq!(probe.status, "");
+        assert_eq!(probe.updated_at, "");
+    }
+
+    #[test]
+    fn run_view_null_update_timestamp_parses_as_empty() {
+        let valid: GhRunUpdatedAt = serde_json::from_str(RUN_VIEW_FIXTURE).unwrap();
+        assert_eq!(
+            parse_run_updated_at(&valid.updated_at),
+            Some(cache_updated_at())
+        );
+        let twin: GhRunUpdatedAt = serde_json::from_str(r#"{"updatedAt":null}"#).unwrap();
+        assert_eq!(twin.updated_at, "");
+    }
+
+    #[test]
+    fn completed_cache_requires_completed_probe() {
+        let mut probe = completed_probe();
+        assert_eq!(
+            completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::Serve
+        );
+        for status in ["in_progress", "queued", ""] {
+            probe.status = status.into();
+            assert_eq!(
+                completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+                CacheVerdict::EvictAndRefetch
+            );
+        }
+    }
+
+    #[test]
+    fn completed_cache_requires_same_updated_at_after_approval() {
+        let mut probe = completed_probe();
+        probe.updated_at = "2026-10-24T12:37:10-04:00".into();
+        assert_eq!(
+            completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::Serve
+        );
+        probe.updated_at = "2026-10-24T16:37:11Z".into();
+        assert_eq!(
+            completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::EvictAndRefetch
+        );
+    }
+
+    fn assert_probe_timestamp_refused(raw: &str) {
+        let mut probe = completed_probe();
+        assert_eq!(
+            completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::Serve
+        );
+        probe.updated_at = raw.into();
+        assert_eq!(
+            completed_cache_verdict(&probe, cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::EvictAndRefetch
+        );
+    }
+
+    #[test]
+    fn completed_cache_refuses_empty_probe_timestamp() {
+        assert_probe_timestamp_refused("");
+    }
+
+    #[test]
+    fn completed_cache_refuses_unparseable_probe_timestamp() {
+        assert_probe_timestamp_refused("not a timestamp");
+    }
+
+    #[test]
+    fn completed_cache_refuses_go_zero_probe_timestamp() {
+        assert_probe_timestamp_refused("0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn completed_cache_requires_same_epoch() {
+        assert_eq!(
+            completed_cache_verdict(&completed_probe(), cache_updated_at(), 3, 3, Duration::ZERO),
+            CacheVerdict::Serve
+        );
+        assert_eq!(
+            completed_cache_verdict(&completed_probe(), cache_updated_at(), 3, 4, Duration::ZERO),
+            CacheVerdict::EvictAndRefetch
+        );
+    }
+
+    #[test]
+    fn completed_cache_expires_at_the_fill_age_boundary() {
+        assert_eq!(
+            completed_cache_verdict(
+                &completed_probe(),
+                cache_updated_at(),
+                3,
+                3,
+                COMPLETED_RUN_CACHE_MAX_AGE,
+            ),
+            CacheVerdict::Serve
+        );
+        assert_eq!(
+            completed_cache_verdict(
+                &completed_probe(),
+                cache_updated_at(),
+                3,
+                3,
+                COMPLETED_RUN_CACHE_MAX_AGE + Duration::from_nanos(1),
+            ),
+            CacheVerdict::EvictAndRefetch
+        );
+    }
+
+    #[test]
+    fn completed_detail_fill_requires_completed_run() {
+        let mut detail = cache_detail();
+        assert!(run_detail_fill_ok(&detail, Some(cache_updated_at())));
+        detail.status = "in_progress".into();
+        assert!(!run_detail_fill_ok(&detail, Some(cache_updated_at())));
+    }
+
+    #[test]
+    fn completed_detail_fill_requires_a_timestamp() {
+        let detail = cache_detail();
+        assert!(run_detail_fill_ok(&detail, Some(cache_updated_at())));
+        assert!(!run_detail_fill_ok(&detail, None));
+    }
+
+    fn assert_view_timestamp_refused(raw: &str) {
+        let detail = cache_detail();
+        let valid: GhRunUpdatedAt =
+            serde_json::from_value(json!({"updatedAt": "2026-10-24T16:37:10Z"})).unwrap();
+        assert!(run_detail_fill_ok(
+            &detail,
+            parse_run_updated_at(&valid.updated_at),
+        ));
+        let invalid: GhRunUpdatedAt = serde_json::from_value(json!({"updatedAt": raw})).unwrap();
+        assert!(!run_detail_fill_ok(
+            &detail,
+            parse_run_updated_at(&invalid.updated_at),
+        ));
+    }
+
+    #[test]
+    fn completed_detail_fill_refuses_empty_view_timestamp() {
+        assert_view_timestamp_refused("");
+    }
+
+    #[test]
+    fn completed_detail_fill_refuses_unparseable_view_timestamp() {
+        assert_view_timestamp_refused("not a timestamp");
+    }
+
+    #[test]
+    fn completed_detail_fill_refuses_go_zero_view_timestamp() {
+        assert_view_timestamp_refused("0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn completed_detail_fill_requires_every_job_completed() {
+        let mut detail = cache_detail();
+        assert!(run_detail_fill_ok(&detail, Some(cache_updated_at())));
+        detail.jobs.push(
+            serde_json::from_value(json!({"databaseId": 8, "status": "in_progress"})).unwrap(),
+        );
+        assert!(!run_detail_fill_ok(&detail, Some(cache_updated_at())));
+        detail.jobs.clear();
+        assert!(run_detail_fill_ok(&detail, Some(cache_updated_at())));
+    }
+
+    #[test]
+    fn completed_cache_put_evicts_oldest_touch_only_at_capacity() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        for id in 0..COMPLETED_RUN_CACHE_MAX as u64 {
+            completed_cache_put(
+                &mut cache,
+                cache_key(id),
+                cache_entry(now + Duration::from_secs(id)),
+            );
+            assert_eq!(cache.len(), id as usize + 1);
+        }
+        cache.get_mut(&cache_key(0)).unwrap().touched = now + Duration::from_secs(100);
+        completed_cache_put(
+            &mut cache,
+            cache_key(16),
+            cache_entry(now + Duration::from_secs(16)),
+        );
+        assert_eq!(cache.len(), COMPLETED_RUN_CACHE_MAX);
+        assert!(!cache.contains_key(&cache_key(1)));
+        for id in [0, 2, 15, 16] {
+            assert!(cache.contains_key(&cache_key(id)));
+        }
+    }
+
+    #[test]
+    fn completed_cache_put_replaces_without_evicting_another_key() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        for id in 0..COMPLETED_RUN_CACHE_MAX as u64 {
+            cache.insert(cache_key(id), cache_entry(now + Duration::from_secs(id)));
+        }
+        let mut replacement = cache_entry(now + Duration::from_secs(100));
+        replacement.updated_at = cache_updated_at() + chrono::Duration::seconds(1);
+        completed_cache_put(&mut cache, cache_key(15), replacement);
+        assert_eq!(cache.len(), COMPLETED_RUN_CACHE_MAX);
+        assert_eq!(
+            cache[&cache_key(15)].updated_at,
+            cache_updated_at() + chrono::Duration::seconds(1)
+        );
+        assert_eq!(cache[&cache_key(0)].updated_at, cache_updated_at());
+    }
 
     #[test]
     fn tail_capped_keeps_whole_chars_within_the_cap() {
@@ -1577,10 +2380,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_page_args_scopes_head_after_branch_and_preserves_unscoped_argv() {
+        let base = vec![
+            "api",
+            "--method",
+            "GET",
+            "repos/o/r/actions/runs",
+            "-f",
+            "per_page=40",
+            "-f",
+            "page=1",
+            "-f",
+            "exclude_pull_requests=true",
+        ];
+        assert_eq!(
+            run_page_args("repos/o/r/actions/runs", 40, 1, None, None),
+            base
+        );
+        let sha = "a".repeat(40);
+        let scoped = run_page_args("repos/o/r/actions/runs", 40, 1, Some("branch"), Some(&sha));
+        assert_eq!(scoped[..base.len()], base);
+        assert_eq!(
+            scoped[base.len()..],
+            ["-f", "branch=branch", "-f", &format!("head_sha={sha}")]
+        );
+    }
+
+    #[test]
+    fn head_sha_validation_accepts_only_full_ascii_hex_and_lowercases() {
+        for sha in ["aB".repeat(20), "Ab".repeat(32)] {
+            assert_eq!(validate_head_sha(&sha).unwrap(), sha.to_ascii_lowercase());
+        }
+        for sha in [
+            String::new(),
+            "a".repeat(39),
+            "a".repeat(41),
+            "HEAD".into(),
+            "main".into(),
+            format!("{}g", "a".repeat(39)),
+            "x&y".into(),
+            format!("-{}", "a".repeat(39)),
+            "é".repeat(20),
+        ] {
+            match validate_head_sha(&sha).unwrap_err() {
+                AppError::InvalidArgument(message) => {
+                    assert_eq!(message, format!("Invalid head sha: {sha}"))
+                }
+                other => panic!("expected InvalidArgument, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn first_jobs_page_keeps_its_conditional_get_argv() {
+        assert_eq!(
+            run_jobs_args("repos/o/r/actions/runs/1/jobs", 1),
+            [
+                "api",
+                "--method",
+                "GET",
+                "repos/o/r/actions/runs/1/jobs",
+                "-f",
+                "per_page=100"
+            ]
+        );
+    }
+
+    #[test]
+    fn later_jobs_pages_append_a_raw_page_field() {
+        let first = run_jobs_args("repos/o/r/actions/runs/1/jobs", 1);
+        let second = run_jobs_args("repos/o/r/actions/runs/1/jobs", 2);
+        assert_eq!(second[..first.len()], first);
+        assert_eq!(second[first.len()..], ["-f", "page=2"]);
+    }
+
+    #[test]
+    fn jobs_paging_stops_when_the_reported_total_is_collected() {
+        for total in [0, 1, 99, 100] {
+            assert_eq!(next_jobs_page(total, 100, 100, 1), None);
+        }
+        assert_eq!(next_jobs_page(250, 100, 100, 1), Some(2));
+        assert_eq!(next_jobs_page(250, 200, 100, 2), Some(3));
+        assert_eq!(next_jobs_page(250, 250, 50, 3), None);
+        assert_eq!(next_jobs_page(250, 300, 100, 3), None);
+    }
+
+    #[test]
+    fn a_short_jobs_page_ends_paging_even_with_more_reported() {
+        for last_page_len in [0, 1, 99] {
+            assert_eq!(
+                next_jobs_page(250, 100 + last_page_len, last_page_len, 2),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_paging_is_bounded_at_ten_pages() {
+        assert_eq!(next_jobs_page(u64::MAX, 900, 100, 9), Some(10));
+        assert_eq!(next_jobs_page(u64::MAX, 1000, 100, 10), None);
+        assert_eq!(next_jobs_page(u64::MAX, 1100, 100, 11), None);
+    }
+
+    #[test]
+    fn jobs_page_total_parses_and_defaults_to_zero_when_missing() {
+        let counted: RestJobsPage =
+            serde_json::from_str(r#"{"total_count":250,"jobs":[]}"#).unwrap();
+        assert_eq!(counted.total_count, 250);
+        for body in [
+            r#"{"jobs":[]}"#,
+            r#"{"total_count":0,"jobs":[]}"#,
+            r#"{"total_count":null,"jobs":[]}"#,
+        ] {
+            let page: RestJobsPage = serde_json::from_str(body).unwrap();
+            assert_eq!(page.total_count, 0);
+            assert_eq!(next_jobs_page(page.total_count, 100, 100, 1), None);
+        }
+    }
+
+    #[test]
+    fn rest_jobs_mapping_preserves_nulls_steps_and_wire_precision() {
+        let body = r#"{"total_count":1,"jobs":[{"id":9007199254740993,"name":"build","status":"in_progress","conclusion":null,"started_at":"2026-10-27T10:00:00Z","completed_at":null,"html_url":"https://github.com/o/r/actions/runs/1/job/2","steps":[{"name":"Checkout","status":"completed","conclusion":"success","number":1,"started_at":"2026-10-27T10:00:01Z","completed_at":"2026-10-27T10:00:02Z"},{"name":"Build","status":"in_progress","conclusion":null,"number":2,"started_at":"2026-10-27T10:00:03Z","completed_at":null}]}]}"#;
+        let parsed: RestJobsPage = serde_json::from_str(body).unwrap();
+        let job = from_rest_job(parsed.jobs.into_iter().next().unwrap());
+        assert_eq!(job.id, 9_007_199_254_740_993);
+        assert_eq!(job.name, "build");
+        assert_eq!(job.status, "in_progress");
+        assert_eq!(job.conclusion, "");
+        assert_eq!(job.completed_at, "");
+        assert_eq!(job.started_at, "2026-10-27T10:00:00Z");
+        assert_eq!(job.url, "https://github.com/o/r/actions/runs/1/job/2");
+        assert!(job.log_ref.is_none());
+        let wire = serde_json::to_value(&job).unwrap();
+        assert_eq!(wire["id"], "9007199254740993");
+        assert_eq!(wire["startedAt"], job.started_at);
+        assert_eq!(wire["completedAt"], "");
+        assert!(wire.get("started_at").is_none());
+        assert!(wire.get("completed_at").is_none());
+        assert_eq!(
+            wire["steps"],
+            json!([
+                {"name":"Checkout","status":"completed","conclusion":"success","number":1,
+                 "startedAt":"2026-10-27T10:00:01Z","completedAt":"2026-10-27T10:00:02Z"},
+                {"name":"Build","status":"in_progress","conclusion":"","number":2,
+                 "startedAt":"2026-10-27T10:00:03Z","completedAt":""}
+            ])
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["jobs"][0]["steps"] = serde_json::Value::Null;
+        let parsed: RestJobsPage = serde_json::from_value(value).unwrap();
+        let job = from_rest_job(parsed.jobs.into_iter().next().unwrap());
+        assert!(job.steps.is_empty());
+        assert_eq!(job.conclusion, "");
+        assert_eq!(job.completed_at, "");
+        assert!(job.log_ref.is_none());
+        assert_eq!(serde_json::to_value(job).unwrap()["id"], "9007199254740993");
+
+        for body in [r#"{}"#, r#"{"jobs":null}"#] {
+            assert!(serde_json::from_str::<RestJobsPage>(body)
+                .unwrap()
+                .jobs
+                .is_empty());
+        }
+        for body in [
+            r#"{"jobs":[{}]}"#,
+            r#"{"jobs":[{"id":null,"name":null,"status":null,"conclusion":null,"started_at":null,"completed_at":null,"html_url":null,"steps":[{"name":null,"status":null,"conclusion":null,"number":null,"started_at":null,"completed_at":null}]}]}"#,
+        ] {
+            let parsed: RestJobsPage = serde_json::from_str(body).unwrap();
+            let job = from_rest_job(parsed.jobs.into_iter().next().unwrap());
+            assert_eq!(
+                (
+                    job.id,
+                    job.name.as_str(),
+                    job.status.as_str(),
+                    job.url.as_str()
+                ),
+                (0, "", "", "")
+            );
+            for step in job.steps {
+                assert_eq!(
+                    serde_json::to_value(step).unwrap(),
+                    json!({
+                        "name":"", "status":"", "conclusion":"", "number":0,
+                        "startedAt":"", "completedAt":""
+                    })
+                );
+            }
+        }
+    }
+
     /// The argv invariants `gh_run_page`'s correctness rests on, pinned without a spawn.
     #[test]
     fn run_page_argv_keeps_its_invariants() {
-        let args = run_page_args("repos/o/r/actions/runs", 40, 2, None);
+        let args = run_page_args("repos/o/r/actions/runs", 40, 2, None, None);
 
         // `gh api` with `-f` fields present defaults to POST; only under GET do they
         // become query params.
@@ -1611,13 +2605,13 @@ mod tests {
         // The branch field appears only when a branch is given, and only as a `-f`.
         assert!(!args.iter().any(|a| a.starts_with("branch=")), "{args:?}");
         for absent in [None, Some("")] {
-            let args = run_page_args("repos/o/r/actions/runs", 40, 1, absent);
+            let args = run_page_args("repos/o/r/actions/runs", 40, 1, absent, None);
             assert!(
                 !args.iter().any(|a| a.starts_with("branch=")),
                 "{absent:?} must add no branch field: {args:?}"
             );
         }
-        let scoped = run_page_args("repos/o/r/actions/runs", 40, 1, Some("feat/x"));
+        let scoped = run_page_args("repos/o/r/actions/runs", 40, 1, Some("feat/x"), None);
         let at = scoped
             .iter()
             .position(|a| a == "branch=feat/x")

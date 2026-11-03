@@ -340,7 +340,7 @@ struct BuiltCommand {
 /// `docker` is spawned directly as the PTY child: the vendored portable-pty patch
 /// (NULL std handles) makes the child attach to the pseudoconsole, so its TTY check
 /// passes and `-t` allocates a real container TTY.
-async fn build_command(opts: &PtyOpts, id: &str) -> AppResult<BuiltCommand> {
+async fn build_command(opts: &PtyOpts) -> AppResult<BuiltCommand> {
     if opts.kind == "container" {
         let (bin, args, tip) = container_shell_command(&opts.cwd, &opts.ports).await?;
         let mut cmd = CommandBuilder::new(bin);
@@ -384,28 +384,15 @@ async fn build_command(opts: &PtyOpts, id: &str) -> AppResult<BuiltCommand> {
             }
             None => {
                 let body = opts.body.as_deref().unwrap_or_default();
-                // Sanitize the (unique-per-run) id to safe filename chars.
-                let safe: String = id
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect();
-                let tmp = std::env::temp_dir().join(format!("gd-task-{safe}.{ext}"));
-                std::fs::write(&tmp, body).map_err(AppError::Io)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(meta) = std::fs::metadata(&tmp) {
-                        let mut perm = meta.permissions();
-                        perm.set_mode(0o755);
-                        let _ = std::fs::set_permissions(&tmp, perm);
-                    }
-                }
+                // Executable (0o700, still owner-only) so a body that re-runs itself
+                // by path works.
+                let tmp = crate::agent_sandbox::write_temp_script(
+                    "gd-task-",
+                    &format!(".{ext}"),
+                    body,
+                    true,
+                )
+                .map_err(AppError::Io)?;
                 (tmp.to_string_lossy().into_owned(), Some(tmp))
             }
         };
@@ -548,12 +535,13 @@ pub async fn pty_open(
         tip,
         cleanup,
         tree_kill,
-    } = build_command(&opts, &id).await?;
+    } = build_command(&opts).await?;
     // portable-pty's CommandBuilder already inherits the parent environment, so we
-    // only subtract (whatever `sanitize_child_env` removes — the AppImage bundle's
-    // paths and an inherited PWD, which would misdirect host tools run in the
-    // terminal) and advertise a capable terminal — re-copying every var is
-    // redundant and can introduce odd-cased duplicate Windows vars.
+    // only apply `sanitize_child_env`'s rewrites (it drops an inherited PWD and the
+    // AppImage bundle's paths, which would misdirect host tools run in the terminal,
+    // and on macOS/Linux sets the merged shell PATH plus its marker) and advertise a
+    // capable terminal; re-copying every var is redundant and can introduce
+    // odd-cased duplicate Windows vars.
     crate::agent::sanitize_child_env(&mut cmd);
     cmd.env("TERM", "xterm-256color");
 
@@ -565,7 +553,12 @@ pub async fn pty_open(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| AppError::Command(format!("failed to open a terminal: {e}")))?;
+        .map_err(|e| {
+            if let Some(p) = &cleanup {
+                let _ = std::fs::remove_file(p);
+            }
+            AppError::Command(format!("failed to open a terminal: {e}"))
+        })?;
 
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
         // The temp script file is orphaned if the spawn fails — clean it up.
@@ -605,7 +598,6 @@ pub async fn pty_open(
     std::thread::spawn(move || pump_pty_input(writer, input_rx, pump_queued));
 
     let gen = PTY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let cleanup_path = cleanup.clone();
     let prev = state.ptys.lock().unwrap().insert(
         id.clone(),
         PtyHandle {
@@ -620,12 +612,8 @@ pub async fn pty_open(
     );
     // A same-id re-open (React StrictMode double-mount in dev fires two opens
     // whose closes can't catch them) — tear the stale process tree down so it
-    // can't orphan. Skip deleting its temp script when this run reuses the same
-    // path (inline tasks derive the name from the shared id).
-    if let Some(mut old) = prev {
-        if old.cleanup == cleanup_path {
-            old.cleanup = None;
-        }
+    // can't orphan.
+    if let Some(old) = prev {
         std::thread::spawn(move || teardown_handle(old));
     }
 
@@ -755,44 +743,59 @@ pub fn pty_close(state: State<'_, PtyState>, id: String) -> AppResult<()> {
 // Dev-only external-terminal fallback: runs a task in the user's OS terminal
 // because the in-app PTY can't spawn under `pnpm tauri dev` on Windows (see the
 // module header). Compiled out of release builds (`debug_assertions`), and the
-// frontend's gate is statically false there. Mirrors
-// `agent_sandbox::launch_container_shell`.
-
-#[cfg(debug_assertions)]
-static TERM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// frontend's gate is statically false there. Mirrors the launch shape of
+// `agent_sandbox::launch_container_shell`, without its self-deleting script.
 
 #[cfg(all(unix, debug_assertions))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Windows: write a temp `.cmd` that cds to the repo, runs the (double-quoted)
-/// command, and pauses; `start` it so it gets a fresh, fully-wired console.
+/// The cmd interpreter's script reads %~N directly, so trailing backslashes stay undoubled.
+/// Other programs, including batch shims, need MSVC doubling at the receiving executable.
+#[cfg(any(all(windows, debug_assertions), test))]
+fn task_terminal_script(
+    cwd: &str,
+    bin: &str,
+    argv: &[String],
+    interpreter: &str,
+) -> AppResult<String> {
+    let quote_arg = if interpreter == "cmd" {
+        crate::agent_sandbox::cmd_script_quoted
+    } else {
+        crate::agent_sandbox::cmd_script_arg
+    };
+    let cwd = crate::agent_sandbox::cmd_script_quoted(cwd)?;
+    let mut line = crate::agent_sandbox::cmd_script_quoted(bin)?;
+    for a in argv {
+        line.push(' ');
+        line.push_str(&quote_arg(a)?);
+    }
+    Ok(format!(
+        "{}title GitDesktop task\r\ncd /d {cwd}\r\n{line}\r\necho.\r\necho (task exited) Press any key to close...\r\npause >nul\r\n",
+        crate::agent_sandbox::CMD_SCRIPT_PRELUDE
+    ))
+}
+
+/// Windows: `start` a temp `.cmd` for a fresh, fully-wired console.
+/// Every cwd/program/argv value goes through `cmd_script_quoted` /
+/// `cmd_script_arg` under their documented contract.
 #[cfg(all(windows, debug_assertions))]
-fn spawn_terminal(cwd: &str, bin: &str, argv: &[String]) -> AppResult<()> {
+fn spawn_terminal(cwd: &str, bin: &str, argv: &[String], interpreter: &str) -> AppResult<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut line = format!("\"{bin}\"");
-    for a in argv {
-        line.push_str(&format!(" \"{a}\""));
-    }
-    let script = format!(
-        "@echo off\r\ntitle GitDesktop task\r\ncd /d \"{cwd}\"\r\n{line}\r\necho.\r\necho (task exited) Press any key to close...\r\npause >nul\r\n"
-    );
-    let n = TERM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("gd-task-run-{}-{n}.cmd", std::process::id()));
-    std::fs::write(&path, script).map_err(AppError::Io)?;
+    let script = task_terminal_script(cwd, bin, argv, interpreter)?;
+    let path = crate::agent_sandbox::write_temp_script("gd-task-run-", ".cmd", &script, false)
+        .map_err(AppError::Io)?;
     let mut c = std::process::Command::new("cmd");
     c.raw_arg(format!("/c start \"GitDesktop\" \"{}\"", path.display()));
     c.creation_flags(CREATE_NO_WINDOW);
-    c.spawn().map(|_| ()).map_err(AppError::Io)
+    crate::agent_sandbox::discard_script_on_err(&path, c.spawn().map(|_| ()).map_err(AppError::Io))
 }
 
 /// macOS: write a temp `.command` (Terminal.app runs it on `open`).
 #[cfg(all(target_os = "macos", debug_assertions))]
 fn spawn_terminal(cwd: &str, bin: &str, argv: &[String]) -> AppResult<()> {
-    use std::os::unix::fs::PermissionsExt;
     let mut line = sh_quote(bin);
     for a in argv {
         line.push(' ');
@@ -802,18 +805,14 @@ fn spawn_terminal(cwd: &str, bin: &str, argv: &[String]) -> AppResult<()> {
         "#!/bin/bash\ncd {}\n{line}\necho\necho '(task exited)'\n",
         sh_quote(cwd)
     );
-    let n = TERM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("gd-task-run-{}-{n}.command", std::process::id()));
-    std::fs::write(&path, script).map_err(AppError::Io)?;
-    let mut perm = std::fs::metadata(&path).map_err(AppError::Io)?.permissions();
-    perm.set_mode(0o755);
-    std::fs::set_permissions(&path, perm).map_err(AppError::Io)?;
-    std::process::Command::new("open")
+    let path = crate::agent_sandbox::write_temp_script("gd-task-run-", ".command", &script, true)
+        .map_err(AppError::Io)?;
+    let spawned = std::process::Command::new("open")
         .arg(&path)
         .spawn()
         .map(|_| ())
-        .map_err(AppError::Io)
+        .map_err(AppError::Io);
+    crate::agent_sandbox::discard_script_on_err(&path, spawned)
 }
 
 /// Linux: run the command in the first available terminal emulator, dropping into a
@@ -879,6 +878,14 @@ async fn task_open_terminal_impl(
     path: Option<String>,
     args: Vec<String>,
 ) -> AppResult<()> {
+    // Windows script refusals must precede resolution and inline-body writes.
+    #[cfg(windows)]
+    {
+        crate::agent_sandbox::cmd_script_quoted(&cwd)?;
+        for arg in &args {
+            crate::agent_sandbox::cmd_script_quoted(arg)?;
+        }
+    }
     let (names, ext, build_args) = task_interp(&interpreter).ok_or_else(|| {
         AppError::Command(format!("unknown task interpreter '{interpreter}'"))
     })?;
@@ -890,6 +897,10 @@ async fn task_open_terminal_impl(
             ))
         })?;
 
+    #[cfg(windows)]
+    crate::agent_sandbox::cmd_script_quoted(&bin.to_string_lossy())?;
+
+    let mut inline_tmp = None;
     let script_path = match path.as_deref().filter(|p| !p.is_empty()) {
         Some(file) => {
             let full = resolve_script_path(&cwd, file);
@@ -903,22 +914,17 @@ async fn task_open_terminal_impl(
         }
         None => {
             // Inline body → a temp script the external terminal reads after we
-            // return. Not cleaned up here (we'd race the terminal); the OS clears
-            // its temp dir.
+            // return, so a launched one stays in the temp dir; only a failed spawn
+            // removes it. Executable (0o700) so a body that re-runs itself works.
             let body = body.as_deref().unwrap_or_default();
-            let n = TERM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = std::env::temp_dir()
-                .join(format!("gd-task-inline-{}-{n}.{ext}", std::process::id()));
-            std::fs::write(&tmp, body).map_err(AppError::Io)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&tmp) {
-                    let mut perm = meta.permissions();
-                    perm.set_mode(0o755);
-                    let _ = std::fs::set_permissions(&tmp, perm);
-                }
-            }
+            let tmp = crate::agent_sandbox::write_temp_script(
+                "gd-task-inline-",
+                &format!(".{ext}"),
+                body,
+                true,
+            )
+            .map_err(AppError::Io)?;
+            inline_tmp = Some(tmp.clone());
             tmp.to_string_lossy().into_owned()
         }
     };
@@ -926,7 +932,14 @@ async fn task_open_terminal_impl(
     let mut argv = build_args(&script_path);
     argv.extend(args);
     let bin = bin.to_string_lossy().into_owned();
-    spawn_terminal(&cwd, &bin, &argv)
+    #[cfg(windows)]
+    let spawned = spawn_terminal(&cwd, &bin, &argv, &interpreter);
+    #[cfg(not(windows))]
+    let spawned = spawn_terminal(&cwd, &bin, &argv);
+    match inline_tmp {
+        Some(tmp) => crate::agent_sandbox::discard_script_on_err(&tmp, spawned),
+        None => spawned,
+    }
 }
 
 #[cfg(test)]
@@ -1423,5 +1436,118 @@ mod tests {
         let (_n, ext, build) = task_interp("cmd").unwrap();
         assert_eq!(ext, "cmd");
         assert_eq!(build("x.cmd"), vec!["/c".to_string(), "x.cmd".to_string()]);
+    }
+
+    #[test]
+    fn cmd_script_task_golden() {
+        let cwd = "C:\\Users\\José\\rate 100%\\repo";
+        let bin = "C:\\Program Files\\nodejs\\node.exe";
+        let argv: Vec<String> = [
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\gd-task-inline-1-0.js",
+            "out dir\\",
+            "R&D (v2)^!",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let expected = concat!(
+            "@echo off\r\n",
+            "chcp 65001 >nul\r\n",
+            "setlocal DisableDelayedExpansion\r\n",
+            "title GitDesktop task\r\n",
+            "cd /d \"C:\\Users\\José\\rate 100%%\\repo\"\r\n",
+            "\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\Users\\dev\\AppData\\Local\\Temp\\gd-task-inline-1-0.js\" \"out dir\\\\\" \"R&D (v2)^!\"\r\n",
+            "echo.\r\n",
+            "echo (task exited) Press any key to close...\r\n",
+            "pause >nul\r\n",
+        );
+        assert_eq!(task_terminal_script(cwd, bin, &argv, "node").unwrap(), expected);
+    }
+
+    #[test]
+    fn cmd_script_task_refuses_cwd() {
+        for value in ["a\"b", "a\nb", "a\rb", "a\0b", "a\tb"] {
+            assert!(matches!(
+                task_terminal_script(value, "node", &[], "node"),
+                Err(AppError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cmd_script_task_refuses_argv() {
+        for value in ["a\"b", "a\nb", "a\rb", "a\0b", "a\tb"] {
+            let argv = vec!["task.js".to_string(), value.to_string()];
+            assert!(matches!(
+                task_terminal_script("C:\\repos", "node", &argv, "node"),
+                Err(AppError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cmd_script_task_refuses_bin() {
+        assert!(matches!(
+            task_terminal_script("C:\\repos", "a\"b", &[], "node"),
+            Err(AppError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn cmd_script_task_cmd_golden() {
+        let bin = "C:\\Windows\\System32\\cmd.exe";
+        let (_, _, build_args) = task_interp("cmd").unwrap();
+        let mut argv = build_args("C:\\repos\\task.cmd");
+        argv.push("out dir\\".to_string());
+        let expected = concat!(
+            "@echo off\r\n",
+            "chcp 65001 >nul\r\n",
+            "setlocal DisableDelayedExpansion\r\n",
+            "title GitDesktop task\r\n",
+            "cd /d \"C:\\repos\"\r\n",
+            "\"C:\\Windows\\System32\\cmd.exe\" \"/c\" \"C:\\repos\\task.cmd\" \"out dir\\\"\r\n",
+            "echo.\r\n",
+            "echo (task exited) Press any key to close...\r\n",
+            "pause >nul\r\n",
+        );
+        assert_eq!(
+            task_terminal_script("C:\\repos", bin, &argv, "cmd").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn cmd_script_task_batch_shims_get_native_quoting() {
+        for bin in ["C:\\tools\\node.cmd", "C:\\tools\\node.BaT"] {
+            let argv = vec!["out dir\\".to_string(), "100%!".to_string()];
+            let script = task_terminal_script("C:\\repos", bin, &argv, "node").unwrap();
+            assert!(script.contains(&format!("\"{bin}\" \"out dir\\\\\" \"100%%!\"\r\n")));
+        }
+    }
+
+    #[test]
+    fn cmd_script_task_cwd_keeps_trailing_backslash() {
+        let script = task_terminal_script("C:\\", "node.exe", &[], "node").unwrap();
+        assert!(script.lines().any(|line| line == "cd /d \"C:\\\""));
+    }
+
+    #[cfg(all(windows, debug_assertions))]
+    #[tokio::test]
+    async fn task_open_terminal_refuses_before_resolution() {
+        // The post-resolution bin check is not covered by this shape.
+        for (cwd, args) in [
+            ("a\"b".to_string(), vec![]),
+            ("C:\\repos".to_string(), vec!["a\nb".to_string()]),
+        ] {
+            let result = task_open_terminal_impl(
+                cwd,
+                "no-such-interp".into(),
+                Some("echo".into()),
+                None,
+                args,
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::InvalidArgument(_))), "{result:?}");
+        }
     }
 }

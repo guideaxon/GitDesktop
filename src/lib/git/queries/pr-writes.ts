@@ -3,7 +3,7 @@
  * write is filed under, how a write's variables name what it targets, and the
  * matches a PR view holds its controls by. Also the reading every cache-scan hold
  * shares (a cache mutation as a {@link PendingMutationEntry}), and the review-thread,
- * discussion-upvote, label-edit, fork and tag-push projections over it.
+ * discussion-upvote, label-edit, fork, tag-push and publish projections over it.
  *
  * Import-free at runtime on purpose (types only, erased): `scripts/pr-writes.test.mjs`
  * loads it straight from `src/` under Node's type stripping, which resolves no
@@ -523,3 +523,52 @@ export function pendingLocalPrWrite(
 /** A cache entry's kind and variables as a {@link PendingLocalPrWrite}. */
 export const readPendingLocalPrWrite = (kind: string, vars: unknown) =>
   pendingLocalPrWrite(kind as LocalPrWriteKind, vars);
+
+/** Filter prefix for every repository publish ({@link publishRepoKey}). */
+export const PUBLISH_REPO_KEY = ["publish-repo"] as const;
+
+/** A repository publish's mutation key; provider and name ride the variables. The
+ *  repo identity, when known, rides a third element so every worktree of the
+ *  repository sees the publish; without it the key stays path-only. */
+export const publishRepoKey = (repo: string, identity?: string) =>
+  identity === undefined
+    ? ([...PUBLISH_REPO_KEY, repo] as const)
+    : ([...PUBLISH_REPO_KEY, repo, identity] as const);
+
+/** One publish in flight: where it goes and the name it creates there. */
+export interface PendingPublish {
+  provider: "github" | "gitlab" | "bitbucket";
+  name: string;
+}
+
+/** The publishes of the repository among `entries`, which the caller has already
+ *  narrowed to pending ones: keyed under `repo`'s own path, or under any path
+ *  whose key carries `identity` (an absent identity never matches an absent one).
+ *  Variables without a known provider and a string name are dropped, so a
+ *  malformed entry holds nothing. */
+export function pendingPublishesFor(
+  entries: readonly PendingMutationEntry[],
+  repo: string,
+  identity?: string,
+): PendingPublish[] {
+  const out: PendingPublish[] = [];
+  for (const e of entries) {
+    const [prefix, keyRepo, keyIdentity] = e.key ?? [];
+    if (prefix !== PUBLISH_REPO_KEY[0]) continue;
+    if (
+      keyRepo !== repo &&
+      (identity === undefined || keyIdentity !== identity)
+    )
+      continue;
+    if (typeof e.vars !== "object" || e.vars === null) continue;
+    const { provider, name } = e.vars as Record<string, unknown>;
+    if (
+      (provider === "github" ||
+        provider === "gitlab" ||
+        provider === "bitbucket") &&
+      typeof name === "string"
+    )
+      out.push({ provider, name });
+  }
+  return out;
+}

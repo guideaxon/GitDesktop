@@ -199,7 +199,10 @@ export function CollaboratorsSection({
             autoComplete="off"
             spellCheck={false}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && canAdd) void addCollaborator();
+              // A held Enter can land here after a removal; only a fresh press
+              // sends the invite.
+              if (e.key === "Enter" && canAdd && !e.repeat)
+                void addCollaborator();
             }}
           />
           <RoleSlot personal={personal} value={inviteRole} onRole={setRole} />
@@ -226,8 +229,8 @@ export function CollaboratorsSection({
           </p>
         )}
         {/* The settings read has `retry: false`: an error holds Invite and the row
-            pickers until a re-read: this Retry, the window-focus `["repo"]`
-            invalidation, or reopening the dialog. */}
+            pickers until a re-read: this Retry, the window-focus pass's error
+            arm, or reopening the dialog. */}
         {rolesUnknownReason === ROLES_UNREAD_REASON && (
           <div className="mt-2 flex items-center gap-2 text-[11px] text-muted-foreground">
             <p>{ROLES_UNREAD_REASON}.</p>

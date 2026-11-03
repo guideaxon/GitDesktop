@@ -109,6 +109,7 @@ import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
 import {
   COMMENT_DELETE_PENDING_REASON,
   COMMENT_POST_PENDING_REASON,
+  isOfflineNow,
   OFFLINE_ITEM_REASON,
   pendingItemReason,
   pendingWriteReason,
@@ -125,6 +126,7 @@ import { toastError, toastErrorWithNote } from "@/lib/toast";
 import { useEntityHold, useRevealGuard } from "@/lib/use-entity-hold";
 import { useKeyedEntityState } from "@/lib/use-keyed-entity-state";
 import { useLatestRef } from "@/lib/use-latest-ref";
+import { useToastClearance } from "@/lib/use-toast-clearance";
 import { PlanIssueButton } from "../plan/PlanIssueButton";
 import { readAnswered } from "../pulls/pr-section-answered";
 import { SolveIssueButton } from "../sessions/SolveIssueButton";
@@ -334,6 +336,8 @@ export function RemoteIssueView({
   })();
   const pinSuffix = itemSuffix || (pinHeld ? ` — ${pinHeld}` : "");
   const lockHeldSuffix = lockSuffix || (lockHeld ? ` — ${lockHeld}` : "");
+  // Either direction would be a guess while the lock state is unknown.
+  const lockUnknownSuffix = lockSuffix || " — couldn't check lock state";
   const selectIssue = useUiStore((s) => s.selectIssue);
   const openPr = useUiStore((s) => s.openPr);
   const repoName = useUiStore((s) => s.repoName);
@@ -579,6 +583,13 @@ export function RemoteIssueView({
           : "content";
   // Each frame episode decides afresh.
   if (arm !== "loading" && frameRow !== null) setFrameRow(null);
+  // The state-only bar renders only in the content arm, and only for a viewer who
+  // can change state but not comment (the composer carries the actions then).
+  const stateBarRef = useRef<HTMLDivElement>(null);
+  useToastClearance(
+    stateBarRef,
+    arm === "content" && !canComment && canChangeState,
+  );
   // A swap that unmounts the focused node (in-view navigation onto an issue that
   // lands without a hold, or an arm change) would drop focus to <body>; land it
   // on the host. Change-only, so a mount never takes focus from elsewhere.
@@ -711,10 +722,9 @@ export function RemoteIssueView({
                 variant="outline"
                 size="sm"
                 className="cursor-pointer"
-                disabled={details.isFetching}
                 onClick={() => details.refetch()}
               >
-                {details.isFetching ? "Retrying…" : "Retry"}
+                Retry
               </Button>
             </div>
           ) : undefined
@@ -1124,7 +1134,7 @@ export function RemoteIssueView({
   }
 
   async function doLock(reason: LockReason | null) {
-    if (lockPending || refuseWhileOffline()) return;
+    if (lockPending || issue?.lockUnknown || refuseWhileOffline()) return;
     try {
       await lockIssue.mutateAsync({ number, reason });
     } catch (e) {
@@ -1135,7 +1145,7 @@ export function RemoteIssueView({
   }
 
   async function doUnlock() {
-    if (lockPending || refuseWhileOffline()) return;
+    if (lockPending || issue?.lockUnknown || refuseWhileOffline()) return;
     try {
       await unlockIssue.mutateAsync(number);
     } catch (e) {
@@ -1402,7 +1412,23 @@ export function RemoteIssueView({
             {remoteLabel}
           </DisabledReasonButton>
           {(canLock || canDuplicate || canTransfer || canDelete) && (
-            <DropdownMenu>
+            <DropdownMenu
+              onOpenChange={(open) => {
+                // Opening the menu is the held lock row's retry, as the
+                // Repository menu's is for its star row: a row has no room.
+                if (
+                  open &&
+                  canLock &&
+                  !detailsStale &&
+                  issue.lockUnknown &&
+                  !details.isFetching &&
+                  !details.isPaused &&
+                  !isOfflineNow()
+                ) {
+                  void details.refetch();
+                }
+              }}
+            >
               {/* Every item but Transfer is withheld while the rendered issue is
                   the previous one, so hold the menu shut rather than open a near-
                   empty popup. */}
@@ -1436,8 +1462,14 @@ export function RemoteIssueView({
                 {/* Absent while a placeholder is served: which affordance renders
                     comes from the LOADED issue's lock state, so a click during that
                     window would lock or unlock the issue you actually selected. */}
+                {canLock && !detailsStale && issue.lockUnknown && (
+                  <DropdownMenuItem className={MENU_HELD_ROW_CLASS} disabled>
+                    Lock or unlock conversation{lockUnknownSuffix}
+                  </DropdownMenuItem>
+                )}
                 {canLock &&
                   !detailsStale &&
+                  !issue.lockUnknown &&
                   (issue.locked ? (
                     <DropdownMenuItem
                       className={MENU_HELD_ROW_CLASS}
@@ -1733,6 +1765,7 @@ export function RemoteIssueView({
           Bitbucket has neither, so the whole bar hides. */}
       {canComment ? (
         <CommentComposer
+          toastClearance
           ref={composerRef}
           ariaLabel="Leave a comment"
           placeholder="Leave a comment…"
@@ -1767,7 +1800,7 @@ export function RemoteIssueView({
           }
         />
       ) : canChangeState ? (
-        <div className="space-y-2 border-t p-3">
+        <div ref={stateBarRef} className="space-y-2 border-t p-3">
           <div className="flex items-center gap-2">{stateActions}</div>
         </div>
       ) : null}

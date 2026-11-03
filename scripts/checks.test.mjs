@@ -37,6 +37,10 @@ import {
   EXTENSIONS,
   generateChordCalls,
   isPreparingSlotHost,
+  MCP_FLUSH_CALLER,
+  MCP_FLUSH_MODULE,
+  MCP_SECRET_API,
+  MCP_SECRET_READ_ONLY,
   okReportLine,
   preparingSlotSites,
   reachesGitQueriesInternal,
@@ -87,13 +91,10 @@ import {
   verdict as reusedViewVerdict,
 } from "./check-reused-view-pending.mjs";
 import {
-  CARRIERS,
-  MOUNTED_CARRIERS,
-  missingSentinels,
-} from "./check-rule-mirrors.mjs";
-import {
   checkBareBranchRevs,
   checkCompareEndpoints,
+  checkDiffExternalDrivers,
+  checkGhExitAbsence,
   checkMergeIgnoredGuard,
   checkRefspecTemplates,
   checkSecretArgv,
@@ -102,9 +103,12 @@ import {
   checkSyncCommands,
   checkTestMarkerBranches,
   enclosingFn,
+  GH_EXIT_ABSENCE_ALLOWLIST,
+  ghExitAbsenceScope,
   lexRust,
   MERGE_GUARD_ALLOWLIST,
   MERGE_GUARD_NOTE,
+  reportEmptyGhScope,
   splitStaleEntries,
   staleAllowlistEntries,
   TEST_MARKER_ALLOWLIST,
@@ -1538,7 +1542,7 @@ test("binary-marker-single-source exempts the helper module only", () => {
   assert.equal(appliesTo("src/features/pulls/RemotePrView.tsx"), true);
   assert.equal(appliesTo("src/features/pulls/PrCommitDetail.tsx"), true);
   assert.equal(appliesTo("src/lib/ai/prompt.ts"), true);
-  assert.deepEqual(allowlist, ["src/lib/ai/prompt.ts"]);
+  assert.deepEqual(allowlist, []);
 });
 
 test("null-suspense-fallback flags the literal on one line or wrapped", () => {
@@ -2531,7 +2535,7 @@ test("preparing-slot-hide premise: the real roles, hosts and sites", () => {
   assert.ok(check.expectScanned.atLeast >= 500);
   const hosts = [
     "src/features/actions/run-slots.tsx",
-    "src/features/diff/DiffViewer.tsx",
+    "src/features/diff/file-slot.tsx",
   ];
   for (const file of hosts) {
     const source = read(file);
@@ -4872,6 +4876,205 @@ test("stripComments blanks comments but not comment-shaped strings", () => {
 
 // -------------------------------------------------------- check-rust-invariants
 
+function diffDriverHits(src, allowlist) {
+  const hits = [];
+  checkDiffExternalDrivers("git/diff.rs", src, src.split("\n"), hits, allowlist);
+  return hits;
+}
+
+test("diff drivers require a flag on patches, quiet and exit-code verdicts", () => {
+  for (const argv of [
+    '["diff", "--no-color"]',
+    'vec!("diff", "--no-color")',
+    'vec!{"diff", "--no-color"}',
+    '["diff", "--numstat", "-p", r]',
+    '["diff", "--numstat", "-U"]',
+    '["diff", "--numstat", "--binary"]',
+    '["diff", "--name-only", "--quiet"]',
+    '["diff", "--numstat", "--foo"]',
+    '["diff", "--name-only", "--exit-code"]',
+    '["diff", "--numstat", "--exit-code"]',
+    '["diff", "--numstat", "-pz"]',
+    '["diff", "--numstat", "-zp"]',
+    'vec!["diff".to_string(), x]',
+    'vec![String::from("diff"), "--numstat".into(), "-p".into()]',
+    '["diff", "--name-only", "--patch"]',
+    '["diff", "--cached", "--quiet"]',
+    '["diff", "--exit-code"]',
+    '["-C", repo, "diff", "--no-color"]',
+    '["--git-dir=repo", "diff", "--no-color"]',
+    '["diff", "--", "--no-ext-diff"]',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { run(${argv}); }`);
+    assert.equal(hits.length, 1, argv);
+    assert.equal(hits[0].allowlisted, false, argv);
+    assert.equal(hits[0].fn, "patch");
+    assert.match(hits[0].fix, /--no-ext-diff/);
+  }
+});
+
+test("diff drivers reject explicit external-driver enabling regardless of flag order", () => {
+  for (const argv of [
+    '["diff", "--no-ext-diff", "--ext-diff"]',
+    '["diff", "--ext-diff", "--no-ext-diff"]',
+    '["diff", "--numstat", "--ext-diff"]',
+    '["show", "--ext-diff", sha]',
+    '["log", "-p", "--ext-diff"]',
+    '["diff-tree", "--ext-diff".to_owned(), sha]',
+    '["-C", "--", "diff", "--no-ext-diff", "--ext-diff"]',
+    '["-p", "--ext-diff", "HEAD"]',
+    '["--ext-diff", "diff"]',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { run(${argv}); }`);
+    assert.equal(hits.length, 1, argv);
+    assert.equal(hits[0].allowlisted, false, argv);
+    assert.match(hits[0].fix, /drop --ext-diff/);
+  }
+  for (const call of [
+    'Command::new("git").arg("show").args(["--ext-diff", "HEAD"])',
+    'cmd.arg("diff").args(["--ext-diff", "HEAD"])',
+  ]) {
+    const hits = diffDriverHits(`fn patch() { ${call}; }`);
+    assert.equal(hits.length, 1, call);
+    assert.equal(hits[0].allowlisted, false, call);
+    assert.match(hits[0].fix, /drop --ext-diff/);
+  }
+  assert.deepEqual(diffDriverHits('fn log() { run(&["-c", "--ext-diff", "log"]); }'), []);
+});
+
+test("diff drivers retain every production exempt argv shape", () => {
+  for (const [site, argv] of [
+    ["diff.rs staged", '["diff", base, "--numstat", "-z"]'],
+    ["diff.rs cached stats", '["diff", "--cached", "--numstat", "-z"]'],
+    ["diff.rs working stats", '["diff", "--numstat", "-z"]'],
+    ["compare.rs branch stats", '["diff", "--numstat", "-z", &format!("{base}...{compare}")]'],
+    ["compare.rs branch compare", '["diff", "--numstat", "-z", &range]'],
+    ["compare.rs range delta", '["diff", "--numstat", "-z", &range]'],
+    ["ops.rs selected staged", '["diff", "--cached", "--no-renames", "-z", "--name-only"]'],
+    ["ops.rs selected paths", '["diff", "--cached", "--no-renames", "-z", "--name-only", "--"]'],
+    ["ops.rs conflicts", '["diff", "--name-only", "--diff-filter=U"]'],
+    ["ignored_guard.rs", '["diff", "--no-relative", "--name-only", "--no-renames", "--diff-filter=d", "-z", &format!("HEAD...{incoming_sha}")]'],
+    ["stats.rs", '["diff", "--numstat", &merge_range]'],
+  ]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&${argv}); }`), [], site);
+  }
+});
+
+test("diff drivers exempt only known options alongside a machine-readable mode", () => {
+  for (const option of ["-z", "--no-color", "--cached", "--staged", "--no-renames", "--no-relative", "--find-renames", "--find-renames=50%", "-M", "-M50%", "--diff-filter=U", "--relative", "--relative=src/", "--ignore-submodules", "--ignore-submodules=all"]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&["diff", "--numstat", "${option}"]); }`), [], option);
+  }
+  assert.deepEqual(diffDriverHits('fn stats() { run(&["diff", "--name-only", "-z", "--cached"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn stats() { run(&["diff", "--numstat", "--", "--quiet"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn show() { run(&["show", "--", "--ext-diff"]); }'), []);
+  for (const option of ["--quiet", "--binary", "--stat", "--stat=80", "--raw", "-W", "--word-diff", "--word-diff=plain", "--color-words"]) {
+    const hits = diffDriverHits(`fn patch() { run(&["diff", "--numstat", "${option}"]); }`);
+    assert.equal(hits.length, 1, option);
+    assert.equal(hits[0].allowlisted, false, option);
+  }
+});
+
+test("diff drivers resolve owned literal verbs and flags", () => {
+  for (const verb of ['"diff".to_string()', '"diff".into()', '"diff".to_owned()', 'String::from("diff")']) {
+    const hits = diffDriverHits(`fn patch() { run(vec![${verb}, x]); }`);
+    assert.equal(hits.length, 1, verb);
+    assert.equal(hits[0].allowlisted, false, verb);
+    assert.deepEqual(diffDriverHits(`fn patch() { run(vec![${verb}, "--no-ext-diff".into()]); }`), []);
+    assert.deepEqual(diffDriverHits(`fn stats() { run(vec![${verb}, "--numstat".to_owned(), String::from("-z")]); }`), []);
+  }
+});
+
+test("diff drivers require protection when machine-readable output also requests a patch", () => {
+  for (const flag of ["-p", "-u", "-U", "--patch", "--patch-with-raw", "--patch-with-stat", "-U3", "--unified", "--unified=3"]) {
+    for (const output of ["--numstat", "--name-only", "--name-status"]) {
+      const argv = `"diff", "${output}", "${flag}", r`;
+      const hits = diffDriverHits(`fn patch() { run(&[${argv}]); }`);
+      assert.equal(hits.length, 1, argv);
+      assert.equal(hits[0].allowlisted, false, argv);
+      assert.deepEqual(diffDriverHits(`fn patch() { run(&[${argv}, "--no-ext-diff"]); }`), []);
+    }
+  }
+  for (const [open, close] of [["[", "]"], ["(", ")"], ["{", "}"]]) {
+    assert.deepEqual(diffDriverHits(`fn patch() { run(vec!${open}"diff", "--no-ext-diff"${close}); }`), []);
+  }
+});
+
+test("diff drivers do not treat a test-module header inside a string as a module", () => {
+  const hits = diffDriverHits('fn a() { let s = "#[cfg(test)] mod t {"; run(&["diff"]); }');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "a");
+  assert.equal(hits[0].allowlisted, false);
+});
+
+test("diff drivers accept explicit protection and machine-readable output", () => {
+  for (const flag of ["--no-ext-diff", "--numstat", "--name-only", "--name-status"]) {
+    for (const prefix of ['"diff"', '"-c", config, "diff"']) {
+      assert.deepEqual(
+        diffDriverHits(`fn patch() { run(&[${prefix}, "${flag}", path]); }`),
+        [],
+      );
+    }
+  }
+  for (const argv of [
+    '["-c", "core.quotepath=off", "diff", "--numstat"]',
+    '["-C", p, "diff", "--numstat"]',
+    '["--no-pager", "diff", "--name-only"]',
+  ]) {
+    assert.deepEqual(diffDriverHits(`fn stats() { run(&${argv}); }`), [], argv);
+  }
+  assert.deepEqual(diffDriverHits('fn pr() { run(&["pr", "diff"]); }'), []);
+  assert.deepEqual(diffDriverHits('fn opaque() { let x = [a, b]; }'), []);
+  assert.deepEqual(diffDriverHits('fn text() { let s = "[\\\"diff\\\"]"; }'), []);
+  assert.deepEqual(diffDriverHits('// ["diff", "--quiet"]'), []);
+});
+
+test("diff drivers exclude named and visibility-qualified test modules by span", () => {
+  for (const module of ["mod tests", "mod config_tests", "pub(crate) mod tests"]) {
+    const src = `#[cfg(test)] ${module} { fn fixture() { run(&["diff", "--no-color"]); } }`;
+    assert.deepEqual(diffDriverHits(src), []);
+    const hits = diffDriverHits(`${src}\nfn production() { run(&["diff"]); }`);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].fn, "production");
+  }
+});
+
+test("diff drivers attribute const/static initializers separately from functions", () => {
+  const row = {
+    file: "git/diff.rs",
+    fn: "REQUESTED_ATTRS",
+    item: true,
+    rationale: "Attribute names passed to check-attr, never a git argv",
+  };
+  for (const kind of ["const", "pub const", "pub(crate) static"]) {
+    const src = `${kind} REQUESTED_ATTRS: [&str; 2] = ["diff", "filter"];`;
+    const hits = diffDriverHits(src);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].fn, "REQUESTED_ATTRS");
+    assert.equal(hits[0].allowlisted, true);
+    assert.equal(diffDriverHits(src, [{ ...row, item: false }])[0].allowlisted, false);
+    assert.equal(diffDriverHits(src, [])[0].allowlisted, false);
+  }
+  const src = 'fn REQUESTED_ATTRS() { run(&["diff", "--no-color"]); }';
+  assert.equal(diffDriverHits(src, [row])[0].allowlisted, false);
+  assert.equal(diffDriverHits(src, [{ ...row, item: false }])[0].allowlisted, true);
+});
+
+test("diff drivers fail closed on unreadable literals, groups and verb slots", () => {
+  for (const [src, reason] of [
+    ['fn patch() { let s = "unterminated', /never closes/],
+    ['fn patch() { run(&["diff", "--no-color"', /cannot bound/],
+    ['fn patch() { run(&["diff", "--no-ext-diff"); }', /cannot bound/],
+    ['fn patch() { run(&[x, "diff", "--no-color"]); }', /cannot resolve/],
+  ]) {
+    const hits = diffDriverHits(src);
+    assert.equal(hits.length, 1, src);
+    assert.equal(hits[0].allowlisted, false, src);
+    assert.match(hits[0].fix, reason);
+    assert.equal(hits[0].file, "git/diff.rs");
+    assert.equal(hits[0].line, 1);
+  }
+});
+
 function markerBranchHits(src, other = "", corpus = undefined) {
   const hits = [];
   checkTestMarkerBranches(
@@ -6753,6 +6956,172 @@ test("test modules are skipped by SPAN, so production code after one is scanned"
   );
 });
 
+/** Check J over one fixture file, as [fn, line] pairs. */
+function ghExitAbsenceHits(src, file = "github/fixture.rs", allowlist = []) {
+  const hits = [];
+  checkGhExitAbsence(file, src, src.split("\n"), hits, allowlist);
+  return hits;
+}
+
+test("check J flags each gh-exit-as-absence shape the classifier replaced", () => {
+  // The pre-classifier shapes of security.rs, secrets.rs, auth.rs and pr.rs.
+  const src = [
+    "async fn probe_ok(repo: &str) -> bool {",
+    '    run_gh_raw(Some(repo), &["api", "x"], T)',
+    "        .await",
+    "        .map(|o| o.code == 0)",
+    "        .unwrap_or(false)",
+    "}",
+    "async fn get_bool_field(repo: &str) -> bool {",
+    "    let Ok(out) = run_gh_raw(Some(repo), &[], T).await else { return false; };",
+    "    if out.code != 0 {",
+    "        return false;",
+    "    }",
+    "    true",
+    "}",
+    "pub async fn gh_environments_list(repo: String) -> AppResult<Vec<String>> {",
+    "    let out = run_gh_raw(Some(&repo), &[], T).await?;",
+    "    if out.code != 0 {",
+    "        return Ok(Vec::new());",
+    "    }",
+    "    Ok(vec![])",
+    "}",
+    "pub async fn gh_token_scopes() -> AppResult<GhScopes> {",
+    "    let out = run_gh_raw(None, &[], T).await?;",
+    "    if out.code != 0 {",
+    "        return Ok(GhScopes::default());",
+    "    }",
+    "    Ok(parse(&out))",
+    "}",
+    "pub async fn gh_repo_star_status(repo: String) -> AppResult<bool> {",
+    "    let out = run_gh_raw(Some(&repo), &[], T).await?;",
+    "    Ok(out.code == 0)",
+    "}",
+    "fn trailing(out: GhOutput) -> AppResult<Option<u8>> {",
+    "    if out.code != 0 { Ok(None) } else { Ok(Some(1)) }",
+    "}",
+    "fn defaulted(out: GhOutput) -> Vec<u8> {",
+    "    run(out).map(|x| x.code == 0).unwrap_or_default();",
+    "    if out.code != 0 {",
+    "        return Default::default();",
+    "    }",
+    "    vec![1]",
+    "}",
+  ].join("\n");
+  assert.deepEqual(
+    ghExitAbsenceHits(src).map((h) => [h.fn, h.line]),
+    [
+      ["gh_repo_star_status", 30],
+      ["probe_ok", 4],
+      ["defaulted", 36],
+      ["get_bool_field", 9],
+      ["gh_environments_list", 16],
+      ["gh_token_scopes", 23],
+      ["trailing", 33],
+      ["defaulted", 37],
+    ],
+  );
+  assert.ok(ghExitAbsenceHits(src).every((h) => !h.allowlisted));
+});
+
+test("check J passes classified reads, errors, comments, strings and test modules", () => {
+  const src = [
+    "fn star_outcome(out: GhOutput) -> AppResult<bool> {",
+    "    if out.code != 0 {",
+    "        return match classify_gh_failure(&out.stderr) {",
+    "            GhFailure::NotFound => Ok(false),",
+    "            _ => Err(AppError::Gh(gh_failure_reason(&out))),",
+    "        };",
+    "    }",
+    "    Ok(true)",
+    "}",
+    "fn classified_first(out: GhOutput) -> AppResult<Vec<u8>> {",
+    "    let failure = classify_gh_failure(&out.stderr);",
+    "    if out.code != 0 {",
+    "        return Ok(Vec::new());",
+    "    }",
+    "    Ok(vec![failure as u8])",
+    "}",
+    "fn errs(out: GhOutput) -> AppResult<bool> {",
+    "    if out.code != 0 {",
+    "        return Err(AppError::Gh(gh_failure_reason(&out)));",
+    "    }",
+    "    Ok(out.code == 1)",
+    "}",
+    "// Never `Ok(out.code == 0)` or `if out.code != 0 { return Ok(None); }`.",
+    "fn text() -> &'static str {",
+    '    "if out.code != 0 { return Ok(None); } Ok(out.code == 0)"',
+    "}",
+    "#[cfg(test)]",
+    "mod tests {",
+    "    fn helper(out: GhOutput) -> AppResult<bool> {",
+    "        Ok(out.code == 0)",
+    "    }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(ghExitAbsenceHits(src), []);
+});
+
+test("check J reads only the GitHub files, and allowlists by (file, fn)", () => {
+  const src = [
+    "pub async fn gh_repo_star_status(out: GhOutput) -> AppResult<bool> {",
+    "    Ok(out.code == 0)",
+    "}",
+  ].join("\n");
+  assert.equal(ghExitAbsenceScope("github/pr.rs"), true);
+  assert.equal(ghExitAbsenceScope("forge/github.rs"), true);
+  assert.equal(ghExitAbsenceScope("forge/gitlab.rs"), false);
+  assert.equal(ghExitAbsenceScope("git/ops.rs"), false);
+  assert.deepEqual(ghExitAbsenceHits(src, "forge/gitlab.rs"), []);
+  assert.equal(ghExitAbsenceHits(src, "forge/github.rs").length, 1);
+  const allow = [
+    { file: "github/pr.rs", fn: "gh_repo_star_status", rationale: "fixture" },
+  ];
+  assert.equal(
+    ghExitAbsenceHits(src, "github/pr.rs", allow)[0].allowlisted,
+    true,
+  );
+  // Another file's entry never covers this one.
+  assert.equal(
+    ghExitAbsenceHits(src, "github/auth.rs", allow)[0].allowlisted,
+    false,
+  );
+  // Every live entry carries a rationale.
+  for (const e of GH_EXIT_ABSENCE_ALLOWLIST)
+    assert.ok(e.rationale.length > 20, e.fn);
+});
+
+test("check J fails closed on a file it cannot lex", () => {
+  const src = [
+    "fn fine(out: GhOutput) -> bool {",
+    '    let s = "never closed;',
+    "    if out.code != 0 { return false; }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(
+    ghExitAbsenceHits(src).map((h) => h.fn),
+    ["<unreadable>"],
+  );
+});
+
+test("check J's empty scope lands on J wherever it sits in the list", () => {
+  const j = { run: checkGhExitAbsence, hits: [] };
+  const k = { run: () => {}, hits: [] };
+  // A check added after J must not take J's failure.
+  reportEmptyGhScope([j, k], ["git/ops.rs", "forge/gitlab.rs"]);
+  assert.deepEqual(
+    j.hits.map((h) => h.fn),
+    ["<empty scope>"],
+  );
+  assert.deepEqual(k.hits, []);
+  // A scope with a GitHub file reports nothing.
+  const quiet = { run: checkGhExitAbsence, hits: [] };
+  reportEmptyGhScope([quiet, k], ["github/pr.rs"]);
+  assert.deepEqual(quiet.hits, []);
+  // Losing J from the list fails loudly rather than misrouting.
+  assert.throws(() => reportEmptyGhScope([k], []), /check J is missing/);
+});
+
 // ----------------------------------------------------------- check-dead-surface
 
 test("a commented-out handler entry does not read as registered", () => {
@@ -6838,127 +7207,6 @@ test("invoke matching survives nested generics and wrapped calls", () => {
     "git_branch_tips",
     "git_status",
   ]);
-});
-
-// ----------------------------------------------------------- check-rule-mirrors
-
-// Both fixtures wrap their sentences the way the real carriers do — the `-C`
-// clause and the `is / forbidden` catchall each straddle a line break. That is
-// deliberate: if the whitespace normalization ever came out, the passing
-// fixture would read as a carrier missing two sentinels, so these cases pin the
-// normalization as much as the patterns.
-const carrierStatingTheRule = [
-  "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
-  "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
-  "   to address a task worktree. Everything else — commit, add/stage, stash,",
-  "   push, worktree, config — is",
-  '   forbidden, even "just to test". The user commits their own work.',
-].join("\n");
-
-test("a carrier that still states the whole rule satisfies every sentinel", () => {
-  assert.deepEqual(missingSentinels(carrierStatingTheRule), []);
-});
-
-test("a carrier that drops the line-wrapped catchall is caught", () => {
-  // The dangerous direction: the whitelist forms are still listed, so the file
-  // LOOKS like it carries the rule — only the sentence forbidding everything
-  // else is gone, which is exactly the drift a reader would not notice.
-  const softened = carrierStatingTheRule.replace(
-    ["   push, worktree, config — is", "   forbidden, even"].join("\n"),
-    "   push, worktree, config — are discouraged, except",
-  );
-  assert.notEqual(softened, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(softened).map((s) => s.name),
-    ["forbidden catchall"],
-  );
-});
-
-test("a carrier that carves an exception into the catchall is caught", () => {
-  // Worse than deleting the sentence, because the sentence is still there to
-  // read: the rule is stated and then unstated in the same breath.
-  const excepted = carrierStatingTheRule.replace(
-    [
-      "   push, worktree, config — is",
-      '   forbidden, even "just to test".',
-    ].join("\n"),
-    "   push, worktree, config — is forbidden, except git commit.",
-  );
-  assert.notEqual(excepted, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(excepted).map((s) => s.name),
-    ["forbidden catchall"],
-  );
-});
-
-test("a carrier that drops the -C sanction is caught", () => {
-  // Losing this clause is what makes a worktree-scoped command read as
-  // forbidden to an agent honoring its own charter.
-  const unscoped = carrierStatingTheRule.replace(
-    [
-      "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
-      "   to address a task worktree. Everything else",
-    ].join("\n"),
-    "   show` and `git branch --list`. Everything else",
-  );
-  assert.notEqual(unscoped, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(unscoped).map((s) => s.name),
-    ["-C worktree sanction"],
-  );
-});
-
-test("a carrier that drops the branch --list allowance is caught", () => {
-  const withoutBranch = carrierStatingTheRule.replace(
-    "` and `git branch --list`,",
-    "`,",
-  );
-  assert.notEqual(withoutBranch, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(withoutBranch).map((s) => s.name),
-    ["branch --list allowance"],
-  );
-});
-
-test("a carrier that drops the read-only forms list is caught", () => {
-  const withoutForms = carrierStatingTheRule.replace(
-    [
-      "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
-      "   show`",
-    ].join("\n"),
-    "1. **Git is a whitelist.** Permitted: the read-only inspection forms",
-  );
-  assert.notEqual(withoutForms, carrierStatingTheRule);
-  assert.deepEqual(
-    missingSentinels(withoutForms).map((s) => s.name),
-    ["read-only git forms"],
-  );
-});
-
-test("every carrier path the gate checks exists on disk", () => {
-  // The sentinels only fire on a file the gate can read: a carrier renamed or
-  // moved without updating CARRIERS would otherwise fail as "cannot read" in
-  // CI long after the rename landed.
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  for (const carrier of CARRIERS) {
-    assert.ok(existsSync(join(root, carrier)), `missing carrier: ${carrier}`);
-  }
-});
-
-test("a mounted carrier, when present, still states the whole rule", () => {
-  // Mounted carriers exist only behind the owner's junction — also the only
-  // place their drift can be authored — so the suite gates them exactly where
-  // it can and skips them in clones, the same split the gate itself makes.
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  for (const carrier of MOUNTED_CARRIERS) {
-    const path = join(root, carrier);
-    if (!existsSync(path)) continue;
-    assert.deepEqual(
-      missingSentinels(readFileSync(path, "utf8")).map((s) => s.name),
-      [],
-      `mounted carrier lost the rule: ${carrier}`,
-    );
-  }
 });
 
 // ------------------------------------------------ check-built-whitespace
@@ -10057,4 +10305,1284 @@ test("reused-view-pending: the masker reads `of` as a name outside a for-of head
     assert.deepEqual(rvRun(rvView(line)).errors, [], line);
     assert.deepEqual(rvReads(rvView(line)), [], line);
   }
+});
+
+// ---------------------------------------------------- mcp-secret-keychain-sites
+
+const MCP_CHECK = CHECKS.find((c) => c.name === "mcp-secret-keychain-sites");
+const MCP_BS = String.fromCharCode(92);
+const MCP_DRAFT = "src/features/settings/McpServersSection.tsx";
+const MCP_API = "src/lib/git/api/mcp.ts";
+const MCP_SCREEN = "src/features/settings/SettingsScreen.tsx";
+
+/** The scan of `lines` (joined with LF) as `file`, sorted. */
+function mcpScan(file, lines) {
+  return MCP_CHECK.scan(view(lines.join("\n")), file).sort((a, b) => a - b);
+}
+
+/** `lines` with line `n` (1-based) replaced by `insert` (none deletes it). */
+function mcpSwap(lines, n, ...insert) {
+  return [...lines.slice(0, n - 1), ...insert, ...lines.slice(n)];
+}
+
+/** `lines` with `insert` added after line `n` (1-based). */
+function mcpAfter(lines, n, ...insert) {
+  return [...lines.slice(0, n), ...insert, ...lines.slice(n)];
+}
+
+const MCP_SET = "const failed = await flushMcpSecretSets(plan.flush);";
+const MCP_DEL = "flushMcpSecretDeletes(deletes);";
+
+/** mcp.ts's keychain definitions as the formatter lays them out. */
+const MCP_API_BASE = [
+  'import { invoke } from "../../tauri/invoke";', // 1
+  "const mcpRef = (serverId: string, key: string) =>", // 2
+  "  `mcp-server/${serverId}/${key}`;", // 3
+  "", // 4
+  "export const setMcpSecret = (serverId: string, key: string, value: string) =>", // 5
+  "  COLD_START", // 6
+  "    ? Promise.resolve(coldStartSetSecret(mcpRef(serverId, key), value))", // 7
+  '    : invoke<void>("set_mcp_secret", { serverId, key, value });', // 8
+  "", // 9
+  "export const deleteMcpSecret = (serverId: string, key: string) =>", // 10
+  "  COLD_START", // 11
+  "    ? Promise.resolve(coldStartDeleteSecret(mcpRef(serverId, key)))", // 12
+  '    : invoke<void>("delete_mcp_secret", { serverId, key });', // 13
+  "", // 14
+  "export const mcpSecretExists = (serverId: string, key: string) =>", // 15
+  "  COLD_START", // 16
+  "    ? Promise.resolve(coldStartGetSecret(mcpRef(serverId, key)) !== null)", // 17
+  '    : invoke<boolean>("mcp_secret_exists", { serverId, key });', // 18
+];
+
+/** SettingsScreen's Save as the formatter lays it out: the pinned import, the
+ *  form options with a spread before onSubmit, and the real try/finally and
+ *  if/else layout with a `${…}` toast template inside the body. */
+const MCP_SCREEN_BASE = [
+  "import {", // 1
+  "  flushMcpSecretDeletes,", // 2
+  "  flushMcpSecretSets,", // 3
+  '} from "./mcp/flush-mcp-secrets";', // 4
+  "export function SettingsScreen() {", // 5
+  "  const form = useAppForm({", // 6
+  "    ...settingsFormOpts,", // 7
+  "    onSubmit: async ({ value }) => {", // 8
+  "      saveLock.current = true;", // 9
+  "      try {", // 10
+  "        const plan = stagedSetFlushPlan({ staged, committed: value.x });", // 11
+  `        ${MCP_SET}`, // 12
+  "        if (failed.length > 0) {", // 13
+  '          toast.error(`saved, ${failed.length} value${failed.length === 1 ? "" : "s"} failed`);', // 14
+  "        } else {", // 15
+  '          toast.success("Settings saved");', // 16
+  "        }", // 17
+  `        ${MCP_DEL}`, // 18
+  "      } finally {", // 19
+  "        saveLock.current = false;", // 20
+  "      }", // 21
+  "    },", // 22
+  "  });", // 23
+  "  function discard() {", // 24
+  "    commitStaged([]);", // 25
+  "  }", // 26
+  "}", // 27
+];
+
+/** A decoy Save after the form: its statements must never satisfy the pins. */
+const MCP_DECOY = [
+  "  const decoy = {", // +1
+  "    onSubmit: async () => {", // +2
+  `      ${MCP_SET}`, // +3
+  `      ${MCP_DEL}`, // +4
+  "    },", // +5
+  "  };", // +6
+];
+
+/** The base with the Save entry's header (line 8) swapped, and the decoy added
+ *  after the form (it lands on lines 24-29, its statements on 26 and 27). */
+const mcpDecoyed = (header) =>
+  mcpAfter(mcpSwap(MCP_SCREEN_BASE, 8, header), 23, ...MCP_DECOY);
+
+const MCP_FLUSH = "src/features/settings/mcp/flush-mcp-secrets.ts";
+
+/** The flush module as the formatter lays it out. */
+const MCP_FLUSH_BASE = [
+  'import { deleteMcpSecret, setMcpSecret } from "@/lib/git/api";', // 1
+  "import {", // 2
+  "  createCallQueue,", // 3
+  "  type McpSecretDelete,", // 4
+  "  type McpSetFailure,", // 5
+  "  type McpStagedSecret,", // 6
+  '} from "./secret-ops";', // 7
+  "", // 8
+  "// The guard pins this module's code and lets only the settings screen", // 9
+  "// import it.", // 10
+  "", // 11
+  "// One queue orders every keychain call this window issues.", // 12
+  "", // 13
+  "const inOrder = createCallQueue();", // 14
+  "", // 15
+  "/** Writes each staged value in turn and returns the failures. */", // 16
+  "", // 17
+  "", // 18
+  "", // 19
+  "export async function flushMcpSecretSets(", // 20
+  "  sets: readonly McpStagedSecret[],", // 21
+  "): Promise<McpSetFailure[]> {", // 22
+  "  const failed: McpSetFailure[] = [];", // 23
+  "  for (const entry of sets) {", // 24
+  "    try {", // 25
+  "      await inOrder(() => setMcpSecret(entry.serverId, entry.key, entry.value));", // 26
+  "    } catch (error) {", // 27
+  "      failed.push({ entry, error });", // 28
+  "    }", // 29
+  "  }", // 30
+  "  return failed;", // 31
+  "}", // 32
+  "", // 33
+  "/** Fires each delete without waiting, in queue order. */", // 34
+  "", // 35
+  "export function flushMcpSecretDeletes(", // 36
+  "  deletes: readonly McpSecretDelete[],", // 37
+  "): void {", // 38
+  "  for (const { serverId, key } of deletes)", // 39
+  "    void inOrder(() => deleteMcpSecret(serverId, key)).catch(() => undefined);", // 40
+  "}", // 41
+];
+
+const MCP_FIXTURES = [
+  // P1: names are read on raw source, so no lexing gap can hide a call.
+  {
+    name: "regex-slash-star-hides-call",
+    file: MCP_DRAFT,
+    lines: [
+      `const p2 = p.replace(/${MCP_BS}/*$/, "");`,
+      "await setMcpSecret(a, b, c);",
+    ],
+    expected: [2],
+  },
+  {
+    name: "template-slash-star-hides-call",
+    file: MCP_DRAFT,
+    lines: [
+      "const doc = `see",
+      "docs/*",
+      "here`;",
+      "await setMcpSecret(a, b, c);",
+    ],
+    expected: [4],
+  },
+  {
+    name: "regex-url-same-line",
+    file: MCP_DRAFT,
+    lines: [
+      `const ok = /https?:${MCP_BS}/${MCP_BS}//.test(u) && setMcpSecret(a, b, c);`,
+    ],
+    expected: [1],
+  },
+  {
+    name: "jsx-text-url-same-line",
+    file: MCP_DRAFT,
+    lines: ["const x = <p>See https://x.dev {String(setMcpSecret)}</p>;"],
+    expected: [1],
+  },
+  {
+    name: "line-continued-string",
+    file: MCP_DRAFT,
+    lines: [
+      `const s = "first${MCP_BS}`,
+      '// still the string"; void setMcpSecret(a, b, c);',
+    ],
+    expected: [2],
+  },
+  {
+    name: "comment-mention-fails-closed",
+    file: MCP_DRAFT,
+    lines: ["const a = 1;", "// setMcpSecret used to run here"],
+    expected: [2],
+  },
+  // P2/P4: every reach that names the module or a write command.
+  {
+    name: "flush-new-export-caller",
+    file: MCP_DRAFT,
+    lines: [
+      'import { flushMcpSecret } from "./flush-mcp-secrets";',
+      "flushMcpSecret(entry);",
+    ],
+    expected: [1],
+  },
+  {
+    name: "flush-namespace-object-values",
+    file: MCP_DRAFT,
+    lines: [
+      'import * as f from "./mcp/flush-mcp-secrets";',
+      "for (const fn of Object.values(f)) void fn([]);",
+    ],
+    expected: [1],
+  },
+  {
+    name: "flush-barrel-export-star",
+    file: "src/features/settings/mcp/index.ts",
+    lines: ['export * from "./flush-mcp-secrets";'],
+    expected: [1],
+  },
+  {
+    name: "flush-dynamic-import",
+    file: MCP_DRAFT,
+    lines: ["const m = await import(", '  "./mcp/flush-mcp-secrets"', ");"],
+    expected: [2],
+  },
+  {
+    name: "flush-require",
+    file: MCP_DRAFT,
+    lines: ['const m = require("./mcp/flush-mcp-secrets.ts");'],
+    expected: [1],
+  },
+  {
+    name: "plural-command-string",
+    file: MCP_DRAFT,
+    lines: ['await invoke("set_mcp_secrets", { serverId });'],
+    expected: [1],
+  },
+  {
+    name: "digit-command-string",
+    file: MCP_DRAFT,
+    lines: ['await invoke("set_mcp_secret_v2", { serverId });'],
+    expected: [1],
+  },
+  {
+    name: "read-only-command-stays-clean",
+    file: MCP_DRAFT,
+    lines: [
+      'const ok = await invoke<boolean>("mcp_secret_exists", { serverId, key });',
+      "const also = await mcpSecretExists(serverId, key);",
+      "const setMcpSecrets = 1;",
+    ],
+    expected: [],
+  },
+  {
+    name: "api-name-call",
+    file: MCP_DRAFT,
+    lines: ["void deleteMcpSecret(server.id, key).catch(() => undefined);"],
+    expected: [1],
+  },
+  // P3: mcp.ts holds exactly its two pinned definitions.
+  { name: "api-real-layout", file: MCP_API, lines: MCP_API_BASE, expected: [] },
+  {
+    name: "api-wrapper",
+    file: MCP_API,
+    lines: [
+      ...MCP_API_BASE,
+      "export const writeSecret = (a: string, b: string, c: string) =>",
+      "  setMcpSecret(a, b, c);",
+    ],
+    expected: [20],
+  },
+  {
+    name: "api-command-constant",
+    file: MCP_API,
+    lines: [...MCP_API_BASE, 'const SET_COMMAND = "set_mcp_secret";'],
+    expected: [19],
+  },
+  {
+    name: "api-second-invoke",
+    file: MCP_API,
+    lines: [
+      ...MCP_API_BASE,
+      "export const storeSecret = (serverId: string) =>",
+      '  invoke<void>("delete_mcp_secret", { serverId });',
+    ],
+    expected: [20],
+  },
+  {
+    name: "api-re-export-alias",
+    file: MCP_API,
+    lines: [...MCP_API_BASE, "export { setMcpSecret as writeMcpSecret };"],
+    expected: [19],
+  },
+  {
+    name: "api-renamed-definition",
+    file: MCP_API,
+    lines: mcpSwap(
+      MCP_API_BASE,
+      5,
+      "export const putMcpSecret = (serverId: string, key: string, value: string) =>",
+    ),
+    expected: [1, 8],
+  },
+  {
+    name: "api-definition-in-comment",
+    file: MCP_API,
+    lines: [
+      ...mcpSwap(
+        MCP_API_BASE,
+        10,
+        "export const removeMcpSecret = (serverId: string, key: string) =>",
+      ),
+      '// export const deleteMcpSecret = (serverId: string, key: string) => COLD_START ? Promise.resolve(coldStartDeleteSecret(mcpRef(serverId, key))) : invoke<void>("delete_mcp_secret", { serverId, key });',
+    ],
+    expected: [1, 13, 19],
+  },
+  // P5: the real Save in another syntax beside a decoy. The decoy's
+  // statements (26, 27) never satisfy the pins; an unreadable Save fails line 1
+  // and leaves its own statements (12, 18) unexempted.
+  {
+    name: "decoy-save-as-method",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed("    async onSubmit({ value }) {"),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-as-function-expression",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed("    onSubmit: async function ({ value }) {"),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-non-async-arrow",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed("    onSubmit: ({ value }) => {"),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-quoted-key",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed('    "onSubmit": async ({ value }) => {'),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-computed-key",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed('    ["onSubmit"]: async ({ value }) => {'),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-return-typed",
+    file: MCP_SCREEN,
+    lines: mcpDecoyed("    onSubmit: async ({ value }): Promise<void> => {"),
+    expected: [26, 27],
+  },
+  {
+    name: "decoy-save-concise-body",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      mcpSwap(
+        mcpSwap(MCP_SCREEN_BASE, 22, "    }),"),
+        8,
+        "    onSubmit: async ({ value }) => runSave(value, async () => {",
+      ),
+      23,
+      ...MCP_DECOY,
+    ),
+    expected: [1, 12, 18, 26, 27],
+  },
+  {
+    name: "decoy-save-shorthand",
+    file: MCP_SCREEN,
+    lines: [
+      ...MCP_SCREEN_BASE.slice(0, 7),
+      "    onSubmit,",
+      "  });",
+      "  async function onSubmit({ value }) {",
+      ...MCP_SCREEN_BASE.slice(8, 21),
+      "  }",
+      ...MCP_DECOY,
+      "}",
+    ],
+    expected: [1, 14, 20, 27, 28],
+  },
+  {
+    name: "decoy-save-in-jsx-form",
+    file: MCP_SCREEN,
+    lines: [
+      ...MCP_SCREEN_BASE.slice(0, 7),
+      "  });",
+      "  return (",
+      "    <form",
+      "      onSubmit={async () => {",
+      `        ${MCP_SET}`,
+      `        ${MCP_DEL}`,
+      "      }}",
+      "    />",
+      "  );",
+      "}",
+    ],
+    expected: [1, 12, 13],
+  },
+  {
+    name: "decoy-in-validators",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      7,
+      "    validators: {",
+      "      onSubmit: async () => {",
+      `        ${MCP_SET}`,
+      `        ${MCP_DEL}`,
+      "      },",
+      "    },",
+    ),
+    expected: [10, 11],
+  },
+  // P5: the form options themselves must be readable.
+  {
+    name: "spread-after-onSubmit",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 22, "    ...extraOpts,"),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "second-useAppForm",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      23,
+      "  const other = useAppForm({ ...settingsFormOpts });",
+    ),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "onSubmit-not-literal-arg",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      mcpSwap(MCP_SCREEN_BASE, 23, "  };", "  const form = useAppForm(opts);"),
+      6,
+      "  const opts = {",
+    ),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "computed-key-in-form",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 7, "    [extraKey]: 1,"),
+    expected: [1, 13, 19],
+  },
+  // P5/P6: real layouts that must stay clean.
+  {
+    name: "real-try-finally-if-else-layout",
+    file: MCP_SCREEN,
+    lines: MCP_SCREEN_BASE,
+    expected: [],
+  },
+  {
+    name: "return-typed-save",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      8,
+      "    onSubmit: async ({ value }): Promise<() => void> => {",
+    ),
+    expected: [],
+  },
+  {
+    name: "params-with-parens",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      8,
+      "    onSubmit: async ({ value, meta = pick(value, (v) => v.x) }) => {",
+    ),
+    expected: [],
+  },
+  {
+    name: "validators-onSubmit-alongside",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      7,
+      "    validators: { onSubmit: ({ value }) => undefined },",
+    ),
+    expected: [],
+  },
+  {
+    name: "jsx-form-onSubmit-alongside",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      26,
+      "  return <form onSubmit={(e) => { e.preventDefault(); }}>x</form>;",
+    ),
+    expected: [],
+  },
+  {
+    name: "interface-onSubmit-alongside",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      4,
+      "interface Props { onSubmit: () => void }",
+    ),
+    expected: [],
+  },
+  {
+    name: "spread-before-onSubmit",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 7, "    ...moreOpts,"),
+    expected: [],
+  },
+  {
+    name: "statement-on-brace-line",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      mcpSwap(MCP_SCREEN_BASE, 12),
+      8,
+      `    onSubmit: async ({ value }) => { ${MCP_SET}`,
+    ),
+    expected: [],
+  },
+  // P6: a pinned statement anywhere but directly in the Save body's blocks.
+  {
+    name: "closure-arrow-expr",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        discardFlush.current = () => ${MCP_DEL}`,
+    ),
+    expected: [19],
+  },
+  {
+    name: "closure-block",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        pending.current = async () => { ${MCP_SET} };`,
+    ),
+    expected: [19],
+  },
+  {
+    name: "settimeout-callback",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        setTimeout(() => { ${MCP_DEL} }, 60000);`,
+    ),
+    expected: [19],
+  },
+  {
+    name: "void-prefixed-call",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 18, `        void ${MCP_DEL}`),
+    expected: [19],
+  },
+  {
+    name: "if-guarded-call",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 18, `        if (retry) ${MCP_DEL}`),
+    expected: [19],
+  },
+  {
+    name: "statement-in-template-string",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        const note = \`${MCP_DEL}\`;`,
+    ),
+    expected: [19],
+  },
+  {
+    // A copy after `;` inside a string reads as a statement on raw source.
+    name: "statement-copy-in-string",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        const note = "done; ${MCP_DEL}";`,
+    ),
+    expected: [19],
+  },
+  {
+    name: "statement-copy-in-string-replaces-real",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      mcpSwap(MCP_SCREEN_BASE, 18),
+      17,
+      `        const note = "done; ${MCP_DEL}";`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "case-block",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      18,
+      `        switch (mode) { case 1: { ${MCP_DEL} } }`,
+    ),
+    expected: [19],
+  },
+  {
+    name: "pinned-statement-twice-in-body",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 18, `        ${MCP_DEL}`),
+    expected: [1, 18, 19],
+  },
+  {
+    name: "delete-moved-into-discard",
+    file: MCP_SCREEN,
+    lines: mcpAfter(mcpSwap(MCP_SCREEN_BASE, 18), 24, `    ${MCP_DEL}`),
+    expected: [1, 25],
+  },
+  {
+    name: "second-call-in-discard",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      25,
+      `    ${MCP_DEL}`,
+      "    void flushMcpSecretSets(stagedRef.current);",
+    ),
+    expected: [26, 27],
+  },
+  {
+    name: "api-call-in-screen",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      25,
+      '    void setMcpSecret("id", "KEY", "test-value-1");',
+    ),
+    expected: [26],
+  },
+  {
+    name: "missing-import",
+    file: MCP_SCREEN,
+    lines: MCP_SCREEN_BASE.slice(4),
+    expected: [1],
+  },
+  {
+    name: "unlexable-screen",
+    file: MCP_SCREEN,
+    lines: [...MCP_SCREEN_BASE, "const x = `open"],
+    expected: [1, 2, 3, 4, 12, 18],
+  },
+  // F1: a binding-free catch is a block, the repo's idiom.
+  {
+    name: "catch-binding-free-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        try { void 0; } catch { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  {
+    name: "catch-with-binding-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        try { void 0; } catch (err) { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  // F2: a brace after `}` is a block only when that `}` closed a block.
+  {
+    name: "function-object-return-type",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        function later(): { ok: true } { ${MCP_DEL} return { ok: true }; } setTimeout(later, 1000);`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "function-expression-object-return-type",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        const later = function (): { ok: true } { ${MCP_DEL} return { ok: true }; }; window.addEventListener("blur", later);`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "function-union-return-type",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        function later(): null | { n: number } { ${MCP_DEL} return null; } setTimeout(later, 1000);`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "function-object-return-type-multiline",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      "        function later(): {",
+      "          ok: true;",
+      "        } {",
+      `          ${MCP_DEL}`,
+      "          return { ok: true };",
+      "        }",
+      "        setTimeout(later, 1000);",
+    ),
+    expected: [1, 21],
+  },
+  {
+    name: "bare-block-after-if-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        if (x) { void 0; } { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  // F3: function closures never count as blocks.
+  {
+    name: "function-declaration-closure",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        function finish() { ${MCP_DEL} } queueMicrotask(finish);`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "function-expression-closure",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        const finish = function () { ${MCP_DEL} };`,
+    ),
+    expected: [1, 18],
+  },
+  {
+    name: "async-function-closure",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        async function finish() { ${MCP_DEL} }`,
+    ),
+    expected: [1, 18],
+  },
+  // F4: useAppForm type arguments the walk can't read fail closed.
+  {
+    name: "unreadable-type-args-on-the-save",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      6,
+      "  const form = useAppForm<{ a: string; b: number }>({",
+    ),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "unreadable-type-args-on-a-second-call",
+    file: MCP_SCREEN,
+    lines: mcpAfter(
+      MCP_SCREEN_BASE,
+      23,
+      "  const other = useAppForm<{ a: string; b: number }>({ ...settingsFormOpts });",
+    ),
+    expected: [1, 12, 18],
+  },
+  // F5: a comment inside a pinned Save statement voids the match.
+  {
+    name: "block-comment-inside-save-statement",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      12,
+      "        const failed = /* flushMcpSecretDeletes(x) */ await flushMcpSecretSets(plan.flush);",
+    ),
+    expected: [1, 12],
+  },
+  {
+    name: "line-comment-inside-save-statement",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      12,
+      "        const failed = // was flushMcpSecretDeletes(x)",
+      "          await flushMcpSecretSets(plan.flush);",
+    ),
+    expected: [1, 12, 13],
+  },
+  // F6: the flush module's code is pinned; nothing else there may name a token.
+  {
+    name: "flush-module-real-layout",
+    file: MCP_FLUSH,
+    lines: MCP_FLUSH_BASE,
+    expected: [],
+  },
+  {
+    name: "flush-module-scope-listener",
+    file: MCP_FLUSH,
+    lines: [
+      ...MCP_FLUSH_BASE,
+      'window.addEventListener("blur", () => void flushMcpSecretSets(x));',
+    ],
+    expected: [42],
+  },
+  {
+    name: "flush-module-deferred-retry",
+    file: MCP_FLUSH,
+    lines: mcpAfter(
+      MCP_FLUSH_BASE,
+      26,
+      "      setTimeout(() => void setMcpSecret(a, b, c), 5000);",
+    ),
+    expected: [1, 20, 26, 27],
+  },
+  {
+    // The queue binding is pinned: a wrapped or passthrough queue would let a
+    // delete land after a later set of the same pair.
+    name: "flush-module-queue-retry",
+    file: MCP_FLUSH,
+    lines: mcpSwap(
+      MCP_FLUSH_BASE,
+      14,
+      "const inOrder = withRetry(createCallQueue());",
+    ),
+    expected: [1],
+  },
+  {
+    name: "flush-module-queue-passthrough",
+    file: MCP_FLUSH,
+    lines: mcpSwap(
+      MCP_FLUSH_BASE,
+      14,
+      "const inOrder = <T,>(call: () => Promise<T>) => call();",
+    ),
+    expected: [1],
+  },
+  {
+    name: "flush-module-queue-per-call",
+    file: MCP_FLUSH,
+    lines: mcpSwap(
+      MCP_FLUSH_BASE,
+      14,
+      "const inOrder = <T,>(call: () => Promise<T>) => createCallQueue()(call);",
+    ),
+    expected: [1],
+  },
+  {
+    name: "flush-module-comment-inside-pin",
+    file: MCP_FLUSH,
+    lines: mcpAfter(MCP_FLUSH_BASE, 30, "  // retried by the caller"),
+    expected: [1, 20, 26],
+  },
+  // F8: documented rules, each on the real-file layout.
+  {
+    name: "duplicate-onSubmit-identifier",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 22, "    onSubmit: async () => {},"),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "duplicate-onSubmit-quoted",
+    file: MCP_SCREEN,
+    lines: mcpAfter(MCP_SCREEN_BASE, 22, '    "onSubmit": async () => {},'),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "while-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        while (again) { ${MCP_DEL} break; }`,
+    ),
+    expected: [],
+  },
+  {
+    name: "do-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        do { ${MCP_DEL} } while (false);`,
+    ),
+    expected: [],
+  },
+  {
+    name: "for-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        for (const d of [deletes]) { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  {
+    name: "for-await-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        for await (const d of stream) { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  {
+    name: "bare-block-after-semicolon",
+    file: MCP_SCREEN,
+    lines: mcpSwap(MCP_SCREEN_BASE, 18, `        void 0; { ${MCP_DEL} }`),
+    expected: [],
+  },
+  {
+    name: "else-if-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        if (a) { void 0; } else if (b) { ${MCP_DEL} }`,
+    ),
+    expected: [],
+  },
+  {
+    name: "save-entry-tail-as-cast",
+    file: MCP_SCREEN,
+    lines: mcpSwap(MCP_SCREEN_BASE, 22, "    } as SubmitFn,"),
+    expected: [1, 12, 18],
+  },
+  {
+    name: "class-static-block",
+    file: MCP_SCREEN,
+    lines: mcpSwap(
+      MCP_SCREEN_BASE,
+      18,
+      `        class Later { static { ${MCP_DEL} } }`,
+    ),
+    expected: [1, 18],
+  },
+];
+
+for (const { name, file, lines, expected } of MCP_FIXTURES)
+  test(`mcp-secret-keychain-sites: ${name}`, () => {
+    assert.deepEqual(mcpScan(file, lines), expected);
+  });
+
+test("mcp-secret-keychain-sites pins, allowlist and scope", () => {
+  assert.deepEqual(MCP_FLUSH_CALLER, {
+    file: "src/features/settings/SettingsScreen.tsx",
+    imports: [
+      'import { flushMcpSecretDeletes, flushMcpSecretSets, } from "./mcp/flush-mcp-secrets";',
+    ],
+    onSubmit: [MCP_SET, MCP_DEL],
+  });
+  assert.equal(MCP_SECRET_API.file, "src/lib/git/api/mcp.ts");
+  assert.equal(MCP_SECRET_API.definitions.length, 2);
+  assert.deepEqual([...MCP_SECRET_READ_ONLY], ["mcp_secret_exists"]);
+  assert.equal(MCP_FLUSH_MODULE.file, MCP_FLUSH);
+  assert.equal(MCP_FLUSH_MODULE.statements.length, 4);
+  assert.equal(
+    MCP_FLUSH_MODULE.statements[1],
+    "const inOrder = createCallQueue();",
+  );
+  assert.deepEqual(MCP_CHECK.allowlist, []);
+  assert.deepEqual(MCP_CHECK.expectScanned, {
+    atLeast: 500,
+    hint: "every .ts/.tsx under src/",
+  });
+  for (const file of [
+    MCP_SCREEN,
+    MCP_DRAFT,
+    MCP_API,
+    "src/lib/git/api/secrets.ts",
+    "src/features/agent/x.tsx",
+  ])
+    assert.equal(MCP_CHECK.appliesTo(file), true, file);
+});
+
+test("mcp-secret-keychain-sites passes the real files with no allowlist row", () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const files = [
+    MCP_SCREEN,
+    MCP_API,
+    "src/features/settings/mcp/flush-mcp-secrets.ts",
+  ];
+  const views = new Map(
+    files.map((f) => [f, view(readFileSync(join(root, f), "utf8"))]),
+  );
+  const { violations, stale } = runCheck(MCP_CHECK, files, views);
+  assert.deepEqual(violations, []);
+  assert.deepEqual(stale, []);
+  // Every pinned file scans clean on its own, the flush module included.
+  for (const f of files)
+    assert.deepEqual(MCP_CHECK.scan(views.get(f), f), [], f);
+});
+
+test("mcp-secret-keychain-sites: the flush module's extra code violates under runCheck", () => {
+  const lines = [
+    ...MCP_FLUSH_BASE,
+    'window.addEventListener("blur", () => void flushMcpSecretSets(x));',
+  ];
+  const { violations, stale } = runCheck(
+    MCP_CHECK,
+    [MCP_FLUSH],
+    new Map([[MCP_FLUSH, view(lines.join("\n"))]]),
+  );
+  assert.deepEqual(violations, [`${MCP_FLUSH}:42`]);
+  assert.deepEqual(stale, []);
+});
+
+// --------------------------------------------- focusable-held-button-render
+
+const focusableHeldRender = scanner("focusable-held-button-render");
+
+test("focusable-held-button-render flags a bare focusable button", () => {
+  const bare = [
+    "<Button",
+    "  disabled={busy}",
+    "  focusableWhenDisabled",
+    "  onClick={go}",
+    ">",
+    "  Load more",
+    "</Button>",
+  ].join("\n");
+  assert.deepEqual(focusableHeldRender(bare), [1]);
+  // The prop's value form is the same attribute.
+  assert.deepEqual(
+    focusableHeldRender("<Button disabled={a} focusableWhenDisabled={!b} />"),
+    [1],
+  );
+});
+
+test("focusable-held-button-render passes the helper's render", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      [
+        "<Button",
+        "  disabled={busy}",
+        "  focusableWhenDisabled",
+        "  render={heldButtonRender(busy)}",
+        ">",
+        "  Load more",
+        "</Button>",
+      ].join("\n"),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled={f} render={ heldButtonRender(h, props.render) } />",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render reads form.SubmitButton as passing through", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      "<form.SubmitButton focusableWhenDisabled={!!blockedReason}>Save</form.SubmitButton>",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render ignores the prop in comments and strings", () => {
+  assert.deepEqual(
+    focusableHeldRender(
+      [
+        "// a <Button focusableWhenDisabled> keeps focus",
+        "/* <Button focusableWhenDisabled /> */",
+        'const doc = "<Button focusableWhenDisabled />";',
+        "<div>{/* <Button focusableWhenDisabled /> */}</div>",
+      ].join("\n"),
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render reports a wrapped tag at its opening line", () => {
+  const source = [
+    "const x = 1;",
+    "return (",
+    "  <Button",
+    '    variant="ghost"',
+    '    className={cn("a", ARIA_DISABLED_CLASS)}',
+    "    disabled={fetching}",
+    "    focusableWhenDisabled",
+    "  >",
+    "    More",
+    "  </Button>",
+    ");",
+  ].join("\n");
+  assert.deepEqual(focusableHeldRender(source), [3]);
+});
+
+test("focusable-held-button-render wants the helper as the render itself", () => {
+  // Any other render, or the helper on another attribute, still fails.
+  assert.deepEqual(
+    focusableHeldRender(
+      '<Button focusableWhenDisabled render={<button type="button" />} />',
+    ),
+    [1],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled data-x={heldButtonRender(a)} />",
+    ),
+    [1],
+  );
+  // A nested tag is judged on its own: the outer one carries no prop.
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Trigger render={<Button disabled focusableWhenDisabled />} />",
+    ),
+    [1],
+  );
+  // A name that merely starts with the prop's is not the prop.
+  assert.deepEqual(
+    focusableHeldRender("<Button focusableWhenDisabledHint={x} />"),
+    [],
+  );
+});
+
+test("focusable-held-button-render leaves the props-object form unreached", () => {
+  // Named in the check's comment: a spread or props object is out of a JSX
+  // rule's reach (ProjectLifecycleDialogs hands its props to form.SubmitButton).
+  assert.deepEqual(
+    focusableHeldRender("<Button {...{ focusableWhenDisabled: true }} />"),
+    [],
+  );
+  // Also named there: whether `held` is right, and a spread after the helper.
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button disabled={b} focusableWhenDisabled render={heldButtonRender(false)} />",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Button focusableWhenDisabled render={heldButtonRender(b)} {...rest} />",
+    ),
+    [],
+  );
+});
+
+test("focusable-held-button-render holds SubmitButton to the helper", () => {
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  const file = "src/components/form/submit-button.tsx";
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const real = readFileSync(join(root, file), "utf8");
+  assert.deepEqual(check.scan(view(real), file), []);
+  // NEGATIVE CONTROL: SubmitButton dropping the helper fails its line 1, so
+  // the form.SubmitButton pass can't outlive the pass-through it relies on.
+  const dropped = real.replace(
+    /render=\{heldButtonRender\([\s\S]*?\)\}/,
+    () => "render={props.render}",
+  );
+  assert.notEqual(dropped, real);
+  assert.deepEqual(check.scan(view(dropped), file), [1]);
+  // A call whose first argument never mentions the focusable hold is no
+  // pass-through either.
+  const unheld = real.replace(
+    /heldButtonRender\(\s*Boolean\(held && props\.focusableWhenDisabled\)/,
+    () => "heldButtonRender(false",
+  );
+  assert.notEqual(unheld, real);
+  assert.deepEqual(check.scan(view(unheld), file), [1]);
+  // Nor does the call on another element while the Button renders its own.
+  const moved = dropped.replace(
+    '<Spinner data-icon="inline-start" />',
+    () =>
+      '<Spinner data-icon="inline-start" render={heldButtonRender(Boolean(held && props.focusableWhenDisabled), props.render)} />',
+  );
+  assert.notEqual(moved, dropped);
+  assert.deepEqual(check.scan(view(moved), file), [1]);
+  // A documented limit: the first argument need only mention the prop, so a
+  // short-circuited hold still passes.
+  const shorted = real.replace(
+    /heldButtonRender\(\s*Boolean\(held && props\.focusableWhenDisabled\)/,
+    () => "heldButtonRender(false && props.focusableWhenDisabled",
+  );
+  assert.notEqual(shorted, real);
+  assert.deepEqual(check.scan(view(shorted), file), []);
+});
+
+test("focusable-held-button-render reads a generic tag past its type arguments", () => {
+  assert.deepEqual(
+    focusableHeldRender("<Held<string> disabled focusableWhenDisabled />"),
+    [1],
+  );
+  assert.deepEqual(
+    focusableHeldRender(
+      "<Held<string> focusableWhenDisabled render={heldButtonRender(h)} />",
+    ),
+    [],
+  );
+  // An arrow's `>` inside the type arguments doesn't close them.
+  assert.deepEqual(
+    focusableHeldRender("<Held<(a: A) => B> focusableWhenDisabled />"),
+    [1],
+  );
+  // A run that never closes fails closed when the prop follows it: ts-mask
+  // refuses it in a .tsx file, and the scan's own walk flags it elsewhere.
+  const unclosed = "<Held<Map<K> disabled focusableWhenDisabled";
+  assert.throws(() => focusableHeldRender(unclosed), /cannot lex/);
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  assert.deepEqual(check.scan(view(unclosed), "src/lib/x.ts"), [1]);
+});
+
+test("ts-mask closes a JSX element only at its own closing tag", async () => {
+  const { maskNonCode } = await import("./lib/ts-mask.mjs");
+  // A generic function type lexes as an element named `T`; an unrelated
+  // close tag in a later comment must not end it.
+  for (const src of [
+    'type F = <T>(a: T) => T;\nload(x, {});\n// see the </table> markup\nload("y");',
+    'type Fs = [<T>(a: T) => T];\nload(x, {});\n// see the </table> markup\nload("y");',
+    'const f: <T>(a: T) => T = id;\nload(x, {});\n// see the </table> markup\nload("y");',
+    "const a = <div>x</span>;",
+    "const a = <>x</div>;",
+    "const a = <div>x</>;",
+    "const a = <a.b>x</a>;",
+  ])
+    assert.throws(() => maskNonCode(src, true), /mismatched JSX closing tag/);
+  for (const [src, masked] of [
+    [
+      "const a = <div><span>x</span>y</div>;",
+      "const a = <div><span> </span> </div>;",
+    ],
+    ["const a = <>x{b}</>;", "const a = <> {b}</>;"],
+    ["const a = <a.b>x</a.b>;", "const a = <a.b> </a.b>;"],
+    ["const a = <svg:rect>x</svg:rect>;", "const a = <svg:rect> </svg:rect>;"],
+    ["const a = <br />;", "const a = <br />;"],
+    ["const a = <p>x<br/>y</ p >;", "const a = <p> <br/> </ p >;"],
+  ])
+    assert.equal(maskNonCode(src, true), masked);
+});
+
+test("focusable-held-button-render is clean on the real tree, red without one site's render", () => {
+  const check = CHECKS.find((c) => c.name === "focusable-held-button-render");
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const files = readdirSync(join(root, "src"), { recursive: true })
+    .map((entry) => `src/${String(entry).split("\\").join("/")}`)
+    .filter((file) => /\.tsx?$/.test(file));
+  const views = new Map(
+    files.map((f) => [f, view(readFileSync(join(root, f), "utf8"))]),
+  );
+  const clean = runCheck(check, files, views);
+  assert.deepEqual(clean.violations, []);
+  assert.deepEqual(clean.stale, []);
+  // NEGATIVE CONTROL: one site's render removed in memory turns the tree red.
+  const site = "src/features/actions/ActionsPanel.tsx";
+  const source = readFileSync(join(root, site), "utf8");
+  const line = "render={heldButtonRender(runs.isFetchingNextPage)}";
+  assert.ok(source.includes(line));
+  const mutated = new Map(views).set(
+    site,
+    view(source.replace(line, () => "")),
+  );
+  const red = runCheck(check, files, mutated);
+  assert.equal(red.violations.length, 1);
+  assert.match(
+    red.violations[0],
+    /^src\/features\/actions\/ActionsPanel\.tsx:\d+$/,
+  );
 });

@@ -25,7 +25,7 @@ import {
 import { queryClient } from "@/lib/query-client";
 import { toastComposedError, toastError } from "@/lib/toast";
 import { useStashReapplyMarker } from "./stash-reapply-marker";
-import { useUiStore } from "./ui";
+import { claimWarmRepoShell, useUiStore } from "./ui";
 
 /** A worktree removal the app is still waiting on. */
 export interface WorktreeRemoval {
@@ -313,10 +313,9 @@ function clearRemoval(repoPath: string, path: string) {
 }
 
 /** Refreshes what a completed removal changed: the manager's list, plus branches
- *  (a removed worktree frees its branch for checkout elsewhere) — the same set
- *  the worktree mutations invalidate. Separate from {@link settleRemoval}
- *  because the promote path refreshes at its removal step while its entry stays
- *  on screen for the rest of the composite. */
+ *  (a removed worktree frees its branch for checkout elsewhere). Separate from
+ *  {@link settleRemoval} because the promote path refreshes at its removal step
+ *  while its entry stays on screen for the rest of the composite. */
 function invalidateAfterRemoval(repoPath: string) {
   void queryClient.invalidateQueries({ queryKey: worktreeKey(repoPath) });
   void queryClient.invalidateQueries({ queryKey: repoKeys.branches(repoPath) });
@@ -510,7 +509,11 @@ async function runPromote(
     // There's no fs-watcher (status is polled), so switching away stops future
     // polls; `removeWorktreeFreeingBranch` retries once for any last in-flight
     // poll that hasn't drained (openRepo's switch can apply after it returns).
-    useUiStore.getState().openRepo(info);
+    // Land the main workspace fully drawn: hold the switch on its shell warm-up
+    // (within the 250 ms budget), the same hold every other repo switch takes.
+    // Its supersession verdict is ignored: the app must leave this folder.
+    await claimWarmRepoShell(info.root)?.settled;
+    useUiStore.getState().openRepo(info, { bypassLeaveGuard: true });
     await new Promise((resolve) => setTimeout(resolve, 80));
     // Main is the active repo now, so the removal is visible where the user is.
     // A promote is checking this branch out, not putting it away, so it never

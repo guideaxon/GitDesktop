@@ -59,7 +59,7 @@ pub(crate) fn validate_branch_name(name: &str) -> AppResult<()> {
 /// detached. Read with `symbolic-ref`, never `rev-parse --abbrev-ref`: the short form
 /// disambiguates, so a branch shadowed by a same-named tag reads `heads/<name>` (or the
 /// full ref, when that is ambiguous too). An UNBORN branch still answers here — sites
-/// that must refuse before the first commit check [`head_is_unborn`] themselves. Any
+/// that must refuse before the first commit check `git::history::unborn_head`. Any
 /// other failure (not a repository, git missing) is an `Err`.
 pub(crate) async fn current_branch_ref(repo_path: &str) -> AppResult<Option<String>> {
     let out = run_git_raw(
@@ -219,6 +219,124 @@ pub async fn git_branches(repo_path: String) -> AppResult<Vec<Branch>> {
         });
     }
     Ok(branches)
+}
+
+/// The for-each-ref atoms [`push_destination_fields`] reads, appended NUL-separated
+/// after a read's own fields: the push remote, its explicit destination ref (filled only
+/// under a `remote.<r>.push` refspec), the destination's remote-tracking ref, and the
+/// upstream's tracking ref it is compared with.
+const PUSH_DESTINATION_ATOMS: &str =
+    "%(push:remotename)%00%(push:remoteref)%00%(push)%00%(upstream)";
+
+/// Runs `for-each-ref <pattern>` with `base_format` extended by
+/// [`PUSH_DESTINATION_ATOMS`]. A git that rejects one of them fails the whole command,
+/// so that failure re-runs `base_format` once and the lines carry no atoms: the
+/// destination reads as unknown, never a broken read (the status read may still derive
+/// one from the push config).
+pub(crate) async fn read_refs_with_push_destination(
+    repo_path: &str,
+    pattern: &str,
+    base_format: &str,
+) -> AppResult<String> {
+    let extended = format!("{base_format}%00{PUSH_DESTINATION_ATOMS}");
+    read_refs_with_fallback(repo_path, pattern, &extended, base_format).await
+}
+
+async fn read_refs_with_fallback(
+    repo_path: &str,
+    pattern: &str,
+    extended: &str,
+    base_format: &str,
+) -> AppResult<String> {
+    let out = run_git_raw(
+        Some(repo_path),
+        &["for-each-ref", pattern, extended],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    if out.code == 0 {
+        return Ok(out.stdout_lossy());
+    }
+    // Any other failure surfaces exactly as `run_git` would have reported it.
+    if !is_unknown_format_atom(&out.stderr) {
+        out.exit_verdict()?;
+    }
+    let out = run_git(
+        Some(repo_path),
+        &["for-each-ref", pattern, base_format],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    Ok(out.stdout_lossy())
+}
+
+/// Whether for-each-ref refused a format atom: git's ref-filter says `unknown field
+/// name: <atom>` for an atom it lacks and `unrecognized %(push) argument: <arg>` for a
+/// known atom's unknown argument. The runner pins `LC_ALL=C`, so neither localizes.
+fn is_unknown_format_atom(stderr: &str) -> bool {
+    stderr.contains("unknown field name") || stderr.contains("unrecognized %(push) argument")
+}
+
+/// `(push_remote, push_branch)` from a line's [`PUSH_DESTINATION_ATOMS`] fields (empty
+/// when the read fell back without them), via [`push_destination`].
+pub(crate) fn push_destination_fields(
+    local: &str,
+    atoms: &[&str],
+    upstream_remote: &str,
+    upstream_remoteref: &str,
+) -> (Option<String>, Option<String>) {
+    let [push_remote, push_remoteref, push_track, upstream_track] = match atoms {
+        [a, b, c, d, ..] => [*a, *b, *c, *d],
+        _ => return (None, None),
+    };
+    push_destination(
+        local,
+        push_remote,
+        push_remoteref,
+        push_track,
+        upstream_track,
+        upstream_remote,
+        upstream_remoteref,
+    )
+}
+
+/// Where a BARE push of `local` lands, as `(remote, branch on it)`: both Some or both
+/// None. A push remote with its own push refspecs is unresolved: git's bare push sends
+/// every configured refspec, which no single destination describes, and
+/// `%(push:remoteref)` fills only then (one that doesn't map the branch leaves `%(push)`
+/// empty). Otherwise `%(push)` is the destination's LOCAL remote-tracking ref, which
+/// depends on the fetch refspec's mapping, so it is only read back when it is the
+/// upstream's own tracking ref on the same remote (the upstream's branch) or the
+/// standard `refs/remotes/<remote>/<local>` (the same name). Any other shape (a
+/// remapped fetch refspec, `team/…`) is unresolved: a wrong branch name is never an
+/// answer. A mirror push remote (`remote.<r>.mirror`) resolves here like any other; the
+/// atoms can't tell it apart, so the status read clears it from the push config, except
+/// for the branch's own same-named live upstream, where it reads no config.
+fn push_destination(
+    local: &str,
+    push_remote: &str,
+    push_remoteref: &str,
+    push_track: &str,
+    upstream_track: &str,
+    upstream_remote: &str,
+    upstream_remoteref: &str,
+) -> (Option<String>, Option<String>) {
+    if !crate::git::remote::is_named_remote(push_remote) || !push_remoteref.is_empty() {
+        return (None, None);
+    }
+    let branch = if push_track.is_empty() {
+        None
+    } else if push_track == upstream_track && upstream_remote == push_remote {
+        upstream_remoteref.strip_prefix("refs/heads/")
+    } else if push_track == format!("refs/remotes/{push_remote}/{local}") {
+        Some(local)
+    } else {
+        None
+    };
+    match branch.filter(|b| !b.is_empty()) {
+        Some(b) => (Some(push_remote.to_string()), Some(b.to_string())),
+        None => (None, None),
+    }
 }
 
 /// Parses git's `%(upstream:track)` field into `(ahead, behind, gone)`.
@@ -387,12 +505,9 @@ fn archive_config_busy(name: &str, archived: bool) -> AppError {
     ))
 }
 
-/// The reserved prefix for GitDesktop agent-session branches. Every branch surface
-/// (GUI lists, pickers, worktree guards) filters `gd/session/*`; deleting or renaming
-/// one breaks session Resume, so the branch-mutating MCP tools refuse it
-/// (`mcp_server::write_git::ensure_not_session_branch`), `list_branches` filters it
-/// out, and the rename core refuses renames into or out of it. Mirrors the
-/// `starts_with("gd/session/")` checks in `crate::git::worktree` / `crate::sessions`.
+/// Agent-session prefix; [`refuse_session_branch_name`] guards case-insensitively, and
+/// `mcp_server::write_git::ensure_not_session_branch` delegates to it, so the MCP tools
+/// refuse with the same text.
 pub(crate) const SESSION_BRANCH_PREFIX: &str = "gd/session/";
 
 /// What a completed rename reports beyond success.
@@ -405,22 +520,30 @@ pub struct RenameBranchOutcome {
     pub warning: Option<String>,
 }
 
+pub(crate) fn is_session_branch_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(SESSION_BRANCH_PREFIX)
+}
+
+/// Refuse names whose branches or worktrees would vanish from every filtered surface.
+pub(crate) fn refuse_session_branch_name(name: &str) -> AppResult<()> {
+    if is_session_branch_name(name) {
+        return Err(AppError::InvalidArgument(format!(
+            "\"{name}\" is in gd/session/, which is reserved for agent sessions — choose another name."
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a rename into or out of the agent-session namespace, compared
 /// case-insensitively: a case-insensitive filesystem can land `GD/Session/x` inside
 /// an existing `gd/session/` ref folder.
 fn refuse_session_rename(old_name: &str, new_name: &str) -> AppResult<()> {
-    let in_session = |name: &str| name.to_ascii_lowercase().starts_with(SESSION_BRANCH_PREFIX);
-    if in_session(old_name) {
+    if is_session_branch_name(old_name) {
         return Err(AppError::InvalidArgument(format!(
             "\"{old_name}\" is an agent-session branch — renaming it would break its session's Resume."
         )));
     }
-    if in_session(new_name) {
-        return Err(AppError::InvalidArgument(format!(
-            "\"{new_name}\" is in gd/session/, which is reserved for agent sessions — choose another name."
-        )));
-    }
-    Ok(())
+    refuse_session_branch_name(new_name)
 }
 
 #[tauri::command]
@@ -1061,11 +1184,12 @@ pub(crate) async fn git_delete_remote_branch_core(
     }
 
     let cred = crate::forge::credential_config_for_remote(&repo_path, &remote).await?;
+    let branch_ref = format!("refs/heads/{name}");
     let out = crate::git::remote::run_git_mutating_with_creds(
         state,
         &repo_path,
         &cred,
-        &["push", &remote, "--delete", "--", &name],
+        &["push", &remote, "--delete", "--", &branch_ref],
         NETWORK_TIMEOUT,
     )
     .await;
@@ -1151,8 +1275,20 @@ pub(crate) async fn git_checkout_branch_core(
     name: String,
 ) -> AppResult<()> {
     validate_ref_name(&name)?;
+    let session_name = is_session_branch_name(&name);
+    // Refuse only guess-creation so existing session-named branches stay reachable.
+    if session_name && !branch_exists_exact(&repo_path, &name).await? {
+        refuse_session_branch_name(&name)?;
+    }
     crate::git::update_marker::refuse_if_branch_updating(state, &repo_path, &name).await?;
-    run_git_mutating(state, &repo_path, &["switch", &name], DEFAULT_TIMEOUT).await?;
+    let mut args = vec!["switch"];
+    if session_name {
+        // The existence check runs outside the lock; a concurrent delete must
+        // not re-open guess-creation at the switch.
+        args.push("--no-guess");
+    }
+    args.push(&name);
+    run_git_mutating(state, &repo_path, &args, DEFAULT_TIMEOUT).await?;
     Ok(())
 }
 
@@ -1180,6 +1316,7 @@ pub(crate) async fn git_checkout_remote_branch_core(
 ) -> AppResult<()> {
     validate_ref_name(&remote)?;
     validate_ref_name(&name)?;
+    refuse_session_branch_name(&name)?;
     // A live update means a LOCAL `name` already exists and is held, so this switch
     // collides on it rather than creating anything.
     crate::git::update_marker::refuse_if_branch_updating(state, &repo_path, &name).await?;
@@ -1260,6 +1397,7 @@ pub(crate) async fn git_create_branch_core(
     no_track: bool,
 ) -> AppResult<()> {
     validate_ref_name(&name)?;
+    refuse_session_branch_name(&name)?;
     if let Some(start) = &start_point {
         // start_point may be a branch name or a commit hash — validate as a ref
         // (non-empty, no leading '-') rather than strictly a hash.
@@ -1362,17 +1500,100 @@ pub async fn git_branch_merge_states(
     Ok(result)
 }
 
-/// Ahead/behind counts for every local branch measured against `base` (the
-/// default branch), driving the at-a-glance counts in the branch menu.
-/// Read-only; the base itself reports 0/0.
+// %(ahead-behind:<base>) prints ahead first; the rev-list loop below prints behind
+// first, so the atom's counts must keep their own order.
+fn parse_ahead_behind(base: &str, stdout: &str) -> Option<Vec<BranchDivergence>> {
+    let mut rows = Vec::new();
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        let mut tokens = line.rsplitn(3, ' ');
+        let behind = tokens.next()?.parse::<u32>().ok()?;
+        let ahead = tokens.next()?.parse::<u32>().ok()?;
+        let name = tokens.next()?.strip_prefix("refs/heads/")?;
+        if name.is_empty() || name.contains(' ') {
+            return None;
+        }
+        rows.push(BranchDivergence {
+            name: name.to_string(),
+            ahead: if name == base { 0 } else { ahead },
+            behind: if name == base { 0 } else { behind },
+        });
+    }
+    Some(rows)
+}
+
+fn parse_git_version(stdout: &str) -> Option<(u32, u32)> {
+    let mut parts = stdout.trim().strip_prefix("git version ")?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+async fn ahead_behind_supported() -> bool {
+    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    match SUPPORTED
+        .get_or_try_init(|| async {
+            let out = run_git_raw(None, &["version"], DEFAULT_TIMEOUT).await?;
+            Ok::<bool, AppError>(
+                out.code == 0
+                    && parse_git_version(&out.stdout_lossy()).is_some_and(|v| v >= (2, 41)),
+            )
+        })
+        .await
+    {
+        Ok(supported) => *supported,
+        Err(_) => false,
+    }
+}
+
+async fn divergence_single_spawn(
+    repo_path: &str,
+    base: &str,
+    base_rev: &str,
+) -> AppResult<Option<Vec<BranchDivergence>>> {
+    // These characters can change the for-each-ref format string's meaning, so
+    // such a base must skip the fast path.
+    if base_rev.contains([')', '%']) {
+        return Ok(None);
+    }
+    let out = run_git_raw(
+        Some(repo_path),
+        &[
+            "for-each-ref",
+            "refs/heads",
+            &format!("--format=%(refname) %(ahead-behind:{base_rev})"),
+        ],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    if out.code != 0 {
+        return Ok(None);
+    }
+    Ok(parse_ahead_behind(base, &out.stdout_lossy()))
+}
+
+/// Compare branches to one base rev (default branch or compare base); the base itself reports 0/0.
+/// Git >= 2.41 uses one for-each-ref. Refused bases, unreadable output, or any non-zero exit
+/// (unsupported atom, unresolvable base) use per-branch rev-list; spawn errors/timeouts propagate.
 #[tauri::command]
 pub async fn git_branch_divergence(
     repo_path: String,
     base: String,
 ) -> AppResult<Vec<BranchDivergence>> {
     validate_ref_name(&base)?;
+    let base_rev = branch_first_rev(&repo_path, &base).await;
+    if ahead_behind_supported().await {
+        if let Some(rows) = divergence_single_spawn(&repo_path, &base, &base_rev).await? {
+            return Ok(rows);
+        }
+    }
+    divergence_per_branch(&repo_path, &base, &base_rev).await
+}
+
+async fn divergence_per_branch(
+    repo_path: &str,
+    base: &str,
+    base_rev: &str,
+) -> AppResult<Vec<BranchDivergence>> {
     let out = run_git(
-        Some(&repo_path),
+        Some(repo_path),
         &["for-each-ref", "refs/heads", "--format=%(refname)"],
         DEFAULT_TIMEOUT,
     )
@@ -1391,7 +1612,6 @@ pub async fn git_branch_divergence(
         })
         .collect();
 
-    let base_rev = branch_first_rev(&repo_path, &base).await;
     let mut result = Vec::with_capacity(refs.len());
     for (full, name) in refs {
         if name == base {
@@ -1406,7 +1626,7 @@ pub async fn git_branch_divergence(
         // name only (ahead). A bad/unrelated ref just yields 0/0.
         let range = format!("{base_rev}...{full}");
         let counts = run_git_raw(
-            Some(&repo_path),
+            Some(repo_path),
             &["rev-list", "--left-right", "--count", &range],
             DEFAULT_TIMEOUT,
         )
@@ -2515,6 +2735,20 @@ struct UpdatePins {
     base_sha: String,
 }
 
+/// Enumerate stored names so case-insensitive loose-ref lookups cannot alias a branch.
+pub(crate) async fn branch_exists_exact(repo_path: &str, name: &str) -> AppResult<bool> {
+    let refs = run_git(
+        Some(repo_path),
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    Ok(refs
+        .stdout_lossy()
+        .lines()
+        .any(|line| line.strip_prefix("refs/heads/") == Some(name)))
+}
+
 /// The sha `refs/heads/<branch>` points at, or `None` when there is no such branch.
 /// The FULL ref path is the point: under a bare `rev-parse <branch>` a tag sharing
 /// the name would shadow it, and the pin would then guard the wrong object.
@@ -2742,9 +2976,11 @@ async fn verify_pin_and_merge(
 /// Whether a commit is reachable from any remote-tracking ref (`refs/remotes/*`) —
 /// i.e. it has been pushed. Gates the History-tab commit-comment surface, which can
 /// only anchor a comment on a commit the forge already knows about. The sha is
-/// validated (hex) BEFORE spawning git; a VALID sha the repo doesn't recognise
-/// (unfetched / unpushed) makes git error, which we map to `Ok(false)` — "not on a
-/// remote" is a normal answer here, not an app failure.
+/// validated (hex) BEFORE spawning git. `Ok(false)` comes only from a read that
+/// succeeded and matched no ref; any failed run is an Err, since the UI would read
+/// a defaulted false as "not pushed". git exits nonzero for a well-formed sha the
+/// repo lacks (pinned by `commit_on_remote_errs_for_an_unknown_oid`), so an empty
+/// answer from exit 0 is a real "not on a remote".
 #[tauri::command]
 pub async fn commit_on_remote(repo_path: String, sha: String) -> AppResult<bool> {
     crate::git::history::validate_hash(&sha)?;
@@ -2761,7 +2997,10 @@ pub async fn commit_on_remote(repo_path: String, sha: String) -> AppResult<bool>
     )
     .await?;
     if out.code != 0 {
-        return Ok(false);
+        return Err(AppError::Command(format!(
+            "couldn't check whether {sha} is on a remote.\n{}",
+            out.full_failure_text()
+        )));
     }
     Ok(!out.stdout_lossy().trim().is_empty())
 }
@@ -2770,20 +3009,30 @@ pub async fn commit_on_remote(repo_path: String, sha: String) -> AppResult<bool>
 /// i.e. unpublished anywhere. The History tab uses this to mark "not pushed" rows on
 /// a branch with NO upstream, where "ahead of upstream" is undefined: the fork point
 /// and everything below it live on `origin/<base>` and ARE published. A repo with no
-/// remotes yields the full `HEAD` count (correct); a benign git error (unborn `HEAD`)
-/// maps to `0`.
+/// remotes yields the full `HEAD` count. Only an unborn `HEAD` maps to `0`; any other
+/// failed run is an Err, never a defaulted count. The healthy path is one spawn: the
+/// unborn probe runs only after rev-list fails.
 #[tauri::command]
 pub async fn git_unpushed_count(repo_path: String) -> AppResult<u32> {
-    let out = run_git_raw(
-        Some(&repo_path),
+    let failed =
+        |text: String| AppError::Command(format!("couldn't count the unpushed commits.\n{text}"));
+    // Only an unborn HEAD answers 0.
+    let out = match crate::git::history::read_unless_unborn(
+        &repo_path,
         &["rev-list", "--count", "HEAD", "--not", "--remotes"],
         DEFAULT_TIMEOUT,
     )
-    .await?;
-    if out.code != 0 {
-        return Ok(0);
-    }
-    Ok(out.stdout_lossy().trim().parse().unwrap_or(0))
+    .await
+    {
+        Ok(Some(out)) => out,
+        Ok(None) => return Ok(0),
+        Err(e) => return Err(failed(e.to_string())),
+    };
+    let stdout = out.stdout_lossy();
+    stdout
+        .trim()
+        .parse()
+        .map_err(|_| failed(format!("unexpected rev-list output: {}", stdout.trim())))
 }
 
 /// A process-unique suffix for the throwaway worktree directory name.
@@ -2815,6 +3064,10 @@ mod tests {
     use super::{
         branch_tip_sha, current_branch_name, is_session_holder, name_paths, update_in_holder,
         worktree_holding_branch, HolderMerge, UpdateBranchOutcome,
+    };
+    use super::{
+        is_unknown_format_atom, push_destination, read_refs_with_fallback,
+        read_refs_with_push_destination,
     };
     use super::{RenamePhase, RenamePhaseHook, RENAME_PHASE_HOOK};
     use crate::error::AppError;
@@ -2996,6 +3249,147 @@ mod tests {
         run(repo_s, &["commit", "-qm", "seed"]).await;
     }
 
+    #[test]
+    fn session_branch_name_truth_table() {
+        for name in ["gd/session/x", "GD/Session/x", "gd/SESSION/x", "Gd/session/"] {
+            assert!(super::is_session_branch_name(name), "{name}");
+            let err = super::refuse_session_branch_name(name).unwrap_err();
+            assert!(
+                matches!(err, AppError::InvalidArgument(message) if message == format!(
+                    "\"{name}\" is in gd/session/, which is reserved for agent sessions — choose another name."
+                ))
+            );
+        }
+        for name in ["gd/sessions/x", "wip/gd/session/x", "feature/x", "gd/session"] {
+            assert!(!super::is_session_branch_name(name), "{name}");
+            assert!(super::refuse_session_branch_name(name).is_ok(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_branch_refuses_session_branch_name_any_case() {
+        for checkout in [false, true] {
+            let (_base, base) = temp_base("create-session-branch-name");
+            let repo = base.to_string_lossy().into_owned();
+            init_repo(&repo, "r.txt").await;
+            let before = run(&repo, &["for-each-ref", "refs/heads"]).await;
+            let result = git_create_branch_core(
+                &AppState::default(),
+                repo.clone(),
+                "GD/Session/x".into(),
+                checkout,
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(AppError::InvalidArgument(message)) if message ==
+                    "\"GD/Session/x\" is in gd/session/, which is reserved for agent sessions — choose another name."),
+                "{result:?}"
+            );
+            assert_eq!(run(&repo, &["for-each-ref", "refs/heads"]).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_a_case_alias_of_a_session_branch_name() {
+        let (_base, base) = temp_base("checkout-session-case-alias");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["update-ref", "refs/heads/gd/session/x", "HEAD"]).await;
+        let head = run(&repo, &["symbolic-ref", "HEAD"]).await;
+        // On a case-sensitive filesystem this is a passing control.
+        let result = super::git_checkout_branch_core(
+            &AppState::default(),
+            repo.clone(),
+            "GD/Session/x".into(),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(AppError::InvalidArgument(message)) if message ==
+                "\"GD/Session/x\" is in gd/session/, which is reserved for agent sessions — choose another name."),
+            "expected session branch refusal, got {result:?}"
+        );
+        assert_eq!(run(&repo, &["symbolic-ref", "HEAD"]).await, head);
+    }
+
+    #[tokio::test]
+    async fn checkout_switches_to_an_existing_session_branch_any_case() {
+        for packed in [false, true] {
+            let (_base, base) = temp_base("checkout-existing-session-branch");
+            let repo = base.to_string_lossy().into_owned();
+            init_repo(&repo, "r.txt").await;
+            run(&repo, &["update-ref", "refs/heads/GD/Session/x", "HEAD"]).await;
+            if packed {
+                run(&repo, &["pack-refs", "--all"]).await;
+            }
+            super::git_checkout_branch_core(
+                &AppState::default(),
+                repo.clone(),
+                "GD/Session/x".into(),
+            )
+            .await
+            .expect("existing session branch remains reachable");
+            assert_eq!(
+                run(&repo, &["symbolic-ref", "HEAD"]).await.trim(),
+                "refs/heads/GD/Session/x"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_guessing_a_session_branch_name_any_case() {
+        let (_base, base) = temp_base("checkout-guess-session-branch-name");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["remote", "add", "origin", &repo]).await;
+        run(&repo, &["update-ref", "refs/remotes/origin/GD/Session/x", "HEAD"]).await;
+        let head = run(&repo, &["symbolic-ref", "HEAD"]).await;
+        assert!(run(&repo, &["for-each-ref", "refs/heads/GD/Session/x"])
+            .await
+            .is_empty());
+        let result = super::git_checkout_branch_core(
+            &AppState::default(),
+            repo.clone(),
+            "GD/Session/x".into(),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(AppError::InvalidArgument(message)) if message ==
+                "\"GD/Session/x\" is in gd/session/, which is reserved for agent sessions — choose another name."),
+            "expected session branch refusal, got {result:?}"
+        );
+        assert!(run(&repo, &["for-each-ref", "refs/heads/GD/Session/x"])
+            .await
+            .is_empty());
+        assert_eq!(run(&repo, &["symbolic-ref", "HEAD"]).await, head);
+    }
+
+    #[tokio::test]
+    async fn checkout_remote_refuses_session_branch_name_any_case() {
+        let (_base, base) = temp_base("checkout-session-branch-name");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["remote", "add", "origin", &repo]).await;
+        run(&repo, &["update-ref", "refs/remotes/origin/GD/Session/x", "HEAD"]).await;
+        let head = run(&repo, &["symbolic-ref", "HEAD"]).await;
+        let refs = run(&repo, &["for-each-ref", "refs/heads"]).await;
+        let result = git_checkout_remote_branch_core(
+            &AppState::default(),
+            repo.clone(),
+            "origin".into(),
+            "GD/Session/x".into(),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(AppError::InvalidArgument(message)) if message ==
+                "\"GD/Session/x\" is in gd/session/, which is reserved for agent sessions — choose another name."),
+            "{result:?}"
+        );
+        assert_eq!(run(&repo, &["symbolic-ref", "HEAD"]).await, head);
+        assert_eq!(run(&repo, &["for-each-ref", "refs/heads"]).await, refs);
+    }
+
     /// Drives `git_create_branch_core` against a real repo to prove git honors the
     /// `--no-track` placement the argv table pins. Synthesizes a remote-tracking ref
     /// (`refs/remotes/origin/x` via `update-ref`, so nothing is ever fetched) and bases
@@ -3131,6 +3525,245 @@ mod tests {
             run(&repo_s, &["rev-parse", "refs/tags/origin/x"]).await,
             "fixture sanity: the tag sits on another commit"
         );
+    }
+
+    /// The destination derivation's arms: an explicit push ref, the upstream's own
+    /// tracking ref, the standard same-name tracking ref, and everything that stays
+    /// unresolved rather than naming a wrong branch.
+    #[test]
+    fn push_destination_arms() {
+        let both = |r: &str, b: &str| (Some(r.to_string()), Some(b.to_string()));
+        let none = (None, None);
+        let up = "refs/remotes/origin/main";
+        // (local, push remote, push remoteref, %(push), %(upstream), upstream remote,
+        //  upstream remoteref) → destination
+        let cases = [
+            // A push remote with its own push refspecs sends them all, as configured:
+            // no single destination describes that push.
+            (
+                (
+                    "topic",
+                    "origin",
+                    "refs/heads/pushed/t",
+                    "refs/remotes/origin/pushed/t",
+                    up,
+                    "origin",
+                    "refs/heads/main",
+                ),
+                none.clone(),
+            ),
+            (
+                (
+                    "topic",
+                    "origin",
+                    "refs/tags/t",
+                    "",
+                    up,
+                    "origin",
+                    "refs/heads/main",
+                ),
+                none.clone(),
+            ),
+            // The upstream's own tracking ref on the same remote: the upstream branch.
+            (
+                ("topic", "origin", "", up, up, "origin", "refs/heads/main"),
+                both("origin", "main"),
+            ),
+            // The upstream's tracking ref named for ANOTHER push remote (upstream
+            // mode, triangular): git refuses that push.
+            (
+                ("topic", "second", "", up, up, "origin", "refs/heads/main"),
+                none.clone(),
+            ),
+            // The standard same-name tracking ref.
+            (
+                (
+                    "topic",
+                    "origin",
+                    "",
+                    "refs/remotes/origin/topic",
+                    up,
+                    "origin",
+                    "refs/heads/main",
+                ),
+                both("origin", "topic"),
+            ),
+            (
+                (
+                    "a/b",
+                    "fork",
+                    "",
+                    "refs/remotes/fork/a/b",
+                    up,
+                    "origin",
+                    "refs/heads/main",
+                ),
+                both("fork", "a/b"),
+            ),
+            // A remapped fetch refspec's tracking name is never read as the branch.
+            (
+                (
+                    "topic",
+                    "origin",
+                    "",
+                    "refs/remotes/origin/team/topic",
+                    "refs/remotes/origin/team/main",
+                    "origin",
+                    "refs/heads/main",
+                ),
+                none.clone(),
+            ),
+            // Remapped, but the destination IS the upstream: read back through it.
+            (
+                (
+                    "topic",
+                    "origin",
+                    "",
+                    "refs/remotes/origin/team/main",
+                    "refs/remotes/origin/team/main",
+                    "origin",
+                    "refs/heads/main",
+                ),
+                both("origin", "main"),
+            ),
+            // No destination (simple's cross-name refusal, nothing, a narrow fetch).
+            (
+                ("topic", "origin", "", "", up, "origin", "refs/heads/main"),
+                none.clone(),
+            ),
+            // No remote, or a local one.
+            (
+                (
+                    "topic",
+                    "",
+                    "",
+                    "refs/remotes/origin/topic",
+                    up,
+                    "origin",
+                    "refs/heads/main",
+                ),
+                none.clone(),
+            ),
+            (
+                (
+                    "topic",
+                    ".",
+                    "",
+                    "refs/heads/main",
+                    "",
+                    ".",
+                    "refs/heads/main",
+                ),
+                none.clone(),
+            ),
+            // An upstream that is no branch can't name the destination.
+            (
+                (
+                    "topic",
+                    "origin",
+                    "",
+                    "refs/remotes/origin/pr",
+                    "refs/remotes/origin/pr",
+                    "origin",
+                    "refs/pull/1/head",
+                ),
+                none.clone(),
+            ),
+        ];
+        for ((local, pr, prr, p, u, ur, urr), want) in cases {
+            assert_eq!(
+                push_destination(local, pr, prr, p, u, ur, urr),
+                want,
+                "{local} {pr} {prr} {p} {u}"
+            );
+        }
+    }
+
+    /// git's two real phrasings for a refused format atom (measured live below) are the
+    /// retry's trigger; any other failure is not.
+    #[test]
+    fn unknown_format_atom_phrasings() {
+        assert!(is_unknown_format_atom("fatal: unknown field name: pushx"));
+        assert!(is_unknown_format_atom(
+            "fatal: unrecognized %(push) argument: bogus"
+        ));
+        assert!(!is_unknown_format_atom("fatal: not a git repository"));
+        assert!(!is_unknown_format_atom(
+            "fatal: unrecognized %(upstream) argument: bogus"
+        ));
+    }
+
+    /// The retry-once, live, over the status read's own format: an extended format this
+    /// git rejects (an unknown atom, and a known atom with an unknown argument) re-runs
+    /// the base format, so the read still answers with the tracking fields and no push
+    /// atoms. A failure of any other kind is an error, not a retry.
+    #[tokio::test]
+    async fn a_rejected_push_atom_falls_back_to_the_base_read() {
+        use crate::git::remote::{parse_upstream_tracking, Upstream, UPSTREAM_TRACKING_FORMAT};
+        let (_base, base) = temp_base("push-atom-retry");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "r.txt").await;
+        // A tracked branch, so the tracking fields have something to say.
+        let main = run(&repo_s, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        let refname = run(&repo_s, &["symbolic-ref", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        run(&repo_s, &["remote", "add", "origin", &repo_s]).await;
+        let tracking = format!("refs/remotes/origin/{main}");
+        run(&repo_s, &["update-ref", &tracking, "HEAD"]).await;
+        let upstream = format!("--set-upstream-to=origin/{main}");
+        run(&repo_s, &["branch", "-q", &upstream]).await;
+        // Pinned, so a global remote.pushDefault can't move the push remote read below.
+        let push_remote = format!("branch.{main}.pushRemote");
+        run(&repo_s, &["config", &push_remote, "origin"]).await;
+        let fmt = UPSTREAM_TRACKING_FORMAT;
+        let base_text = run(&repo_s, &["for-each-ref", &refname, fmt]).await;
+        let tracked = Some((Upstream::Branch(main.clone()), "origin".to_string(), false));
+        assert_eq!(parse_upstream_tracking(&base_text, &refname), tracked);
+        for bogus in ["%(nosuchatom)", "%(push:bogus)"] {
+            // The premise: git itself rejects it with a phrasing the matcher knows.
+            let raw = run_git_raw(
+                Some(&repo_s),
+                &["for-each-ref", &refname, &format!("--format={bogus}")],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_ne!(raw.code, 0, "{bogus}");
+            assert!(
+                is_unknown_format_atom(&raw.stderr),
+                "{bogus}: {}",
+                raw.stderr
+            );
+            let extended = format!("{fmt}%00{bogus}");
+            let text = read_refs_with_fallback(&repo_s, &refname, &extended, fmt)
+                .await
+                .expect("the fallback answers");
+            assert_eq!(text, base_text, "{bogus}");
+            assert_eq!(parse_upstream_tracking(&text, &refname), tracked, "{bogus}");
+        }
+        // The real extended read answers with the atoms on this git: the tracking
+        // fields unchanged, the push remote after them.
+        let text = read_refs_with_push_destination(&repo_s, &refname, fmt)
+            .await
+            .unwrap();
+        assert_eq!(parse_upstream_tracking(&text, &refname), tracked);
+        let line = text.lines().next().unwrap();
+        // The base format's 4 fields plus the 4 atoms, whatever their values.
+        assert_eq!(line.split('\0').count(), 8, "{line:?}");
+        assert_eq!(line.split('\0').nth(4), Some("origin"), "{line:?}");
+        // Not a format refusal: no retry, an error.
+        let missing = base.join("not-a-repo");
+        std::fs::create_dir_all(&missing).unwrap();
+        read_refs_with_push_destination(&missing.to_string_lossy(), &refname, fmt)
+            .await
+            .expect_err("a broken repository is an error");
     }
 
     /// `git_branches` must surface git's authoritative `%(upstream:remotename)`
@@ -3319,6 +3952,197 @@ mod tests {
             tracking_of(&repo_s, "landing").await,
             (Some("origin".into()), Some("refs/heads/landing".into()))
         );
+    }
+
+    fn branch_divergence_tuples(rows: &[super::BranchDivergence]) -> Vec<(String, u32, u32)> {
+        rows.iter()
+            .map(|d| (d.name.clone(), d.ahead, d.behind))
+            .collect()
+    }
+
+    #[test]
+    fn branch_divergence_parses_ahead_behind() {
+        let Some(rows) = super::parse_ahead_behind(
+            "base",
+            "refs/heads/x 3 5\n\nrefs/heads/base 7 9\nrefs/heads/feat/x 0 0\n",
+        ) else {
+            panic!("valid ahead/behind rows must parse");
+        };
+        assert_eq!(
+            branch_divergence_tuples(&rows),
+            vec![
+                ("x".to_string(), 3, 5),
+                ("base".to_string(), 0, 0),
+                ("feat/x".to_string(), 0, 0),
+            ]
+        );
+        assert!(super::parse_ahead_behind("base", "").is_some_and(|rows| rows.is_empty()));
+    }
+
+    #[test]
+    fn branch_divergence_preserves_non_ascii_whitespace_in_names() {
+        let Some(rows) = super::parse_ahead_behind(
+            "base",
+            "refs/heads/nb\u{a0}sp 3 5\nrefs/heads/tr\u{a0} 7 9\n",
+        ) else {
+            panic!("branch names with non-ASCII whitespace must parse");
+        };
+        assert_eq!(
+            branch_divergence_tuples(&rows),
+            vec![
+                ("nb\u{a0}sp".to_string(), 3, 5),
+                ("tr\u{a0}".to_string(), 7, 9)
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_divergence_rejects_malformed_ahead_behind() {
+        for invalid in [
+            "refs/heads/x 3",
+            "refs/heads/x 3 5 extra",
+            "refs/heads/x 3 5 7",
+            "refs/heads/x nope 5",
+            "refs/heads/x 3 nope",
+            "refs/tags/x 3 5",
+            "refs/heads/ 3 5",
+            "refs/heads/x 4294967296 5",
+            "refs/heads/x 3 4294967296",
+            "refs/heads/base nope 5",
+        ] {
+            let stdout = format!("refs/heads/valid 1 2\n{invalid}\n");
+            assert!(
+                super::parse_ahead_behind("base", &stdout).is_none(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_divergence_parses_git_version() {
+        for (stdout, expected) in [
+            ("git version 2.51.1.windows.1\n", Some((2, 51))),
+            ("git version 2.39.5 (Apple Git-154)", Some((2, 39))),
+            ("git version 2.40.0.123.gabc", Some((2, 40))),
+            ("git version 2.41.0", Some((2, 41))),
+            ("", None),
+            ("not git", None),
+        ] {
+            assert_eq!(super::parse_git_version(stdout), expected, "{stdout}");
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_divergence_single_spawn_matches_per_branch() -> super::AppResult<()> {
+        let (_dir, path) = temp_base("divergence-single-spawn");
+        let repo = path.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["branch", "-m", "base"]).await;
+        run(&repo, &["branch", "behind"]).await;
+        run(&repo, &["branch", "diverged"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "base one"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "base two"]).await;
+        run(&repo, &["branch", "at-tip"]).await;
+        run(&repo, &["switch", "-qc", "ahead"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "ahead work"]).await;
+        run(&repo, &["branch", "feat/x"]).await;
+        run(&repo, &["switch", "-q", "diverged"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "diverged work"]).await;
+
+        let expected = vec![
+            ("ahead".to_string(), 1, 0),
+            ("at-tip".to_string(), 0, 0),
+            ("base".to_string(), 0, 0),
+            ("behind".to_string(), 0, 2),
+            ("diverged".to_string(), 1, 2),
+            ("feat/x".to_string(), 1, 0),
+        ];
+        let base_rev = super::branch_first_rev(&repo, "base").await;
+        let fallback = super::divergence_per_branch(&repo, "base", &base_rev).await?;
+        let rows = super::git_branch_divergence(repo.clone(), "base".into()).await?;
+        assert_eq!(
+            branch_divergence_tuples(&rows),
+            branch_divergence_tuples(&fallback)
+        );
+        assert_eq!(branch_divergence_tuples(&fallback), expected);
+
+        if super::ahead_behind_supported().await {
+            let fast = super::divergence_single_spawn(&repo, "base", &base_rev).await?;
+            assert!(
+                fast.is_some(),
+                "supported git must use the single-spawn path"
+            );
+            if let Some(rows) = fast {
+                assert_eq!(branch_divergence_tuples(&rows), expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_divergence_unresolvable_base_falls_back_to_all_zero() -> super::AppResult<()> {
+        let (_dir, path) = temp_base("divergence-missing-base");
+        let repo = path.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["branch", "-m", "base"]).await;
+        run(&repo, &["branch", "sibling"]).await;
+
+        let base = "missing-base";
+        super::validate_ref_name(base)?;
+        let base_rev = super::branch_first_rev(&repo, base).await;
+        assert!(super::divergence_single_spawn(&repo, base, &base_rev)
+            .await?
+            .is_none());
+        let rows = super::git_branch_divergence(repo, base.into()).await?;
+        assert_eq!(
+            branch_divergence_tuples(&rows),
+            vec![("base".to_string(), 0, 0), ("sibling".to_string(), 0, 0)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_divergence_percent_base_refuses_fast_path() -> super::AppResult<()> {
+        let (_dir, path) = temp_base("divergence-percent-base");
+        let repo = path.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        let base = "odd%base";
+        run(&repo, &["branch", "-m", base]).await;
+        run(&repo, &["branch", "sibling"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "base one"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "base two"]).await;
+        run(&repo, &["switch", "-q", "sibling"]).await;
+        run(&repo, &["commit", "--allow-empty", "-qm", "sibling work"]).await;
+
+        super::validate_ref_name(base)?;
+        let base_rev = super::branch_first_rev(&repo, base).await;
+        assert!(super::divergence_single_spawn(&repo, base, &base_rev)
+            .await?
+            .is_none());
+        let fallback = super::divergence_per_branch(&repo, base, &base_rev).await?;
+        let rows = super::git_branch_divergence(repo, base.into()).await?;
+        assert_eq!(
+            branch_divergence_tuples(&rows),
+            branch_divergence_tuples(&fallback)
+        );
+        assert_eq!(
+            branch_divergence_tuples(&fallback),
+            vec![
+                ("odd%base".to_string(), 0, 0),
+                ("sibling".to_string(), 1, 2)
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_divergence_empty_repo_reports_no_rows() -> super::AppResult<()> {
+        let (_dir, path) = temp_base("divergence-empty-repo");
+        let repo = path.to_string_lossy().into_owned();
+        run(&repo, &["init", "-q"]).await;
+        let rows = super::git_branch_divergence(repo, "base".into()).await?;
+        assert!(rows.is_empty());
+        Ok(())
     }
 
     /// Rows are named by the real branch and measured through its full ref, and the
@@ -5144,6 +5968,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_remote_branch_preserves_a_same_named_tag() {
+        let (_base, base) = temp_base("delete-remote-twin");
+        let remote_s = base.join("remote").to_string_lossy().into_owned();
+        run_git(None, &["init", "-q", "--bare", &remote_s], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "r.txt").await;
+        run(&repo_s, &["remote", "add", "origin", &remote_s]).await;
+        run(&repo_s, &["branch", "twin"]).await;
+        run(&repo_s, &["tag", "twin"]).await;
+        run(
+            &repo_s,
+            &["push", "-q", "origin", "refs/heads/twin", "refs/tags/twin"],
+        )
+        .await;
+
+        let result = git_delete_remote_branch_core(
+            &AppState::default(),
+            repo_s,
+            "origin".into(),
+            "twin".into(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let refs = run(&remote_s, &["for-each-ref", "--format=%(refname)"]).await;
+        assert!(!refs.lines().any(|name| name == "refs/heads/twin"));
+        assert!(refs.lines().any(|name| name == "refs/tags/twin"));
+    }
+
+    #[tokio::test]
+    async fn delete_remote_branch_preserves_a_tag_when_branch_is_already_gone() {
+        let (_base, base) = temp_base("delete-remote-solo");
+        let remote_s = base.join("remote").to_string_lossy().into_owned();
+        run_git(None, &["init", "-q", "--bare", &remote_s], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "r.txt").await;
+        run(&repo_s, &["remote", "add", "origin", &remote_s]).await;
+        run(&repo_s, &["tag", "solo"]).await;
+        run(&repo_s, &["push", "-q", "origin", "refs/tags/solo"]).await;
+        run(&repo_s, &["update-ref", "refs/remotes/origin/solo", "HEAD"]).await;
+
+        let result = git_delete_remote_branch_core(
+            &AppState::default(),
+            repo_s.clone(),
+            "origin".into(),
+            "solo".into(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let refs = run(&remote_s, &["for-each-ref", "--format=%(refname)"]).await;
+        assert!(refs.lines().any(|name| name == "refs/tags/solo"));
+        assert!(!refs.lines().any(|name| name == "refs/heads/solo"));
+        assert!(run(&repo_s, &["for-each-ref", "refs/remotes/origin/solo"])
+            .await
+            .is_empty());
+    }
+
     /// A malformed (but exit-0) counts line must NOT default to zeros: `local_only
     /// == 0` is half the pair that unlocks the destructive reset offer, so a
     /// fabricated one is the worst answer this type can give. Every shape that
@@ -5791,6 +6680,195 @@ mod tests {
         assert!(
             !files.contains("side.txt"),
             "the tag's commit is not: {files}"
+        );
+    }
+
+    // --- "Update from <default>" sends the default's `%(upstream:short)` as `base`
+    // when the local default is behind it, so a remote-tracking base reaches every arm.
+
+    /// Mints `refs/remotes/origin/<main>` one commit AHEAD of local `main` (a new
+    /// `remote.txt`), as a fetch would, leaving `main` where it is. Returns its sha.
+    async fn mint_origin_ahead(repo: &std::path::Path, repo_s: &str, main: &str) -> String {
+        run(repo_s, &["switch", "-qc", "remote-tip", main]).await;
+        std::fs::write(repo.join("remote.txt"), "remote\n").unwrap();
+        run(repo_s, &["add", "-A"]).await;
+        run(repo_s, &["commit", "-qm", "remote work"]).await;
+        let sha = run(repo_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+        run(
+            repo_s,
+            &["update-ref", &format!("refs/remotes/origin/{main}"), &sha],
+        )
+        .await;
+        run(repo_s, &["switch", "-q", main]).await;
+        run(repo_s, &["branch", "-qD", "remote-tip"]).await;
+        sha
+    }
+
+    /// The fast-forward arm (`fetch .`) of a branch that is NOT checked out takes a
+    /// remote-tracking base, and the local default stays where it was.
+    #[tokio::test]
+    async fn update_branch_from_accepts_a_remote_tracking_base() {
+        let (_guard, repo, repo_s, main) = diverged_repo("update-remote-ff").await;
+        run(&repo_s, &["branch", "behind", "HEAD~1"]).await;
+        let main_tip = run(&repo_s, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+        let remote = mint_origin_ahead(&repo, &repo_s, &main).await;
+
+        let state = AppState::default();
+        let base = format!("origin/{main}");
+        let outcome = update_branch_from(&state, &repo_s, "behind", &base, &HashSet::new(), None)
+            .await
+            .expect("the update succeeds");
+        assert_eq!(outcome.outcome, "fast-forward");
+        assert_eq!(
+            run(&repo_s, &["rev-parse", "refs/heads/behind"])
+                .await
+                .trim(),
+            remote,
+            "the branch lands on the remote-tracking tip"
+        );
+        assert_eq!(
+            run(&repo_s, &["rev-parse", &main]).await.trim(),
+            main_tip,
+            "the local default is never moved"
+        );
+    }
+
+    /// The in-place arm merges the remote-tracking tip into the checked-out branch.
+    #[tokio::test]
+    async fn update_branch_from_remote_tracking_base_merges_in_place() {
+        let (_guard, repo, repo_s, main) = diverged_repo("update-remote-in-place").await;
+        let remote = mint_origin_ahead(&repo, &repo_s, &main).await;
+        run(&repo_s, &["switch", "-q", "feature"]).await;
+
+        let state = AppState::default();
+        let base = format!("origin/{main}");
+        let outcome = update_branch_from(&state, &repo_s, "feature", &base, &HashSet::new(), None)
+            .await
+            .expect("the in-place merge succeeds");
+        assert_eq!(outcome.outcome, "merge");
+        assert_eq!(
+            run(&repo_s, &["rev-parse", "refs/heads/feature^2"])
+                .await
+                .trim(),
+            remote,
+            "the merge's second parent is the remote-tracking tip"
+        );
+        assert!(repo.join("remote.txt").exists(), "its work is merged in");
+    }
+
+    /// The up-to-date probe reads the remote-tracking ref: a branch that contains it
+    /// is up to date even though it lacks the local default's newer commit.
+    #[tokio::test]
+    async fn update_branch_from_up_to_date_against_remote_tracking_base() {
+        let (_guard, _repo, repo_s, main) = diverged_repo("update-remote-uptodate").await;
+        let seed = run(&repo_s, &["rev-parse", "HEAD~1"])
+            .await
+            .trim()
+            .to_string();
+        run(
+            &repo_s,
+            &["update-ref", &format!("refs/remotes/origin/{main}"), &seed],
+        )
+        .await;
+        let feature_tip = run(&repo_s, &["rev-parse", "refs/heads/feature"])
+            .await
+            .trim()
+            .to_string();
+
+        let state = AppState::default();
+        let base = format!("origin/{main}");
+        let outcome = update_branch_from(&state, &repo_s, "feature", &base, &HashSet::new(), None)
+            .await
+            .expect("the update succeeds");
+        assert_eq!(outcome.outcome, "up-to-date");
+        assert_eq!(
+            run(&repo_s, &["rev-parse", "refs/heads/feature"])
+                .await
+                .trim(),
+            feature_tip
+        );
+    }
+
+    /// A LOCAL branch literally named `origin/<main>` would capture the short form, so
+    /// git reports the upstream disambiguated (`remotes/origin/<main>`) and the UI
+    /// sends that string verbatim. Exercises the fast-forward arm of a branch that is
+    /// not checked out: the branch lands on the remote-tracking tip, never on the
+    /// local look-alike's (which it could fast-forward to as well).
+    #[tokio::test]
+    async fn update_branch_from_base_is_not_captured_by_a_local_branch() {
+        let (_guard, repo, repo_s, main) = diverged_repo("update-remote-shadowed").await;
+        let remote = mint_origin_ahead(&repo, &repo_s, &main).await;
+        // Never contacted: the remote exists only so the upstream resolves.
+        let nowhere = repo
+            .parent()
+            .expect("the repo lives under the temp base")
+            .join("origin.git");
+        run(
+            &repo_s,
+            &["remote", "add", "origin", &nowhere.to_string_lossy()],
+        )
+        .await;
+        run(&repo_s, &["branch", "tracker", "HEAD~1"]).await;
+        run(
+            &repo_s,
+            &[
+                "branch",
+                "-q",
+                &format!("--set-upstream-to=origin/{main}"),
+                "tracker",
+            ],
+        )
+        .await;
+        async fn upstream_short(repo_s: &str) -> String {
+            run(
+                repo_s,
+                &[
+                    "for-each-ref",
+                    "--format=%(upstream:short)",
+                    "refs/heads/tracker",
+                ],
+            )
+            .await
+            .trim()
+            .to_string()
+        }
+        assert_eq!(upstream_short(&repo_s).await, format!("origin/{main}"));
+        run(
+            &repo_s,
+            &["branch", &format!("origin/{main}"), "refs/heads/feature"],
+        )
+        .await;
+        let lookalike = run(&repo_s, &["rev-parse", "refs/heads/feature"])
+            .await
+            .trim()
+            .to_string();
+        // The premise: the short form git reports once the local branch exists.
+        let base = upstream_short(&repo_s).await;
+        assert_eq!(base, format!("remotes/origin/{main}"));
+
+        let state = AppState::default();
+        let outcome = update_branch_from(&state, &repo_s, "tracker", &base, &HashSet::new(), None)
+            .await
+            .expect("the update succeeds");
+        assert_eq!(outcome.outcome, "fast-forward");
+        let tip = run(&repo_s, &["rev-parse", "refs/heads/tracker"])
+            .await
+            .trim()
+            .to_string();
+        assert_eq!(tip, remote, "the remote-tracking tip is what lands");
+        assert_ne!(tip, lookalike, "never the local look-alike's tip");
+        assert_eq!(
+            run(
+                &repo_s,
+                &["rev-parse", &format!("refs/heads/origin/{main}")]
+            )
+            .await
+            .trim(),
+            lookalike,
+            "the look-alike branch is never moved"
         );
     }
 
@@ -8163,6 +9241,76 @@ mod tests {
         assert_eq!(stderr, expected.full_failure_text());
         assert!(stderr.contains("MERGE_HEAD exists"), "{stderr}");
         f.assert_snapshot().await;
+    }
+
+    /// Pins the measured exit of `for-each-ref --contains` on a well-formed oid
+    /// the repo lacks, which decides how `commit_on_remote` reads an empty answer.
+    #[tokio::test]
+    async fn commit_on_remote_errs_for_an_unknown_oid() {
+        let (_base, base) = temp_base("on-remote-unknown");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]).await;
+        let unknown = "0123456789abcdef0123456789abcdef01234567";
+        let raw = run_git_raw(
+            Some(&repo),
+            &[
+                "for-each-ref",
+                "refs/remotes",
+                "--contains",
+                unknown,
+                "--format=%(refname)",
+            ],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            raw.code, 0,
+            "for-each-ref answered an unknown oid with exit 0"
+        );
+        let result = super::commit_on_remote(repo.clone(), unknown.into()).await;
+        assert!(matches!(result, Err(AppError::Command(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn commit_on_remote_answers_from_remote_tracking_refs() {
+        let (_base, base) = temp_base("on-remote-answers");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        let pushed = run(&repo, &["rev-parse", "HEAD"]).await.trim().to_string();
+        run(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]).await;
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]).await;
+        let local = run(&repo, &["rev-parse", "HEAD"]).await.trim().to_string();
+        assert!(super::commit_on_remote(repo.clone(), pushed).await.unwrap());
+        assert!(!super::commit_on_remote(repo.clone(), local).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unpushed_count_reads_zero_on_an_unborn_head() {
+        let (_base, base) = temp_base("unpushed-unborn");
+        let repo = base.to_string_lossy().into_owned();
+        run(&repo, &["init", "-q"]).await;
+        assert_eq!(super::git_unpushed_count(repo).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn unpushed_count_counts_every_commit_without_a_remote() {
+        let (_base, base) = temp_base("unpushed-no-remote");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]).await;
+        assert_eq!(super::git_unpushed_count(repo).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn unpushed_count_errs_outside_a_repository() {
+        let (_base, base) = temp_base("unpushed-broken");
+        let repo = base.to_string_lossy().into_owned();
+        init_repo(&repo, "r.txt").await;
+        std::fs::rename(base.join(".git"), base.join("git-moved")).unwrap();
+        let result = super::git_unpushed_count(repo).await;
+        assert!(matches!(result, Err(AppError::Command(_))), "{result:?}");
     }
 
     #[tokio::test]

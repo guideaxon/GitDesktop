@@ -3,6 +3,7 @@ import { normPath } from "@/lib/git/path";
 import type { CommitAuthor, RemoteLens, RepoInfo } from "@/lib/git/types";
 import type { PrSection } from "@/lib/pulls/pr-section";
 import { retargetAmendPin } from "@/lib/stores/draft-pin";
+import { holdNavigation } from "@/lib/stores/navigator-hold";
 import { startViewTransition } from "@/lib/view-transition";
 
 export type AppView =
@@ -422,11 +423,35 @@ interface UiState {
    *  performs for itself. A user action whose state lives in a COMPONENT rather than
    *  here bumps through {@link UiState.noteUserInteraction}. Every bump is synchronous at
    *  request time, transition-backed actions included, so a continuation claims its epoch
-   *  BEFORE invoking a navigator and never re-reads it after. */
+   *  BEFORE invoking a navigator and never re-reads it after. The one exception: a held
+   *  cross-repo navigator's settle-time Settings re-check can bump up to the warm-up
+   *  budget late, only while Settings' leave guard is registered (it asks about unsaved
+   *  edits, or holds the move while a save is writing; see `openPr`'s hold). */
   interactionEpoch: number;
+  /** Registered by SettingsScreen while it holds unsaved edits or a save is
+   *  writing. Every navigator that can leave Settings from elsewhere consults it
+   *  instead of navigating (Settings' own landings and closes are exempt; the
+   *  remove-repo close and the worktree promote's landing bypass it); `resume`
+   *  re-invokes the intercepted navigation with its original arguments. */
+  settingsLeaveGuard: ((resume: () => void) => void) | null;
+  setSettingsLeaveGuard: (guard: ((resume: () => void) => void) | null) => void;
 
-  openRepo: (info: RepoInfo) => void;
+  /** `bypassLeaveGuard` is for the worktree promote's landing only (it moves off
+   *  a folder it is about to delete), never a user's gesture. `onApplied` runs
+   *  inside the transition callback after the set: every call reaching that
+   *  callback applies (a skipped transition still runs its update), so only a
+   *  held move that Settings cancels, replaces or drops never fires it, and
+   *  callers gate with `claimRepoOpen`/`repoOpenWatermark` before calling. It
+   *  never bumps the epoch; the request's bump counted the move. */
+  openRepo: (
+    info: RepoInfo,
+    opts?: { bypassLeaveGuard?: boolean; onApplied?: () => void },
+  ) => void;
   closeRepo: () => void;
+  /** `closeRepo` that Settings' leave guard never holds, for the
+   *  remove-open-repository close alone: it stops status polling before the
+   *  repository is removed (and its folder trashed, when asked). */
+  closeRepoUnguarded: () => void;
   /** Open a repo (if not already open) and select a PR — used by a notification
    *  row's click-through. `section` is the sub-tab to land on, or null to leave
    *  whichever tab the user is on. One atomic update so the landing target
@@ -454,6 +479,13 @@ interface UiState {
      *  correct only against it — against any snapshot taken before the call, the
      *  request-time bump makes the check always refuse. */
     stillValid?: (epochAtRequest: number) => boolean;
+    /** Side effect that counts only if this landing applies (a read-mark), run
+     *  inside the transition callback after `stillValid` passed, `beforeSelect`
+     *  ran and the set applied: a refused landing, a cross-repo one superseded
+     *  during its warm-up, or a move Settings held and then cancelled, replaced
+     *  or dropped, never fires it. It never bumps the epoch; the request's bump
+     *  counted the move. */
+    onApplied?: () => void;
   }) => void;
   /** Open a repo (if not already open) and select one of its issues — the
    *  cross-repo path the work inbox navigates by. ONE atomic update: a repo
@@ -467,6 +499,8 @@ interface UiState {
      *  view-transition callback as the selection (openPr's field of the same
      *  name carries the full rationale). */
     beforeSelect?: () => void;
+    /** Deferred-apply re-check; openPr's field of the same name carries the contract. */
+    stillValid?: (epochAtRequest: number) => boolean;
   }) => void;
   /** Open a repo (if not already) and land on a workflow run in the Actions tab —
    *  used by a notification's click-through. Atomic, like openPr. */
@@ -476,6 +510,8 @@ interface UiState {
     runId: number;
     /** Deferred-apply re-check; openPr's field of the same name carries the contract. */
     stillValid?: (epochAtRequest: number) => boolean;
+    /** Landing side effect; openPr's field of the same name carries the contract. */
+    onApplied?: () => void;
   }) => void;
   /** Open a repo (if not already) and land on its Agent tab. Atomic. */
   openAgentTab: (target: {
@@ -483,6 +519,8 @@ interface UiState {
     repoName: string;
     /** Deferred-apply re-check; openPr's field of the same name carries the contract. */
     stillValid?: (epochAtRequest: number) => boolean;
+    /** Landing side effect; openPr's field of the same name carries the contract. */
+    onApplied?: () => void;
   }) => void;
   /** Open a repo (if not already) and, when `tab` is given, land on that tab;
    *  otherwise the current tab stands. Atomic. Unlike openRepo, staying in the
@@ -493,6 +531,8 @@ interface UiState {
     tab?: RepoTab;
     /** Deferred-apply re-check; openPr's field of the same name carries the contract. */
     stillValid?: (epochAtRequest: number) => boolean;
+    /** Landing side effect; openPr's field of the same name carries the contract. */
+    onApplied?: () => void;
   }) => void;
   /** Jump to a commit in the History tab (e.g. from the blame gutter). ONE atomic set of
    *  `repoTab` + `selectedCommitHash` — a follow-up `set()` gets clobbered by the deferred
@@ -582,12 +622,21 @@ interface UiState {
    *  status), not because the user chose to. The non-bumping route: a background poll
    *  must not advance {@link UiState.interactionEpoch} and strand a click's continuation. */
   clearSelectedFile: () => void;
+  /** Replace the selection because the selected file LEFT its section and a
+   *  successor should show (the Changes advance) — a reactive pick against fresh
+   *  status, not a user action, so like {@link clearSelectedFile} it never bumps
+   *  {@link UiState.interactionEpoch}. */
+  advanceSelectedFile: (file: SelectedFile) => void;
   /** Advance {@link UiState.interactionEpoch} for a USER action whose state lives in a
    *  component rather than this store — a panel-local tab pick is still "where the user
    *  is". Call it BEFORE the local set, so a continuation strands before it can land.
    *  A no-op inside a navigator's `beforeSelect`, whose request-time bump covers it. */
   noteUserInteraction: () => void;
   selectCommit: (hash: string | null) => void;
+  /** Drop the History selection because its commit left this branch's history (an
+   *  undo removed it), not because the user chose to. A prune, so it never bumps
+   *  {@link UiState.interactionEpoch}: a pending amend landing must not strand. */
+  clearSelectedCommit: () => void;
   selectCompareCommit: (hash: string | null) => void;
   setCommitDraft: (title: string, body: string) => void;
   setCommitTitle: (title: string) => void;
@@ -627,6 +676,31 @@ interface UiState {
     fromBranch: string,
     toBranch: string,
   ) => void;
+}
+
+/** Starts the repo-shell warm-up for `root` and claims the open;
+ *  `stillCurrent` fails once a newer open or any navigation arrived. */
+export type RepoShellWarmup = (root: string) => {
+  settled: Promise<void>;
+  stillCurrent: () => boolean;
+};
+
+// Injected rather than imported: the warm-up and the open claims live in
+// src/features/repository, and src/lib never imports from src/features.
+let repoShellWarmup: RepoShellWarmup | null = null;
+
+/** Installs the warm-up every cross-repo landing holds on. Replaces any earlier
+ *  one, so a module re-evaluated by HMR re-registers cleanly. */
+export function registerRepoShellWarmup(fn: RepoShellWarmup): void {
+  repoShellWarmup = fn;
+}
+
+/** The registered warm-up for `root`, or null before registration —
+ *  callers land immediately then (fail open). */
+export function claimWarmRepoShell(
+  root: string,
+): ReturnType<RepoShellWarmup> | null {
+  return repoShellWarmup ? repoShellWarmup(root) : null;
 }
 
 export const useUiStore = create<UiState>()((set, get) => {
@@ -696,6 +770,17 @@ export const useUiStore = create<UiState>()((set, get) => {
   // there double-exposes two differently laid-out headers. Read at REQUEST time.
   const repoViewMotion = () => ({ animate: get().view !== "repo" });
 
+  // Hands a move off a dirty or saving Settings to its guard. Bumps for the
+  // request first, so an older continuation (a claimed repo open) retires and
+  // any hold carries this request's epoch; resume rules live in requestLeave.
+  const interceptSettingsLeave = (resume: () => void): boolean => {
+    const { view, settingsLeaveGuard } = get();
+    if (view !== "settings" || settingsLeaveGuard === null) return false;
+    bumpEpochNow();
+    settingsLeaveGuard(resume);
+    return true;
+  };
+
   // Set while a navigator runs its caller's `beforeSelect`. That navigator bumped
   // at request time, so a note requested here (a lens switch's) is already
   // covered, and landing it now would retire a newer action claimed before the
@@ -757,26 +842,36 @@ export const useUiStore = create<UiState>()((set, get) => {
     activeDraftKey: null,
     draftKeyRemaps: {},
     interactionEpoch: 0,
+    settingsLeaveGuard: null,
+    setSettingsLeaveGuard: (guard) => set({ settingsLeaveGuard: guard }),
 
-    openRepo: (info) => {
+    openRepo: (info, opts) => {
+      if (
+        !opts?.bypassLeaveGuard &&
+        interceptSettingsLeave(() => get().openRepo(info, opts))
+      )
+        return;
       bumpEpochNow();
-      startViewTransition(
-        () =>
-          set({
-            view: "repo",
-            previousView: "repo",
-            repoPath: info.root,
-            repoName: info.name,
-            repoTab: "changes",
-            // Clear the live fields; the previous repo's draft stays in
-            // commitDrafts (keyed by repo+branch) and CommitBox reloads the new
-            // repo's draft once its branch is known.
-            ...CROSS_REPO_RESET,
-          }),
-        repoViewMotion(),
-      );
+      startViewTransition(() => {
+        set({
+          view: "repo",
+          previousView: "repo",
+          repoPath: info.root,
+          repoName: info.name,
+          repoTab: "changes",
+          // Clear the live fields; the previous repo's draft stays in
+          // commitDrafts (keyed by repo+branch) and CommitBox reloads the new
+          // repo's draft once its branch is known.
+          ...CROSS_REPO_RESET,
+        });
+        opts?.onApplied?.();
+      }, repoViewMotion());
     },
     closeRepo: () => {
+      if (interceptSettingsLeave(() => get().closeRepo())) return;
+      get().closeRepoUnguarded();
+    },
+    closeRepoUnguarded: () => {
       bumpEpochNow();
       startViewTransition(() =>
         set({
@@ -790,106 +885,205 @@ export const useUiStore = create<UiState>()((set, get) => {
       );
     },
     openPr: (target) => {
+      if (interceptSettingsLeave(() => get().openPr(target))) return;
       const epochAtRequest = bumpEpochNow();
-      startViewTransition(() => {
-        // Nothing lands once the caller says the request has lapsed: the patch below
-        // can apply in a later task, so its preconditions are re-checked here, not
-        // at request time. The caller gets this navigation's own epoch to compare
-        // against.
+      // Read at request time (repoViewMotion), so a warm-up hold can't move it.
+      const motion = repoViewMotion();
+      const land = () =>
+        startViewTransition(() => {
+          // Nothing lands once the caller says the request has lapsed: the patch below
+          // can apply in a later task, so its preconditions are re-checked here, not
+          // at request time. The caller gets this navigation's own epoch to compare
+          // against.
+          if (target.stillValid?.(epochAtRequest) === false) return;
+          // Before the set, inside this callback: react-query updates an
+          // observer's result synchronously, so the flush below renders the
+          // caller's write and this selection in one pass.
+          runBeforeSelect(target.beforeSelect);
+          const switchingRepo = get().repoPath !== target.repoPath;
+          set({
+            view: "repo",
+            previousView: "repo",
+            repoPath: target.repoPath,
+            repoName: target.repoName,
+            repoTab: "pulls",
+            // Switching repos clears the rest the way openRepo does; staying in
+            // the same repo keeps your other selections and just retargets the PR.
+            // The explicit PR keys come AFTER the spread so it can't null them.
+            ...(switchingRepo ? CROSS_REPO_RESET : {}),
+            selectedPr: { kind: target.kind, id: target.ref },
+            pendingPrSection: target.section,
+            // In THIS set, not a follow-up one: a second set() would be clobbered
+            // (see openCommit's note), and the reveal target must land with the
+            // selection it belongs to.
+            pendingReviewId: target.reviewId ?? null,
+            // The list's open/closed tab can't contain every PR a navigation opens —
+            // arm the align here, where the selection lands, and let the panel resolve
+            // the PR's real state.
+            pendingPrAlign: true,
+          });
+          target.onApplied?.();
+        }, motion);
+      // A cross-repo jump holds on the new repo's shell warm-up, as a picked
+      // open does, and yields to any newer open or navigation; a same-repo jump
+      // (or one made before a warm-up is registered) lands now, unchanged.
+      const warm =
+        get().repoPath !== target.repoPath
+          ? claimWarmRepoShell(target.repoPath)
+          : null;
+      if (!warm) {
+        land();
+        return;
+      }
+      holdNavigation(warm, () => {
+        // A jump its caller retired (`stillValid`) yields first, silently.
+        // Settings' guard can be registered during the hold without a bump, so
+        // re-check before leaving; the resume re-requests this jump. That bump
+        // is the epoch contract's one late bump, made only while Settings' guard
+        // is registered: a later action that snapshotted the epoch without
+        // bumping or claiming is dropped.
         if (target.stillValid?.(epochAtRequest) === false) return;
-        // Before the set, inside this callback: react-query updates an
-        // observer's result synchronously, so the flush below renders the
-        // caller's write and this selection in one pass.
-        runBeforeSelect(target.beforeSelect);
-        const switchingRepo = get().repoPath !== target.repoPath;
-        set({
-          view: "repo",
-          previousView: "repo",
-          repoPath: target.repoPath,
-          repoName: target.repoName,
-          repoTab: "pulls",
-          // Switching repos clears the rest the way openRepo does; staying in
-          // the same repo keeps your other selections and just retargets the PR.
-          // The explicit PR keys come AFTER the spread so it can't null them.
-          ...(switchingRepo ? CROSS_REPO_RESET : {}),
-          selectedPr: { kind: target.kind, id: target.ref },
-          pendingPrSection: target.section,
-          // In THIS set, not a follow-up one: a second set() would be clobbered
-          // (see openCommit's note), and the reveal target must land with the
-          // selection it belongs to.
-          pendingReviewId: target.reviewId ?? null,
-          // The list's open/closed tab can't contain every PR a navigation opens —
-          // arm the align here, where the selection lands, and let the panel resolve
-          // the PR's real state.
-          pendingPrAlign: true,
-        });
-      }, repoViewMotion());
+        if (interceptSettingsLeave(() => get().openPr(target))) return;
+        land();
+      });
     },
     openIssue: (target) => {
-      bumpEpochNow();
-      startViewTransition(() => {
-        runBeforeSelect(target.beforeSelect);
-        const switchingRepo = get().repoPath !== target.repoPath;
-        set({
-          view: "repo",
-          previousView: "repo",
-          repoPath: target.repoPath,
-          repoName: target.repoName,
-          repoTab: "issues",
-          // Switching repos clears the rest the way openRepo does; the issue
-          // comes AFTER the spread so the reset can't null the very selection
-          // this navigation is landing on.
-          ...(switchingRepo ? CROSS_REPO_RESET : {}),
-          selectedIssue: { kind: "remote", id: String(target.number) },
-        });
-      }, repoViewMotion());
+      if (interceptSettingsLeave(() => get().openIssue(target))) return;
+      const epochAtRequest = bumpEpochNow();
+      const motion = repoViewMotion();
+      const land = () =>
+        startViewTransition(() => {
+          if (target.stillValid?.(epochAtRequest) === false) return;
+          runBeforeSelect(target.beforeSelect);
+          const switchingRepo = get().repoPath !== target.repoPath;
+          set({
+            view: "repo",
+            previousView: "repo",
+            repoPath: target.repoPath,
+            repoName: target.repoName,
+            repoTab: "issues",
+            // Switching repos clears the rest the way openRepo does; the issue
+            // comes AFTER the spread so the reset can't null the very selection
+            // this navigation is landing on.
+            ...(switchingRepo ? CROSS_REPO_RESET : {}),
+            selectedIssue: { kind: "remote", id: String(target.number) },
+          });
+        }, motion);
+      // Held across repos like openPr, which carries the rationale.
+      const warm =
+        get().repoPath !== target.repoPath
+          ? claimWarmRepoShell(target.repoPath)
+          : null;
+      if (!warm) {
+        land();
+        return;
+      }
+      holdNavigation(warm, () => {
+        if (target.stillValid?.(epochAtRequest) === false) return;
+        if (interceptSettingsLeave(() => get().openIssue(target))) return;
+        land();
+      });
     },
     openRun: (target) => {
+      if (interceptSettingsLeave(() => get().openRun(target))) return;
       const epochAtRequest = bumpEpochNow();
-      startViewTransition(() => {
+      const motion = repoViewMotion();
+      const land = () =>
+        startViewTransition(() => {
+          if (target.stillValid?.(epochAtRequest) === false) return;
+          const switchingRepo = get().repoPath !== target.repoPath;
+          set({
+            view: "repo",
+            previousView: "repo",
+            repoPath: target.repoPath,
+            repoName: target.repoName,
+            repoTab: "actions",
+            ...(switchingRepo ? CROSS_REPO_RESET : {}),
+            // After the reset (which nulls it) so the run stays selected.
+            selectedRunId: target.runId,
+          });
+          target.onApplied?.();
+        }, motion);
+      // Held across repos like openPr, which carries the rationale.
+      const warm =
+        get().repoPath !== target.repoPath
+          ? claimWarmRepoShell(target.repoPath)
+          : null;
+      if (!warm) {
+        land();
+        return;
+      }
+      holdNavigation(warm, () => {
         if (target.stillValid?.(epochAtRequest) === false) return;
-        const switchingRepo = get().repoPath !== target.repoPath;
-        set({
-          view: "repo",
-          previousView: "repo",
-          repoPath: target.repoPath,
-          repoName: target.repoName,
-          repoTab: "actions",
-          ...(switchingRepo ? CROSS_REPO_RESET : {}),
-          // After the reset (which nulls it) so the run stays selected.
-          selectedRunId: target.runId,
-        });
-      }, repoViewMotion());
+        if (interceptSettingsLeave(() => get().openRun(target))) return;
+        land();
+      });
     },
     openAgentTab: (target) => {
+      if (interceptSettingsLeave(() => get().openAgentTab(target))) return;
       const epochAtRequest = bumpEpochNow();
-      startViewTransition(() => {
+      const motion = repoViewMotion();
+      const land = () =>
+        startViewTransition(() => {
+          if (target.stillValid?.(epochAtRequest) === false) return;
+          const switchingRepo = get().repoPath !== target.repoPath;
+          set({
+            view: "repo",
+            previousView: "repo",
+            repoPath: target.repoPath,
+            repoName: target.repoName,
+            repoTab: "agent",
+            ...(switchingRepo ? CROSS_REPO_RESET : {}),
+          });
+          target.onApplied?.();
+        }, motion);
+      // Held across repos like openPr, which carries the rationale.
+      const warm =
+        get().repoPath !== target.repoPath
+          ? claimWarmRepoShell(target.repoPath)
+          : null;
+      if (!warm) {
+        land();
+        return;
+      }
+      holdNavigation(warm, () => {
         if (target.stillValid?.(epochAtRequest) === false) return;
-        const switchingRepo = get().repoPath !== target.repoPath;
-        set({
-          view: "repo",
-          previousView: "repo",
-          repoPath: target.repoPath,
-          repoName: target.repoName,
-          repoTab: "agent",
-          ...(switchingRepo ? CROSS_REPO_RESET : {}),
-        });
-      }, repoViewMotion());
+        if (interceptSettingsLeave(() => get().openAgentTab(target))) return;
+        land();
+      });
     },
     openRepoView: (target) => {
+      if (interceptSettingsLeave(() => get().openRepoView(target))) return;
       const epochAtRequest = bumpEpochNow();
-      startViewTransition(() => {
+      const motion = repoViewMotion();
+      const land = () =>
+        startViewTransition(() => {
+          if (target.stillValid?.(epochAtRequest) === false) return;
+          const switchingRepo = get().repoPath !== target.repoPath;
+          set({
+            view: "repo",
+            previousView: "repo",
+            repoPath: target.repoPath,
+            repoName: target.repoName,
+            ...(target.tab ? { repoTab: target.tab } : {}),
+            ...(switchingRepo ? CROSS_REPO_RESET : {}),
+          });
+          target.onApplied?.();
+        }, motion);
+      // Held across repos like openPr, which carries the rationale.
+      const warm =
+        get().repoPath !== target.repoPath
+          ? claimWarmRepoShell(target.repoPath)
+          : null;
+      if (!warm) {
+        land();
+        return;
+      }
+      holdNavigation(warm, () => {
         if (target.stillValid?.(epochAtRequest) === false) return;
-        const switchingRepo = get().repoPath !== target.repoPath;
-        set({
-          view: "repo",
-          previousView: "repo",
-          repoPath: target.repoPath,
-          repoName: target.repoName,
-          ...(target.tab ? { repoTab: target.tab } : {}),
-          ...(switchingRepo ? CROSS_REPO_RESET : {}),
-        });
-      }, repoViewMotion());
+        if (interceptSettingsLeave(() => get().openRepoView(target))) return;
+        land();
+      });
     },
     setRepoTab: (tab) =>
       set((s) => ({ repoTab: tab, interactionEpoch: s.interactionEpoch + 1 })),
@@ -989,6 +1183,7 @@ export const useUiStore = create<UiState>()((set, get) => {
         selectedCommitHash: hash,
         interactionEpoch: s.interactionEpoch + 1,
       })),
+    clearSelectedCommit: () => set({ selectedCommitHash: null }),
     selectCompareCommit: (hash) =>
       set((s) => ({
         compareCommitHash: hash,
@@ -1042,6 +1237,7 @@ export const useUiStore = create<UiState>()((set, get) => {
       startViewTransition(() => set({ view: get().previousView }));
     },
     openHelp: () => {
+      if (interceptSettingsLeave(() => get().openHelp())) return;
       bumpEpochNow();
       startViewTransition(() => {
         const { view } = get();
@@ -1056,6 +1252,7 @@ export const useUiStore = create<UiState>()((set, get) => {
       startViewTransition(() => set({ view: get().previousView }));
     },
     openExplore: () => {
+      if (interceptSettingsLeave(() => get().openExplore())) return;
       bumpEpochNow();
       startViewTransition(() => {
         const { view } = get();
@@ -1070,6 +1267,7 @@ export const useUiStore = create<UiState>()((set, get) => {
       startViewTransition(() => set({ view: get().previousView }));
     },
     openMyWork: () => {
+      if (interceptSettingsLeave(() => get().openMyWork())) return;
       bumpEpochNow();
       startViewTransition(() => {
         const { view } = get();
@@ -1089,6 +1287,7 @@ export const useUiStore = create<UiState>()((set, get) => {
         interactionEpoch: s.interactionEpoch + 1,
       })),
     clearSelectedFile: () => set({ selectedFile: null }),
+    advanceSelectedFile: (file) => set({ selectedFile: file }),
     noteUserInteraction: () => {
       if (!inBeforeSelect) bumpEpochNow();
     },

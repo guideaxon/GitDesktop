@@ -21,6 +21,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  clampHighlight,
+  stepHighlight,
+} from "@/features/shortcuts/palette-highlight";
 import { copyText } from "@/lib/clipboard";
 import { suppressContextMenu } from "@/lib/context-menu";
 import { applyFrozenOrder, frozenPathKey } from "@/lib/frozen-order";
@@ -33,6 +37,7 @@ import {
 } from "@/lib/git/api";
 import { useRepoOwners } from "@/lib/git/queries";
 import { type ForgeProvider, providerLabel } from "@/lib/git/types";
+import { hasChordModifier } from "@/lib/hotkeys/binding";
 import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
 import {
   persistRepoVisibility,
@@ -108,8 +113,8 @@ function resolveProvider(
  * dialogs nested in here).
  *
  * Keyboard-first: the filter autofocuses; ArrowUp/Down move a highlight
- * through the visible rows and Enter opens the highlighted repo (or the
- * first match when filtering).
+ * through the visible rows and Enter opens the highlighted repo; while
+ * filtering, the first match starts highlighted.
  */
 export function RepoList({
   currentPath,
@@ -292,15 +297,21 @@ export function RepoList({
     ...recent,
     ...groupNames.flatMap((name) => groups.get(name) ?? []),
   ];
-  const highlightedPath = visible[highlight]?.path ?? null;
+  // -1 sentinel = no cursor yet (unarrowed since the last filter edit, or the
+  // list was empty). With a filter typed the first match is the cursor (Enter
+  // opens it, so it must be marked); with none, a stray Enter opens nothing.
+  const active =
+    !q && highlight < 0 ? -1 : clampHighlight(highlight, visible.length);
+  const highlightedPath = visible[active]?.path ?? null;
 
-  // Keep the keyboard highlight in view as it moves.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scrolls to whichever row carries the current highlight
+  // Keep the marked row in view, re-running when its index or its identity
+  // changes: filtering can move one without the other.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run per marked row and slot
   useEffect(() => {
     listRef.current
       ?.querySelector('[data-highlighted="true"]')
       ?.scrollIntoView({ block: "nearest" });
-  }, [highlight]);
+  }, [active, highlightedPath]);
 
   async function handleOpen(path: string) {
     setOpeningPath(path);
@@ -314,17 +325,26 @@ export function RepoList({
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
+    if (hasChordModifier(e)) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setHighlight((h) => Math.min(h + 1, visible.length - 1));
+      setHighlight(
+        active < 0
+          ? clampHighlight(0, visible.length)
+          : stepHighlight(active, visible.length, 1),
+      );
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setHighlight((h) => Math.max(h - 1, 0));
+      setHighlight(
+        active < 0
+          ? clampHighlight(0, visible.length)
+          : stepHighlight(active, visible.length, -1),
+      );
     } else if (e.key === "Enter") {
-      // Open the highlighted repo, or the first match of a typed filter.
-      // Plain Enter with no highlight and no filter does nothing, so an
+      // Open the marked row; while filtering the first match carries the
+      // cursor. With no filter and no arrowing nothing is marked, so an
       // accidental keypress never opens a repo.
-      const target = visible[highlight] ?? (q ? visible[0] : undefined);
+      const target = visible[active];
       if (target && !openingPath) handleOpen(target.path);
     }
   }

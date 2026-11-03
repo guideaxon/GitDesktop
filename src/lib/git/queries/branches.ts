@@ -1,21 +1,34 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { reloadLocalPrs } from "@/lib/pulls/local";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import { reloadReviewNotes } from "@/lib/review-notes/store";
 import { useUiStore } from "@/lib/stores/ui";
 import * as api from "../api";
+import type { BranchRewriteStatus } from "../types";
 import { repoKeys } from "./core";
 import { useRepoMutation } from "./internal";
 import { localPrWriteKey } from "./pr-writes";
+import { recheckListsLater } from "./push-writes";
 
-export function useBranches(repo: string) {
-  return useQuery({
+/** Shared by the hook and the shell warm-up, so the branch menu's local list is
+ *  cached before the menu first opens. */
+export function branchesOptions(repo: string) {
+  return {
     queryKey: repoKeys.branches(repo),
     queryFn: () => api.gitBranches(repo),
     // Local reads must not park on react-query's default "online" mode offline;
     // the same holds for every `networkMode` in this file.
-    networkMode: "always",
-  });
+    networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+export function useBranches(repo: string) {
+  return useQuery(branchesOptions(repo));
 }
 
 /** Shared by the hook and the shell warm-up, so the switcher's Remote group is
@@ -36,9 +49,9 @@ export function remoteBranchesOptions(repo: string) {
 export const REMOTE_BRANCHES_STALE_TIME = 30_000;
 
 /** Branches that exist on a remote (reflecting the last fetch), for the switcher's
- *  "Remote" group. `enabled` gates the fetch so it only runs while the menu is
- *  open: an enabled observer would re-run an O(remote refs) `for-each-ref` on
- *  every window focus and repo mutation. */
+ *  "Remote" group. Callers gate `enabled` on need (the menu while it is open, the
+ *  run gate while the branch has no upstream): an enabled observer re-runs an
+ *  O(remote refs) `for-each-ref` on each stale focus and repo mutation. */
 export function useRemoteBranches(repo: string, enabled = true) {
   return useQuery({
     ...remoteBranchesOptions(repo),
@@ -54,6 +67,7 @@ export function useCheckoutBranch(repo: string) {
     {
       // Local branch write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -66,6 +80,7 @@ export function useCheckoutRemoteBranch(repo: string) {
     {
       // Local branch write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -102,6 +117,7 @@ export function defaultBranchOptions(repo: string) {
     queryKey: ["repo", repo, "default-branch"] as const,
     queryFn: () => api.gitDefaultBranch(repo),
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -176,15 +192,29 @@ export function useDeleteBranch(repo: string) {
 }
 
 /** Deletes a branch on its remote (`git push <remote> --delete`). Invalidates
- *  the remote-branches list (the row disappears) and the local branches (their
- *  upstream may now be gone). */
+ *  the remote-branches list (the row disappears), the local branches (their
+ *  upstream may now be gone), and the PR rows across both lenses: GitHub closes a
+ *  PR whose head branch is deleted asynchronously, so those rows are re-read once
+ *  after a delay. The review-state map rides with the list (its co-invalidation
+ *  contract); the CI and mergeability maps re-key on the new rows. */
 export function useDeleteRemoteBranch(repo: string) {
+  const queryClient = useQueryClient();
+  const prListKeys = [
+    repoKeys.prList(repo),
+    repoKeys.prReviewState(repo),
+    ["repo", repo, "prs"],
+  ] as const;
   return useRepoMutation(
     repo,
     (args: { remote: string; name: string }) =>
       api.gitDeleteRemoteBranch(repo, args.remote, args.name),
     {
-      invalidate: [["repo", repo, "remote-branches"], repoKeys.branches(repo)],
+      invalidate: [
+        ["repo", repo, "remote-branches"],
+        repoKeys.branches(repo),
+        ...prListKeys,
+      ],
+      onSuccess: () => recheckListsLater(queryClient, repo, prListKeys),
     },
   );
 }
@@ -251,21 +281,34 @@ export function useRebaseOnto(repo: string) {
   );
 }
 
-/** Ahead/behind of every local branch vs `base`. Gated on `enabled` (it's N rev-list
- *  calls) and keyed under the repo so branch mutations invalidate it. */
+/** Ahead/behind of every local branch vs `base`. Gated on `enabled` (one
+ *  for-each-ref spawn on Git 2.41+, else one rev-list per branch) and keyed
+ *  under the repo so branch mutations invalidate it.
+ *
+ *  `staleTime` is per observer: the branch menu passes one so a reopen spawns
+ *  nothing, while CleanupBranchesDialog leaves it unset because its
+ *  ahead-0/behind>0 pre-check pre-selects rows for `git branch -D` and must
+ *  refetch on open. A window is safe because every in-app ref move made from
+ *  this checkout invalidates this key (scripts/divergence-invalidation.test.mjs
+ *  guards the writers that pass their own keys). Accepted residual: a move this
+ *  checkout didn't make that leaves its HEAD alone (terminal `branch -f`,
+ *  `push . x:y`, any write from a sibling worktree, in-app ones too) stays stale
+ *  up to the window, and Cleanup may paint it until its refetch. */
 export function useBranchDivergence(
   repo: string,
   base: string | null,
   enabled: boolean,
+  staleTime?: number,
 ) {
   return useQuery({
     queryKey: ["repo", repo, "divergence", base] as const,
     queryFn: () => api.gitBranchDivergence(repo, base ?? ""),
     enabled: enabled && Boolean(base),
-    // Local rev-list reads only. react-query's default "online" mode parks the
+    // Local git reads only. react-query's default "online" mode parks the
     // fetch whenever the OS reports no connection, and a parked query is neither
     // loading nor errored — consumers would silently render without divergence.
     networkMode: "always",
+    ...(staleTime === undefined ? {} : { staleTime }),
   });
 }
 
@@ -303,10 +346,10 @@ export function useUpdateBranchFrom(repo: string) {
  *
  * LAZY on purpose: `enabled` must stay false unless a surface is actually facing
  * a diverged branch, so the ordinary in-sync path spawns no git. Keyed under the
- * repo, so the whole-subtree invalidation every fetch/pull/push mutation already
- * runs refreshes it. Local rev-list reads only — `networkMode: "always"` keeps
- * an offline OS from parking the query into a permanent pending state, matching
- * {@link useBranchDivergence}.
+ * repo, so a push's whole-subtree invalidation and a fetch or pull's local-only
+ * one (this read is local) both refresh it. Local rev-list reads only —
+ * `networkMode: "always"` keeps an offline OS from parking the query into a
+ * permanent pending state, matching {@link useBranchDivergence}.
  */
 export function useBranchRewriteStatus(
   repo: string,
@@ -325,12 +368,24 @@ export function useBranchRewriteStatus(
  *  than a second spelling that can drift from it. */
 export function branchRewriteStatusOptions(repo: string, branch: string) {
   return {
-    queryKey: ["repo", repo, "rewrite-status", branch] as const,
+    queryKey: [...repoKeys.rewriteStatus(repo), branch] as const,
     queryFn: () => api.gitBranchRewriteStatus(repo, branch),
     staleTime: 30_000,
     networkMode: "always" as const,
   };
 }
+
+/** Whether a rewrite status proves the upstream already carries every local
+ *  commit, with both tips measured: the pair, never the reflog verdict alone,
+ *  is what may unlock a reset to the upstream (unique local work would be lost).
+ *  Every reset-to-upstream offer and confirm reads this one predicate. */
+export const carriesAllLocalCommits = (
+  d: BranchRewriteStatus | null | undefined,
+): d is BranchRewriteStatus & { upstreamTip: string; localTip: string } =>
+  d?.remoteRewritten === true &&
+  d.localOnly === 0 &&
+  Boolean(d.upstreamTip) &&
+  Boolean(d.localTip);
 
 /** Points a NON-current branch at its upstream's tip, refusing if that upstream
  *  moved away from `expectedTip`, or the branch away from `expectedLocalTip`,

@@ -36,30 +36,24 @@ import { toastError } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import {
   activeRepoOp,
+  bannerStatus,
   deriveStashBannerState,
+  OP_VERBS,
+  opInfoTone,
   opPhrase,
 } from "./conflict-banner-state";
+import {
+  STASH_DROP_GONE,
+  STASH_DROP_MOVED,
+  stashDropRestoreFailed,
+} from "./stash-drop-copy";
 
-const OP_LABELS: Record<
-  RepoOp,
-  { banner: string; cont: string; verb: string }
-> = {
-  merge: { banner: "Merge in progress", cont: "Finish merge", verb: "Merging" },
-  rebase: {
-    banner: "Rebase in progress",
-    cont: "Continue rebase",
-    verb: "Rebasing",
-  },
-  "cherry-pick": {
-    banner: "Cherry-pick in progress",
-    cont: "Continue cherry-pick",
-    verb: "Cherry-picking",
-  },
-  revert: {
-    banner: "Revert in progress",
-    cont: "Continue revert",
-    verb: "Reverting",
-  },
+/** The finish control's label, per op. */
+const OP_LABELS: Record<RepoOp, string> = {
+  merge: "Finish merge",
+  rebase: "Continue rebase",
+  "cherry-pick": "Continue cherry-pick",
+  revert: "Continue revert",
 };
 
 /** What Abort undoes, per op. A cherry-pick can be reached from "Cherry-pick to
@@ -117,7 +111,7 @@ const dialogClosed = () =>
   });
 
 function toastStashMoved() {
-  toast.info("The stash list changed — nothing was dropped.", {
+  toast.info(STASH_DROP_MOVED, {
     action: {
       label: "View stashes",
       onClick: (event) => {
@@ -131,7 +125,7 @@ function toastStashMoved() {
 }
 
 function toastStashGone() {
-  toast.info("The backup stash is already gone, so there was nothing to drop.");
+  toast.info(STASH_DROP_GONE.banner);
 }
 
 /** The conflicted tail with its branch name in mono, wrapping anywhere: a long
@@ -241,15 +235,19 @@ export function ConflictBanner({
 
   const busy = abortOp.isPending || continueOp.isPending;
   const onError = (e: unknown) => toastError(e);
-  const opVerb = op ? OP_LABELS[op].verb : null;
-  const conflictText =
-    conflictedCount > 0
-      ? `${conflictedCount} conflict${conflictedCount === 1 ? "" : "s"}`
-      : "all conflicts resolved";
+  const opVerb = op ? OP_VERBS[op] : null;
   // A rebase deliberately paused at an `edit` (not a conflict): the user amends
   // the commit via the Changes tab, then continues.
   const editPaused = Boolean(opState.data?.editPaused) && conflictedCount === 0;
-  const infoTone = editPaused || resolvedShown;
+  const bannerArgs = {
+    op,
+    conflictedCount,
+    editPaused,
+    rebaseStop: opState.data?.rebaseStop,
+    stash: state,
+  };
+  const status = bannerStatus(bannerArgs);
+  const infoTone = opInfoTone(bannerArgs);
 
   // Awaited rather than per-call callbacks: this banner unmounts the moment the
   // op ends (and rides an <Activity>-hidden tab), and react-query drops per-call
@@ -353,21 +351,21 @@ export function ConflictBanner({
         toastStashGone();
         break;
       case "restoreFailed":
-        toast.error(
-          `The stash list changed — a different stash (${outcome.droppedSha.slice(0, 7)}) was dropped and couldn't be restored. Recover it under View stashes → Recoverable.`,
-          {
-            // The only place the lost entry's sha appears: it stays until closed.
-            duration: Infinity,
-            action: {
-              label: "Recover",
-              onClick: (event) => {
-                event.currentTarget.blur();
-                dispatchAction("recover-lost-work");
-              },
+        toast.error(stashDropRestoreFailed(outcome.droppedSha), {
+          // The only place the lost entry's sha appears: it stays until closed.
+          duration: Infinity,
+          action: {
+            label: "Recover",
+            onClick: (event) => {
+              event.currentTarget.blur();
+              dispatchAction("recover-lost-work");
             },
           },
-        );
+        });
         break;
+      default:
+        // No return: an unknown kind still runs the retire-and-rescue tail.
+        outcome satisfies never;
     }
     // Every verdict retires this offer: a refusal would only refuse again. The
     // clear waits out the confirm's exit so Base UI returns focus to a mounted
@@ -409,22 +407,15 @@ export function ConflictBanner({
               <WarningIcon className="mt-0.5 size-3.5 shrink-0" />
             )}
             <span className="min-w-0 text-pretty">
-              {editPaused ? (
-                "Rebase paused — amend this commit's changes in Changes, then Continue"
-              ) : opVerb ? (
-                `${opVerb} · ${conflictText}`
-              ) : markerRows ? (
+              {status.kind === "text" ? (
+                status.text
+              ) : (
                 <>
-                  {state.lead}
+                  {status.lead}
                   <span id={tailId} className="block text-muted-foreground">
-                    <ReapplyTail text={state.tail} detail={marker?.detail} />
+                    <ReapplyTail text={status.tail} detail={marker?.detail} />
                   </span>
                 </>
-              ) : (
-                // No operation to continue or abort (a conflicted stash pop
-                // leaves unmerged paths and nothing else), so the banner has to
-                // say where the resolution happens.
-                `${conflictText} — resolve ${conflictedCount === 1 ? "it" : "them"} in the changes list.`
               )}
             </span>
           </span>
@@ -498,13 +489,13 @@ export function ConflictBanner({
                   onClick={() => void doContinue(op)}
                 >
                   {continueOp.isPending && <Spinner data-icon="inline-start" />}
-                  {OP_LABELS[op].cont}
+                  {OP_LABELS[op]}
                 </DisabledReasonButton>
 
                 <Dialog open={confirmAbort} onOpenChange={setConfirmAbort}>
                   <DialogContent>
                     <DialogHeader>
-                      <DialogTitle>
+                      <DialogTitle className="pr-8">
                         {editPaused
                           ? "Abort editing history?"
                           : `Abort the ${op}?`}

@@ -68,6 +68,17 @@ pub struct BranchHead {
     /// Whether `upstream_branch` is the upstream remote's default branch (its
     /// `refs/remotes/<R>/HEAD`). Only probed while `push_name_mismatch`; None = unknown.
     pub upstream_is_remote_default: Option<bool>,
+    /// The remote a BARE push of this branch lands on: `%(push…)` read with the push
+    /// config where that changes the answer (matching, triangular `simple`), so a
+    /// git without the atoms may still carry a config-derived destination. None when
+    /// unresolvable (a push remote with its own push refspecs or `remote.<r>.mirror`
+    /// set among them: git's bare push runs as configured) or there is no upstream (the
+    /// read only runs beside one). A destination that is the branch's own same-named
+    /// live upstream reads no config, so it stays Some even on a mirror remote.
+    pub push_remote: Option<String>,
+    /// The branch a bare push creates or updates on `push_remote`. Both Some or both
+    /// None.
+    pub push_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +153,11 @@ pub struct FileDiff {
     /// `text` is a lossy decode and must never be handed back to `git apply`.
     /// Computed only by `git_diff_file`; every other producer sets false.
     pub undecodable: bool,
+    /// The path the shown diff pairs this file FROM, when that differs from
+    /// `file_path` (the surface's own rename detection paired them). Old-side
+    /// whole-file reads use it; `file_path` still echoes the requested path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +197,16 @@ pub struct CommitSummary {
     pub tags: Vec<String>,
     /// More than one parent — history rewriting must not cross it.
     pub is_merge: bool,
+}
+
+/// One file-history entry: the commit plus the file's path as of that commit
+/// (the new-side name there), so diffs across a rename read the right blob.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLogEntry {
+    #[serde(flatten)]
+    pub commit: CommitSummary,
+    pub path: String,
 }
 
 /// One git tag, for the Tags list.
@@ -271,6 +297,9 @@ pub struct RewriteStep {
 #[serde(rename_all = "camelCase")]
 pub struct StashEntry {
     pub index: u32,
+    /// The stash commit's id: the stable identity. `index` is its current slot,
+    /// which shifts as stashes are pushed and dropped.
+    pub sha: String,
     pub message: String,
     pub date: String,
 }
@@ -308,6 +337,23 @@ pub struct SubmoduleRemoveOutcome {
     pub module_data_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebaseStop {
+    /// A completed edit pick with an `amend` marker, ready for amendment.
+    Edit,
+    /// Pick/reword/squash/fixup or an edit without an `amend` marker, e.g. a
+    /// conflict stop, an emptied commit, or a rescheduled pick.
+    Pick,
+    /// An exec instruction.
+    Exec,
+    /// A break instruction.
+    Break,
+    /// The apply backend (`rebase --apply` or `git am`, no done file), or
+    /// unreadable or unrecognized state, never a guessed kind.
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoOpState {
@@ -318,13 +364,17 @@ pub struct RepoOpState {
     /// An interactive rebase is paused at an `edit` (vs a conflict) — the user
     /// should amend the commit, then continue.
     pub edit_paused: bool,
+    /// Why an in-progress rebase is stopped, from the last line of
+    /// `rebase-merge/done` (git appends the in-flight item before running it).
+    /// `None` when `rebasing` is false.
+    pub rebase_stop: Option<RebaseStop>,
 }
 
 impl RepoOpState {
     /// Whether a multi-step operation is mid-flight — the single home of the flag
     /// list, so a gate can't drift by re-listing the fields and missing one.
-    /// `edit_paused` is excluded: it qualifies `rebasing` rather than standing on
-    /// its own.
+    /// `edit_paused` and `rebase_stop` are excluded: they qualify `rebasing`
+    /// rather than standing on their own as flags.
     pub fn mid_op(&self) -> bool {
         self.merging || self.rebasing || self.cherry_picking || self.reverting
     }

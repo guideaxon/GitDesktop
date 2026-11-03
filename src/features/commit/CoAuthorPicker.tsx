@@ -1,9 +1,14 @@
 import { Popover } from "@base-ui/react/popover";
 import { UsersIcon, XIcon } from "@phosphor-icons/react";
 import { useState } from "react";
+import { useConfirmSwapFocus } from "@/components/confirm-swap-focus";
 import { usePanelPortalContainer } from "@/components/panel-portal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  clampHighlight,
+  stepHighlight,
+} from "@/features/shortcuts/palette-highlight";
 import { parseCoAuthorInput } from "@/lib/git/co-authors";
 import { useCommitAuthors, useUserIdentity } from "@/lib/git/queries";
 import type { CommitAuthor } from "@/lib/git/types";
@@ -31,6 +36,8 @@ export function CoAuthorPicker({
   // stays in the input, ↑/↓ move a highlight, Enter adds the highlighted one).
   const [activeIndex, setActiveIndex] = useState(0);
   const portalContainer = usePanelPortalContainer();
+  // A removed chip hands focus to the trigger: a chip's only control is its X.
+  const swapFocus = useConfirmSwapFocus();
 
   // The commit author is already credited — never offer them as a co-author.
   const selfEmail = identity.data?.email.toLowerCase() || null;
@@ -57,7 +64,7 @@ export function CoAuthorPicker({
 
   // The keyboard list = an optional "add typed entry" row, then the matches.
   const optionCount = (canAddTyped ? 1 : 0) + suggestions.length;
-  const active = optionCount > 0 ? Math.min(activeIndex, optionCount - 1) : 0;
+  const active = clampHighlight(activeIndex, optionCount);
 
   function add(author: CommitAuthor) {
     onChange([...value, author]);
@@ -83,22 +90,25 @@ export function CoAuthorPicker({
   function onInputKeyDown(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIndex(Math.min(active + 1, optionCount - 1));
+      setActiveIndex(stepHighlight(activeIndex, optionCount, 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActiveIndex(Math.max(active - 1, 0));
+      setActiveIndex(stepHighlight(activeIndex, optionCount, -1));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      addAt(active);
+      // A held Enter (one that landed focus on the trigger and reopened this)
+      // must not add a co-author per repeat.
+      if (!e.repeat) addAt(active);
     }
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
+    <div data-confirm-section className="flex flex-wrap items-center gap-1.5">
       <Popover.Root>
         <Popover.Trigger
           render={
             <Button
+              data-confirm-fallback
               variant="ghost"
               size="sm"
               disabled={disabled}
@@ -212,6 +222,7 @@ export function CoAuthorPicker({
         >
           {a.name}
           <button
+            ref={swapFocus(a.email)}
             type="button"
             aria-label={`Remove co-author ${a.name}`}
             className="text-muted-foreground hover:text-foreground"

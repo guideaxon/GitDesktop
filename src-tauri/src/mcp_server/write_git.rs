@@ -16,10 +16,11 @@
 //! `.git/index.lock`. User-supplied branch/rev/path strings go through
 //! [`ensure_not_flag`] before reaching git argv, and the branch-TARGETING tools —
 //! create_branch (name), checkout_branch, rename_branch (from AND to), push (branch),
-//! delete_branch, delete_remote_branch — additionally refuse `gd/session/*`: mutating or
-//! publishing one breaks session Resume, and creating or renaming INTO that namespace
-//! yields an invisible (UI-filtered) branch. (merge_branch / rebase_branch take a branch
-//! name but only READ it, so they carry no such guard.)
+//! delete_branch, delete_remote_branch — refuse `gd/session/*` in any letter case
+//! to protect Resume. Lowercase `gd/session/` names are hidden from every branch
+//! list; other casing shares real session branches' loose-ref folder on
+//! case-insensitive filesystems. merge_branch / rebase_branch only READ branch
+//! names, so they carry no such guard.
 //!
 //! The tools that move HEAD, a branch, or the stash list also take the promote gate
 //! (`git::promote_marker`), mirroring the set the GUI's `promotionBlocksCheckout`
@@ -35,51 +36,135 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 
-use super::{app_err, ensure_not_flag, json_result, GitDesktopMcp, SESSION_BRANCH_PREFIX};
+use super::{app_err, ensure_not_flag, json_result, GitDesktopMcp};
 use crate::error::AppError;
 use crate::git::pull_guard::{DroppedCommit, WouldDrop};
 use crate::git::remote::PushGuard;
 
-/// Refuses a branch name that names a GitDesktop agent-session branch, with an
-/// actionable error. Pure string logic (no repo access) so it's unit-testable.
+/// Delegates to the shared case-insensitive session-branch guard before repo access.
 fn ensure_not_session_branch(name: &str) -> Result<(), McpError> {
-    if name.starts_with(SESSION_BRANCH_PREFIX) {
-        return Err(McpError::invalid_params(
-            format!(
-                "\"{name}\" is a GitDesktop agent-session branch; refusing to operate on it \
-                 (breaks session Resume)."
-            ),
-            None,
-        ));
-    }
-    Ok(())
+    crate::git::branches::refuse_session_branch_name(name)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
 /// Rewords a push refused for an upstream name mismatch with this tool's own remedy in
 /// place of the GUI's Push-menu one; every other error passes through untouched.
-fn with_mcp_remedy(e: AppError, remedy: fn(&str, &str) -> String) -> AppError {
+/// The remedy names the branch's push remote when one passes `pick_push_remote`'s gates.
+/// A caller-named remote suppresses push-remote advice: git's explicit repository
+/// argument outranks pushRemote and pushDefault.
+async fn with_mcp_remedy(
+    repo: &str,
+    e: AppError,
+    requested_remote: Option<&str>,
+    remedy: fn(&str, &str, Option<&str>) -> String,
+) -> AppError {
     match e {
         AppError::PushUpstreamNameMismatch {
             branch,
             remote,
             remote_branch,
-        } => AppError::Command(format!(
-            "Push blocked — {branch} tracks {remote}/{remote_branch}, which has a different name. {}",
-            remedy(&branch, &remote)
-        )),
+        } => {
+            let push_remote = if requested_remote.is_some() {
+                None
+            } else {
+                differing_push_remote(repo, &branch, &remote).await
+            };
+            AppError::Command(format!(
+                "Push blocked — {branch} tracks {remote}/{remote_branch}, which has a different name. {}",
+                remedy(&branch, &remote, push_remote.as_deref())
+            ))
+        }
         other => other,
     }
 }
 
-/// `push`'s way out: a named publish, which goes to the upstream's OWN remote.
-fn push_remedy(branch: &str, remote: &str) -> String {
+/// pushRemote outranks pushDefault, as in git/status.rs's bare_push_would_be_refused: a set
+/// pushRemote decides alone, so an unusable one gives None rather than falling to pushDefault.
+/// Only an exactly listed, retry-valid remote different from the tracked one is advice.
+fn pick_push_remote<'a>(
+    branch_push_remote: Option<&'a str>,
+    remote_push_default: Option<&'a str>,
+    remotes: &[String],
+    tracked: &str,
+) -> Option<&'a str> {
+    branch_push_remote
+        .or(remote_push_default)
+        .filter(|candidate| {
+            *candidate != tracked
+                && remotes.iter().any(|remote| remote == *candidate)
+                && crate::git::branches::validate_ref_name(candidate).is_ok()
+        })
+}
+
+/// A read that fails, as opposed to finding its key unset, aborts the whole lookup to None:
+/// falling through to remote.pushDefault would name a remote git doesn't push to.
+async fn differing_push_remote(repo: &str, branch: &str, tracked: &str) -> Option<String> {
+    async fn read_config(repo: &str, key: &str) -> Result<Option<String>, ()> {
+        let out = crate::git::runner::run_git_raw(
+            Some(repo),
+            &["config", "--get", key],
+            crate::git::runner::DEFAULT_TIMEOUT,
+        )
+        .await
+        .map_err(|_| ())?;
+        match out.code {
+            0 => {
+                let value = out.stdout_lossy();
+                Ok(Some(value.strip_suffix('\n').unwrap_or(&value).to_string()))
+            }
+            1 => Ok(None),
+            _ => Err(()),
+        }
+    }
+
+    let branch_push_remote = read_config(repo, &format!("branch.{branch}.pushRemote"))
+        .await
+        .ok()?;
+    let remote_push_default = if branch_push_remote.is_none() {
+        read_config(repo, "remote.pushDefault").await.ok()?
+    } else {
+        None
+    };
+    let candidate = branch_push_remote
+        .as_deref()
+        .or(remote_push_default.as_deref())?;
+    if candidate == tracked {
+        return None;
+    }
+    let remotes = crate::git::remote::git_remotes(repo.to_string())
+        .await
+        .ok()?;
+    pick_push_remote(
+        branch_push_remote.as_deref(),
+        remote_push_default.as_deref(),
+        &remotes,
+        tracked,
+    )
+    .map(str::to_string)
+}
+
+fn push_remedy(branch: &str, remote: &str, push_remote: Option<&str>) -> String {
+    if let Some(push_remote) = push_remote {
+        return format!(
+            "Retry with branch: \"{branch}\" and remote: \"{push_remote}\" to push it to \
+             {push_remote}/{branch} and leave its upstream as it is, or push from GitDesktop \
+             to choose the destination."
+        );
+    }
     format!(
         "Retry with branch: \"{branch}\" and set_upstream: true to publish it as \
          {remote}/{branch} and track that, or push from GitDesktop to choose the destination."
     )
 }
 
-fn force_push_remedy(branch: &str, remote: &str) -> String {
+fn force_push_remedy(branch: &str, remote: &str, push_remote: Option<&str>) -> String {
+    if let Some(push_remote) = push_remote {
+        return format!(
+            "Force push isn't available while the names differ. Retry with the push tool \
+             (branch: \"{branch}\", remote: \"{push_remote}\") to push it to {push_remote}/{branch} \
+             and leave its upstream as it is, or push from GitDesktop to choose the destination."
+        );
+    }
     format!(
         "Force push isn't available while the names differ. Retry with the push tool \
          (branch: \"{branch}\", set_upstream: true) to publish it as {remote}/{branch} and \
@@ -113,6 +198,8 @@ fn ok_text(msg: impl Into<String>) -> Result<CallToolResult, McpError> {
 struct StagePathsArgs {
     /// Repo-relative paths to stage (or unstage). Files and directories are
     /// matched exactly. Set `literal: false` to pass git pathspecs/globs instead.
+    /// Both resolve from the repository root, as `repo_status` lists them, even
+    /// when the server was started in a subfolder.
     paths: Vec<String>,
     /// Whether each entry names one exact file or directory (the default). Set
     /// false only to pass a git pathspec or glob such as `*.log`.
@@ -313,10 +400,10 @@ fn ensure_expected_drop_shas(shas: Option<Vec<String>>) -> Result<Vec<String>, M
         // Non-hex is refused here rather than left to the comparison, where it could
         // only ever miss — and a miss reports that the UPSTREAM moved, blaming the
         // wrong thing for what is a malformed argument.
-        if !(4..=40).contains(&sha.len()) || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !(4..=64).contains(&sha.len()) || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(McpError::invalid_params(
                 format!(
-                    "expectedDropShas entry {sha:?} is not a commit sha (4 to 40 hex characters)"
+                    "expectedDropShas entry {sha:?} is not a commit sha (4 to 64 hex characters)"
                 ),
                 None,
             ));
@@ -443,6 +530,8 @@ struct StashPushArgs {
     /// (including untracked). With `paths`, only those files are stashed; every other
     /// file's staged and unstaged changes are left exactly as they were. Files and
     /// directories are matched exactly; set `literal: false` to pass a pathspec/glob.
+    /// Both resolve from the repository root, as `repo_status` lists them, even
+    /// when the server was started in a subfolder.
     #[serde(default)]
     paths: Vec<String>,
     /// Whether each entry names one exact file or directory (the default). Set
@@ -459,9 +548,9 @@ struct StashApplyArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct StashIndexArgs {
-    /// Which stash, by index (0 = most recent; see list_stashes).
-    index: u32,
+struct StashShaArgs {
+    /// The stash's commit sha, exactly as `list_stashes` returns it (`sha`).
+    sha: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -534,8 +623,11 @@ struct PreviewMergeArgs {
 struct DiscardPathArg {
     /// Repo-relative path to discard.
     path: String,
-    /// Whether this path is untracked (a new file). Untracked files go to the OS
-    /// recycle bin; tracked files are restored from the index. Defaults to false.
+    /// Whether this path is a new (untracked) file. The server checks every path's flag
+    /// against git status and refuses the whole request on any mismatch. Matching flagged
+    /// paths go to the OS recycle bin, or are deleted outright when Windows reserves the
+    /// name (such as nul or com3); matching unflagged paths are restored from the index.
+    /// Defaults to false.
     #[serde(default)]
     untracked: bool,
 }
@@ -575,6 +667,8 @@ impl GitDesktopMcp {
     #[tool(
         description = "Stage files (git add) in the bound repository. Repo-relative paths and \
                        directories match exactly; set literal=false to pass a pathspec or glob. \
+                       Paths and literal=false patterns resolve from the repository root, as \
+                       repo_status lists them, even when the server was started in a subfolder. \
                        Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -586,8 +680,9 @@ impl GitDesktopMcp {
         for p in &args.paths {
             ensure_not_flag(p, "path")?;
         }
+        let top = self.toplevel().await.map_err(app_err)?.to_string();
         let paths = literal_pathspecs(args.paths, args.literal);
-        crate::git::stage::git_stage_core(&self.state, self.repo.clone(), paths)
+        crate::git::stage::git_stage_core(&self.state, top, paths)
             .await
             .map_err(app_err)?;
         ok_text("staged")
@@ -596,8 +691,10 @@ impl GitDesktopMcp {
     #[tool(
         description = "Unstage files (restore from the index; drop from the index in an empty \
                        repo) in the bound repository. Repo-relative paths and directories match \
-                       exactly; set literal=false to pass a pathspec or glob. Requires \
-                       --allow-git-write.",
+                       exactly; set literal=false to pass a pathspec or glob. \
+                       Paths and literal=false patterns resolve from the repository root, as \
+                       repo_status lists them, even when the server was started in a subfolder. \
+                       Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn unstage_files(
@@ -608,8 +705,9 @@ impl GitDesktopMcp {
         for p in &args.paths {
             ensure_not_flag(p, "path")?;
         }
+        let top = self.toplevel().await.map_err(app_err)?.to_string();
         let paths = literal_pathspecs(args.paths, args.literal);
-        crate::git::stage::git_unstage_core(&self.state, self.repo.clone(), paths)
+        crate::git::stage::git_unstage_core(&self.state, top, paths)
             .await
             .map_err(app_err)?;
         ok_text("unstaged")
@@ -705,7 +803,7 @@ impl GitDesktopMcp {
                        starting from a given branch/tag/commit (defaults to HEAD), optionally with \
                        no upstream (noTrack — recommended when starting a new branch from a \
                        remote-tracking ref). Refuses to create a GitDesktop agent-session branch \
-                       (gd/session/*). Requires --allow-git-write.",
+                       (gd/session/*, in any letter case). Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn create_branch(
@@ -740,7 +838,7 @@ impl GitDesktopMcp {
 
     #[tool(
         description = "Check out (switch to) an existing local branch in the bound repository. \
-                       Refuses GitDesktop agent-session branches (gd/session/*). \
+                       Refuses GitDesktop agent-session branches (gd/session/*, in any letter case). \
                        Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -764,8 +862,8 @@ impl GitDesktopMcp {
 
     #[tool(
         description = "Rename a branch in the bound repository. Refuses to rename a GitDesktop \
-                       agent-session branch (gd/session/*), or to rename INTO that namespace. \
-                       Requires --allow-git-write.",
+                       agent-session branch (gd/session/*, in any letter case), or to rename INTO \
+                       that namespace. Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn rename_branch(
@@ -801,7 +899,9 @@ impl GitDesktopMcp {
                        on that remote has a different name is refused; \
                        set_upstream: true publishes it under its own \
                        name instead. Uses git's native credential flow. Never force-pushes — use \
-                       force_push (destructive) for that. Requires --allow-git-write.",
+                       force_push (destructive) for that. When `branch` is given, refuses a \
+                       GitDesktop agent-session branch (gd/session/*, in any letter case). \
+                       Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn push(
@@ -817,7 +917,7 @@ impl GitDesktopMcp {
         if let Some(r) = &args.remote {
             ensure_not_flag(r, "remote")?;
         }
-        crate::git::remote::git_push_same_name_core(
+        if let Err(e) = crate::git::remote::git_push_same_name_core(
             &self.state,
             self.repo.clone(),
             args.set_upstream,
@@ -825,7 +925,11 @@ impl GitDesktopMcp {
             args.remote.clone(),
         )
         .await
-        .map_err(|e| app_err(with_mcp_remedy(e, push_remedy)))?;
+        {
+            return Err(app_err(
+                with_mcp_remedy(&self.repo, e, args.remote.as_deref(), push_remedy).await,
+            ));
+        }
         ok_text("pushed")
     }
 
@@ -935,7 +1039,9 @@ impl GitDesktopMcp {
                        directories match exactly, set literal=false to pass a pathspec or glob. \
                        Refused while conflicts are unresolved, or while a merge, rebase, \
                        cherry-pick or revert is in progress (finish or abort it first — \
-                       retrying won't help). Requires --allow-git-write.",
+                       retrying won't help). Paths and literal=false patterns resolve from the \
+                       repository root, as repo_status lists them, even when the server was \
+                       started in a subfolder. Requires --allow-git-write.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn stash_push(
@@ -947,20 +1053,17 @@ impl GitDesktopMcp {
             ensure_not_flag(p, "path")?;
         }
         let _promote = self.promote_gate().await?;
+        let top = self.toplevel().await.map_err(app_err)?.to_string();
         if args.paths.is_empty() {
-            crate::git::ops::git_stash_all_core(&self.state, self.repo.clone())
+            crate::git::ops::git_stash_all_core(&self.state, top)
                 .await
                 .map_err(app_err)?;
             ok_text("stashed all changes")
         } else {
             let paths = literal_pathspecs(args.paths, args.literal);
-            let stashed = crate::git::ops::git_stash_paths_core(
-                &self.state,
-                self.repo.clone(),
-                paths,
-            )
-            .await
-            .map_err(app_err)?;
+            let stashed = crate::git::ops::git_stash_paths_core(&self.state, top, paths)
+                .await
+                .map_err(app_err)?;
             if stashed {
                 ok_text("stashed selected paths")
             } else {
@@ -977,7 +1080,8 @@ impl GitDesktopMcp {
     async fn stash_pop(&self) -> Result<CallToolResult, McpError> {
         self.ensure_git_write()?;
         let _promote = self.promote_gate().await?;
-        crate::git::ops::git_stash_pop_core(&self.state, self.repo.clone())
+        let top = self.toplevel().await.map_err(app_err)?.to_string();
+        crate::git::ops::git_stash_pop_core(&self.state, top)
             .await
             .map_err(app_err)?;
         ok_text("stash popped")
@@ -994,7 +1098,8 @@ impl GitDesktopMcp {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_git_write()?;
         let _promote = self.promote_gate().await?;
-        crate::git::ops::git_stash_apply_core(&self.state, self.repo.clone(), args.index, false)
+        let top = self.toplevel().await.map_err(app_err)?.to_string();
+        crate::git::ops::git_stash_apply_core(&self.state, top, args.index, false)
             .await
             .map_err(app_err)?;
         ok_text(format!("stash@{{{}}} applied", args.index))
@@ -1075,7 +1180,8 @@ impl GitDesktopMcp {
     #[tool(
         description = "Cherry-pick a commit by SHA onto the current branch in the bound \
                        repository. Returns whether a commit was created (a pick that is already \
-                       present is skipped and returns false). A merge commit needs `mainline`: \
+                       present is skipped and returns false; a skip that itself fails returns \
+                       an error). A merge commit needs `mainline`: \
                        the 1-based parent its changes are taken relative to (git's `-m`; 1 is \
                        the usual choice). Without it git refuses a merge. Requires \
                        --allow-git-write.",
@@ -1136,9 +1242,11 @@ impl GitDesktopMcp {
     // ---- UNGATED READS (git-ops domain; no gate, no write annotations) ---
 
     #[tool(
-        description = "List the stash entries in the bound repository (index, message, date), \
-                       most recent first. The index is what stash_apply/stash_pop/drop_stash \
-                       address."
+        description = "List the stash entries in the bound repository (index, sha, message, \
+                       date), most recent first. The index is what stash_apply addresses \
+                       (stash_pop takes none and pops the most recent); it shifts as stashes \
+                       are pushed and dropped. The sha is the stash's stable identity and what \
+                       drop_stash takes."
     )]
     async fn list_stashes(&self) -> Result<CallToolResult, McpError> {
         let stashes = crate::git::ops::git_stash_list(self.repo.clone())
@@ -1175,8 +1283,8 @@ impl GitDesktopMcp {
     #[tool(
         description = "Force-delete a local branch (git branch -D) in the bound repository — \
                        UNMERGED commits on it are irrecoverably lost. Refuses to delete a \
-                       GitDesktop agent-session branch (gd/session/*). Requires --allow-git-write \
-                       AND --allow-destructive.",
+                       GitDesktop agent-session branch (gd/session/*, in any letter case). \
+                       Requires --allow-git-write AND --allow-destructive.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn delete_branch(
@@ -1271,9 +1379,19 @@ impl GitDesktopMcp {
     )]
     async fn force_push(&self) -> Result<CallToolResult, McpError> {
         self.ensure_destructive()?;
-        let guard = crate::git::remote::git_force_push_head_core(&self.state, self.repo.clone())
-            .await
-            .map_err(|e| app_err(with_mcp_remedy(e, force_push_remedy)))?;
+        let guard = match crate::git::remote::git_force_push_head_core(
+            &self.state,
+            self.repo.clone(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Err(app_err(
+                    with_mcp_remedy(&self.repo, e, None, force_push_remedy).await,
+                ));
+            }
+        };
         // The tool's result text names the guarantee the push ACTUALLY ran under —
         // a static "with lease + if-includes" overclaims on either fallback.
         ok_text(match guard {
@@ -1291,8 +1409,8 @@ impl GitDesktopMcp {
     #[tool(
         description = "Delete a branch on a remote (git push <remote> --delete) in the bound \
                        repository. The remote branch is removed. Refuses a GitDesktop \
-                       agent-session branch (gd/session/*). Requires --allow-git-write AND \
-                       --allow-destructive.",
+                       agent-session branch (gd/session/*, in any letter case). \
+                       Requires --allow-git-write AND --allow-destructive.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn delete_remote_branch(
@@ -1318,21 +1436,55 @@ impl GitDesktopMcp {
     }
 
     #[tool(
-        description = "Drop a stash by index (0 = most recent; see list_stashes) in the bound \
-                       repository — the stashed changes are LOST. Requires --allow-git-write AND \
-                       --allow-destructive.",
+        description = "Drop the stash with this commit sha (see list_stashes' `sha`) wherever \
+                       it sits in the stack, in the bound repository — the stashed changes are \
+                       LOST. Refuses, dropping nothing, when no stash has that sha or when the \
+                       stash list shifted under the drop. If a racing stash write made the drop \
+                       remove a different stash that could not be stored back, the error names \
+                       that stash's sha. Requires --allow-git-write AND --allow-destructive.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn drop_stash(
         &self,
-        Parameters(args): Parameters<StashIndexArgs>,
+        Parameters(args): Parameters<StashShaArgs>,
     ) -> Result<CallToolResult, McpError> {
+        use crate::git::autostash::StashDropOutcome;
         self.ensure_destructive()?;
         let _promote = self.promote_gate().await?;
-        crate::git::ops::git_stash_drop_core(&self.state, self.repo.clone(), args.index)
-            .await
-            .map_err(app_err)?;
-        ok_text(format!("stash@{{{}}} dropped", args.index))
+        let outcome = crate::git::autostash::git_drop_stash_by_sha_core(
+            &self.state,
+            self.repo.clone(),
+            args.sha.clone(),
+            true,
+        )
+        .await
+        .map_err(app_err)?;
+        match outcome {
+            StashDropOutcome::Dropped => ok_text(format!("stash dropped: {}", args.sha)),
+            StashDropOutcome::Gone => Err(McpError::invalid_request(
+                format!(
+                    "No stash with sha {} exists; it may already be dropped. Run list_stashes \
+                     for the current entries.",
+                    args.sha
+                ),
+                None,
+            )),
+            StashDropOutcome::Moved => Err(McpError::invalid_request(
+                "The stash list changed while dropping: nothing was dropped, and slots have \
+                 shifted (if the drop took a different stash, it was stored back at \
+                 stash@{0}). Re-run list_stashes and retry by sha.",
+                None,
+            )),
+            StashDropOutcome::RestoreFailed { dropped_sha } => Err(McpError::invalid_request(
+                format!(
+                    "A concurrent stash operation raced this drop: a different stash \
+                     ({dropped_sha}) was dropped and could not be restored. Recover it with \
+                     `git stash store {dropped_sha}` or under GitDesktop's View stashes → \
+                     Recoverable."
+                ),
+                None,
+            )),
+        }
     }
 
     #[tool(
@@ -1382,22 +1534,114 @@ mod tests {
         assert_eq!(literal_pathspecs(paths(), false), paths());
     }
 
+    #[test]
+    fn pick_push_remote_obeys_precedence_and_retry_validation() {
+        let remotes = vec!["parent".into(), "mine".into()];
+        for branch in [None, Some("mine"), Some("parent"), Some("gone"), Some("")] {
+            for default in [None, Some("mine"), Some("parent"), Some("gone")] {
+                let expected = match branch {
+                    Some("mine") => Some("mine"),
+                    None if default == Some("mine") => Some("mine"),
+                    _ => None,
+                };
+                assert_eq!(
+                    pick_push_remote(branch, default, &remotes, "parent"),
+                    expected,
+                    "pushRemote={branch:?}, pushDefault={default:?}"
+                );
+            }
+        }
+        for candidate in ["Mine", "git@host:o/r.git"] {
+            assert_eq!(
+                pick_push_remote(Some(candidate), None, &remotes, "parent"),
+                None
+            );
+        }
+        let remotes = vec![
+            "parent".into(),
+            "mine".into(),
+            "-fork".into(),
+            "we ird".into(),
+        ];
+        for candidate in ["-fork", "we ird"] {
+            assert_eq!(
+                pick_push_remote(Some(candidate), None, &remotes, "parent"),
+                None
+            );
+            assert_eq!(
+                pick_push_remote(None, Some(candidate), &remotes, "parent"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn push_remedies_keep_fallback_and_name_differing_remote() {
+        assert_eq!(push_remedy("x", "parent", None), TRACKED_REMEDY);
+        assert_eq!(push_remedy("x", "parent", Some("mine")), TRIANGULAR_REMEDY);
+        assert!(!push_remedy("x", "parent", Some("mine")).contains("set_upstream"));
+        assert_eq!(
+            force_push_remedy("x", "parent", None),
+            "Force push isn't available while the names differ. Retry with the push tool \
+             (branch: \"x\", set_upstream: true) to publish it as parent/x and \
+             track that, or push from GitDesktop to choose the destination."
+        );
+        let force = force_push_remedy("x", "parent", Some("mine"));
+        assert_eq!(
+            force,
+            "Force push isn't available while the names differ. Retry with the push tool \
+             (branch: \"x\", remote: \"mine\") to push it to mine/x and leave its upstream as it is, \
+             or push from GitDesktop to choose the destination."
+        );
+        assert!(!force.contains("set_upstream"));
+    }
+
     /// Each tool words its own way out of a name-mismatch refusal; other errors keep
     /// theirs.
-    #[test]
-    fn name_mismatch_refusals_carry_each_tools_own_remedy() {
+    #[tokio::test]
+    async fn name_mismatch_refusals_carry_each_tools_own_remedy() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-mcp-remedy-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        git(&repo, &["init", "-q"]).await;
         let refusal = || AppError::PushUpstreamNameMismatch {
             branch: "feat/y".into(),
             remote: "origin".into(),
             remote_branch: "feat/x".into(),
         };
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
         assert_eq!(
-            with_mcp_remedy(refusal(), push_remedy).to_string(),
+            with_mcp_remedy(&missing, refusal(), None, push_remedy)
+                .await
+                .to_string(),
             "Push blocked — feat/y tracks origin/feat/x, which has a different name. Retry with \
              branch: \"feat/y\" and set_upstream: true to publish it as origin/feat/y and track \
              that, or push from GitDesktop to choose the destination."
         );
-        let force = with_mcp_remedy(refusal(), force_push_remedy).to_string();
+        let other = with_mcp_remedy(&missing, AppError::Timeout(5), None, push_remedy).await;
+        assert!(matches!(other, AppError::Timeout(5)), "{other:?}");
+        if !all_push_keys_unset(
+            &repo,
+            "name_mismatch_refusals_carry_each_tools_own_remedy",
+            &["remote.pushDefault", "branch.feat/y.pushRemote"],
+        )
+        .await
+        {
+            return;
+        }
+        assert_eq!(
+            with_mcp_remedy(&repo, refusal(), None, push_remedy)
+                .await
+                .to_string(),
+            "Push blocked — feat/y tracks origin/feat/x, which has a different name. Retry with \
+             branch: \"feat/y\" and set_upstream: true to publish it as origin/feat/y and track \
+             that, or push from GitDesktop to choose the destination."
+        );
+        let force = with_mcp_remedy(&repo, refusal(), None, force_push_remedy)
+            .await
+            .to_string();
         assert_eq!(
             force,
             "Push blocked — feat/y tracks origin/feat/x, which has a different name. Force push \
@@ -1409,8 +1653,6 @@ mod tests {
         assert!(force.contains("branch: \"feat/y\""), "{force}");
         assert!(force.contains("origin/feat/y"), "{force}");
         assert!(!force.contains("explicit destination"), "{force}");
-        let other = with_mcp_remedy(AppError::Timeout(5), push_remedy);
-        assert!(matches!(other, AppError::Timeout(5)), "{other:?}");
     }
 
     /// With ALL flags false, every gated tool must error before doing work. Destructive
@@ -1570,7 +1812,9 @@ mod tests {
             "--allow-git-write"
         );
         assert_gated!(
-            h.drop_stash(Parameters(StashIndexArgs { index: 0 })),
+            h.drop_stash(Parameters(StashShaArgs {
+                sha: "a".repeat(40)
+            })),
             "--allow-git-write"
         );
         assert_gated!(
@@ -1619,7 +1863,9 @@ mod tests {
             remote: "origin".into(),
             name: "b".into(),
         })));
-        assert_destructive_gated!(h.drop_stash(Parameters(StashIndexArgs { index: 0 })));
+        assert_destructive_gated!(h.drop_stash(Parameters(StashShaArgs {
+            sha: "a".repeat(40)
+        })));
         assert_destructive_gated!(h.delete_tag(Parameters(DeleteTagArgs {
             name: "v1".into(),
             remote: false
@@ -1655,6 +1901,8 @@ mod tests {
     fn session_branch_guard_refuses_reserved_prefix() {
         assert!(ensure_not_session_branch("gd/session/abc123").is_err());
         assert!(ensure_not_session_branch("gd/session/").is_err());
+        assert!(ensure_not_session_branch("GD/Session/x").is_err());
+        assert!(ensure_not_session_branch("Gd/SESSION/").is_err());
         assert!(ensure_not_session_branch("feature/x").is_ok());
         assert!(ensure_not_session_branch("main").is_ok());
         // A branch that merely CONTAINS the token but doesn't start with it is fine.
@@ -1678,9 +1926,10 @@ mod tests {
             .await
             .expect_err("create_branch into gd/session/* must be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "expected the session-branch refusal, got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 
         let err = h
             .rename_branch(Parameters(RenameBranchArgs {
@@ -1690,9 +1939,10 @@ mod tests {
             .await
             .expect_err("rename_branch into gd/session/* must be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "expected the session-branch refusal, got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
     /// `noTrack` is optional on the wire (#[serde(default)]): absent → false so
@@ -1871,24 +2121,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn echo_matches_sha256_full_id_and_prefix() {
+        let sha = "a1B2c3D4".repeat(8);
+        let fresh = vec![DroppedCommit {
+            sha: sha.clone(),
+            subject: "s".into(),
+            author: "a".into(),
+            author_date: "2026-08-28T23:37:38-04:00".into(),
+        }];
+        assert!(echo_matches(std::slice::from_ref(&sha), &fresh));
+        assert!(echo_matches(&[sha[..7].to_string()], &fresh));
+        assert!(!echo_matches(&[format!("{}5", &sha[..63])], &fresh));
+    }
+
     /// The echo is required with an answer and has to look like shas — a malformed
     /// one is refused here rather than reported as an upstream that moved.
     #[test]
     fn expected_drop_shas_are_required_and_hex() {
-        assert_eq!(
-            ensure_expected_drop_shas(Some(vec!["1111111".into()])).unwrap(),
-            vec!["1111111".to_string()]
-        );
+        for good in [4, 7, 40, 41, 64]
+            .map(|len| "a".repeat(len))
+            .into_iter()
+            .chain(["A".repeat(64)])
+        {
+            assert_eq!(
+                ensure_expected_drop_shas(Some(vec![good.clone()])).unwrap(),
+                vec![good]
+            );
+        }
 
         for missing in [None, Some(vec![])] {
             let err = ensure_expected_drop_shas(missing)
                 .expect_err("an answer without its shas is not an answer");
             assert!(err.to_string().contains("expectedDropShas"), "{err}");
         }
-        for bad in ["", "abc", "zzzzzzz", "1111111 ", &"a".repeat(41)] {
+        for bad in [
+            "",
+            "abc",
+            "zzzzzzz",
+            "1111111 ",
+            &"a".repeat(65),
+            &format!("{}z", "a".repeat(63)),
+        ] {
             let err = ensure_expected_drop_shas(Some(vec![bad.to_string()]))
                 .expect_err("only a sha can name a commit");
-            assert!(err.to_string().contains("hex characters"), "{bad:?} → {err}");
+            assert!(
+                err.message.contains("(4 to 64 hex characters)"),
+                "{bad:?} → {err}"
+            );
         }
     }
 
@@ -1915,6 +2195,76 @@ mod tests {
         git(repo, &["config", "user.name", "T"]).await;
     }
 
+    #[tokio::test]
+    async fn stage_unstage_and_stash_resolve_paths_from_the_repository_root() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-mcp-root-")
+            .tempdir()
+            .unwrap();
+        let repo = dir.path().to_str().unwrap();
+        git(repo, &["init", "-q", "-b", "main"]).await;
+        configure(repo).await;
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("sub/keep.txt"), "keep\n").unwrap();
+        git(repo, &["add", "-A"]).await;
+        git(repo, &["commit", "-qm", "seed"]).await;
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        let h = GitDesktopMcp::with_options(
+            dir.path().join("sub").to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+        );
+        h.stage_files(Parameters(StagePathsArgs {
+            paths: vec!["a.txt".into()],
+            literal: true,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            git(repo, &["diff", "--cached", "--name-only"]).await.trim(),
+            "a.txt"
+        );
+        h.unstage_files(Parameters(StagePathsArgs {
+            paths: vec!["a.txt".into()],
+            literal: true,
+        }))
+        .await
+        .unwrap();
+        assert!(git(repo, &["diff", "--cached", "--name-only"])
+            .await
+            .trim()
+            .is_empty());
+        let result = h
+            .stash_push(Parameters(StashPushArgs {
+                paths: vec!["a.txt".into()],
+                literal: true,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(text_of(&result), "stashed selected paths");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"a\n");
+    }
+
+    #[test]
+    fn stash_tools_pass_the_toplevel_to_their_cores() {
+        let source = include_str!("write_git.rs").replace("\r\n", "\n");
+        for name in ["stash_pop", "stash_apply", "stash_push"] {
+            let start = source.find(&format!("async fn {name}(")).expect(name);
+            let rest = &source[start..];
+            let end = rest.find("\n    }\n").expect(name);
+            let body = rest[..end]
+                .lines()
+                .map(|line| line.split("//").next().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(body.contains("self.toplevel()"), "{name}");
+            assert!(!body.contains("self.repo.clone()"), "{name}");
+        }
+    }
+
     /// The one text block a tool result carries.
     fn text_of(result: &CallToolResult) -> String {
         result
@@ -1924,6 +2274,73 @@ mod tests {
             .expect("the tool returns one text block")
             .text
             .clone()
+    }
+
+    /// The schema an agent reads names the stash by `sha` alone, never by slot.
+    #[test]
+    fn drop_stash_schema_takes_a_required_sha_and_no_index() {
+        let tool = GitDesktopMcp::write_git_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "drop_stash")
+            .expect("drop_stash is listed");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        assert_eq!(schema["required"], serde_json::json!(["sha"]), "{schema}");
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(props.contains_key("sha"), "{schema}");
+        assert!(!props.contains_key("index"), "{schema}");
+    }
+
+    /// End to end: list_stashes rows carry the sha, drop_stash drops exactly that
+    /// entry from mid-stack, and a sha no longer listed refuses toward list_stashes.
+    #[tokio::test]
+    async fn drop_stash_drops_by_sha_and_refuses_a_gone_one() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-mcp-drop-stash-")
+            .tempdir()
+            .unwrap();
+        let repo = dir.path().to_string_lossy().into_owned();
+        git(&repo, &["init", "-q", "-b", "main"]).await;
+        configure(&repo).await;
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&repo, &["add", "-A"]).await;
+        git(&repo, &["commit", "-qm", "base"]).await;
+        for body in ["one\n", "two\n", "three\n"] {
+            std::fs::write(dir.path().join("a.txt"), body).unwrap();
+            git(&repo, &["stash", "push", "-q"]).await;
+        }
+        let h = GitDesktopMcp::with_options(repo.clone(), false, false, true, true);
+        let listed: serde_json::Value =
+            serde_json::from_str(&text_of(&h.list_stashes().await.unwrap())).unwrap();
+        let shas: Vec<String> = listed
+            .as_array()
+            .expect("an array of stashes")
+            .iter()
+            .map(|row| row["sha"].as_str().expect("a sha on every row").to_string())
+            .collect();
+        assert_eq!(shas.len(), 3, "{listed}");
+        let middle = shas[1].clone();
+
+        let result = h
+            .drop_stash(Parameters(StashShaArgs {
+                sha: middle.clone(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(text_of(&result), format!("stash dropped: {middle}"));
+        let left: Vec<String> = git(&repo, &["stash", "list", "--format=%H"])
+            .await
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(left, vec![shas[0].clone(), shas[2].clone()]);
+
+        let err = h
+            .drop_stash(Parameters(StashShaArgs { sha: middle }))
+            .await
+            .expect_err("a dropped sha refuses");
+        assert!(err.message.contains("No stash with sha"), "{}", err.message);
+        assert!(err.message.contains("list_stashes"), "{}", err.message);
     }
 
     /// A repo holding commits A then B; returns their oids.
@@ -2086,6 +2503,257 @@ mod tests {
         assert_eq!(git(&repo, &["rev-parse", "HEAD"]).await.trim(), a);
     }
 
+    async fn all_push_keys_unset(repo: &str, what: &str, keys: &[&str]) -> bool {
+        for key in keys {
+            let out = crate::git::runner::run_git_raw(
+                Some(repo),
+                &["config", "--get", key],
+                crate::git::runner::DEFAULT_TIMEOUT,
+            )
+            .await;
+            if !matches!(out, Ok(out) if out.code == 1) {
+                eprintln!("skipping {what}: {key} is not unset outside the fixture");
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn triangular_push_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-mcp-push-remote-")
+            .tempdir()
+            .expect("create temp dir");
+        let root = dir.path().to_string_lossy().into_owned();
+        git(&root, &["init", "-q", "-b", "main", "work"]).await;
+        let work = dir.path().join("work").to_string_lossy().into_owned();
+        configure(&work).await;
+        git(&work, &["commit", "-qm", "seed", "--allow-empty"]).await;
+        for remote in ["parent", "mine"] {
+            let path = dir.path().join(format!("{remote}.git"));
+            git(&work, &["remote", "add", remote, &path.to_string_lossy()]).await;
+        }
+        git(&work, &["update-ref", "refs/remotes/parent/main", "HEAD"]).await;
+        git(&work, &["branch", "--track", "x", "parent/main"]).await;
+        (dir, work)
+    }
+
+    const TRIANGULAR_REFUSAL: &str =
+        "Push blocked — x tracks parent/main, which has a different name. ";
+    const TRIANGULAR_REMEDY: &str =
+        "Retry with branch: \"x\" and remote: \"mine\" to push it to mine/x and leave its upstream as it is, or push from GitDesktop to choose the destination.";
+    const TRACKED_REMEDY: &str =
+        "Retry with branch: \"x\" and set_upstream: true to publish it as parent/x and track that, or push from GitDesktop to choose the destination.";
+
+    async fn assert_triangular_refusal(work: &str, remote: Option<&str>, remedy: &str, what: &str) {
+        let h = GitDesktopMcp::with_options(work.into(), false, false, true, false);
+        let err = h
+            .push(Parameters(PushArgs {
+                branch: Some("x".into()),
+                remote: remote.map(str::to_string),
+                set_upstream: false,
+            }))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{what}: a cross-name upstream refuses"));
+        let message = &*err.message;
+        assert!(message.starts_with(TRIANGULAR_REFUSAL), "{what}: {message}");
+        assert_eq!(
+            git(work, &["rev-parse", "--symbolic-full-name", "x@{upstream}"])
+                .await
+                .trim(),
+            "refs/remotes/parent/main",
+            "{what}"
+        );
+        assert_eq!(message, format!("{TRIANGULAR_REFUSAL}{remedy}"), "{what}");
+        if remedy == TRIANGULAR_REMEDY {
+            assert!(message.contains("remote: \"mine\""), "{what}: {message}");
+            assert!(message.contains("mine/x"), "{what}: {message}");
+            assert!(!message.contains("parent/x"), "{what}: {message}");
+            assert!(!message.contains("set_upstream"), "{what}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn named_push_remedy_names_branch_push_remote() {
+        let (_dir, work) = triangular_push_repo().await;
+        git(&work, &["config", "branch.x.pushRemote", "mine"]).await;
+        assert_triangular_refusal(&work, None, TRIANGULAR_REMEDY, "pushRemote only").await;
+    }
+
+    #[tokio::test]
+    async fn named_push_naming_the_tracked_remote_keeps_the_tracked_remedy() {
+        let mut failures = Vec::new();
+        for (what, branch_remote, default) in [
+            ("explicit parent with pushRemote", Some("mine"), None),
+            ("explicit parent with pushDefault", None, Some("mine")),
+            ("explicit parent with both keys", Some("mine"), Some("mine")),
+        ] {
+            // A failed row must not prevent the remaining precedence cases from running.
+            let row = tokio::spawn(async move {
+                let (_dir, work) = triangular_push_repo().await;
+                for (key, value) in [
+                    ("branch.x.pushRemote", branch_remote),
+                    ("remote.pushDefault", default),
+                ] {
+                    if let Some(value) = value {
+                        git(&work, &["config", key, value]).await;
+                    }
+                }
+                assert_triangular_refusal(&work, Some("parent"), TRACKED_REMEDY, what).await;
+            });
+            if row.await.is_err() {
+                failures.push(what);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "named remote rows failed: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_push_empty_push_remote_outranks_default() {
+        let (_dir, work) = triangular_push_repo().await;
+        git(&work, &["config", "branch.x.pushRemote", ""]).await;
+        git(&work, &["config", "remote.pushDefault", "mine"]).await;
+        assert_triangular_refusal(
+            &work,
+            None,
+            TRACKED_REMEDY,
+            "empty pushRemote outranks pushDefault",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn named_push_remedy_config_matrix() {
+        for (case, branch_remote, default, remedy) in [
+            ("pushDefault only", None, Some("mine"), TRIANGULAR_REMEDY),
+            (
+                "pushRemote outranks pushDefault",
+                Some("mine"),
+                Some("parent"),
+                TRIANGULAR_REMEDY,
+            ),
+            (
+                "pushRemote=tracked outranks pushDefault",
+                Some("parent"),
+                Some("mine"),
+                TRACKED_REMEDY,
+            ),
+            ("neither key set", None, None, TRACKED_REMEDY),
+            (
+                "unlisted pushRemote outranks pushDefault",
+                Some("gd-test-absent"),
+                Some("mine"),
+                TRACKED_REMEDY,
+            ),
+            (
+                "unlisted pushDefault only",
+                None,
+                Some("gd-test-absent"),
+                TRACKED_REMEDY,
+            ),
+            ("pushRemote=tracked", Some("parent"), None, TRACKED_REMEDY),
+        ] {
+            let (_dir, work) = triangular_push_repo().await;
+            if branch_remote.is_none() {
+                let keys = if default.is_none() {
+                    vec!["branch.x.pushRemote", "remote.pushDefault"]
+                } else {
+                    vec!["branch.x.pushRemote"]
+                };
+                if !all_push_keys_unset(&work, case, &keys).await {
+                    continue;
+                }
+            }
+            for (key, value) in [
+                ("branch.x.pushRemote", branch_remote),
+                ("remote.pushDefault", default),
+            ] {
+                if let Some(value) = value {
+                    git(&work, &["config", key, value]).await;
+                }
+            }
+            assert_triangular_refusal(&work, None, remedy, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn differing_remote_rewords_both_tools_refusals() {
+        let (_dir, work) = triangular_push_repo().await;
+        git(&work, &["config", "branch.x.pushRemote", "mine"]).await;
+        let refusal = || AppError::PushUpstreamNameMismatch {
+            branch: "x".into(),
+            remote: "parent".into(),
+            remote_branch: "main".into(),
+        };
+        assert_eq!(
+            with_mcp_remedy(&work, refusal(), None, push_remedy)
+                .await
+                .to_string(),
+            format!("{TRIANGULAR_REFUSAL}{TRIANGULAR_REMEDY}")
+        );
+        assert_eq!(
+            with_mcp_remedy(&work, refusal(), None, force_push_remedy).await.to_string(),
+            "Push blocked — x tracks parent/main, which has a different name. \
+             Force push isn't available while the names differ. Retry with the push tool \
+             (branch: \"x\", remote: \"mine\") to push it to mine/x and leave its upstream as it is, \
+             or push from GitDesktop to choose the destination."
+        );
+        assert_eq!(
+            with_mcp_remedy(&work, refusal(), Some("parent"), push_remedy)
+                .await
+                .to_string(),
+            format!("{TRIANGULAR_REFUSAL}{TRACKED_REMEDY}")
+        );
+        assert_eq!(
+            with_mcp_remedy(&work, refusal(), Some("parent"), force_push_remedy)
+                .await
+                .to_string(),
+            format!(
+                "{TRIANGULAR_REFUSAL}{}",
+                force_push_remedy("x", "parent", None)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn named_push_remote_retry_preserves_triangular_upstream() {
+        let (dir, work) = triangular_push_repo().await;
+        let root = dir.path().to_string_lossy().into_owned();
+        git(&root, &["init", "-q", "--bare", "-b", "main", "mine.git"]).await;
+        let mine = dir.path().join("mine.git").to_string_lossy().into_owned();
+        git(&work, &["config", "branch.x.pushRemote", "mine"]).await;
+        let parent_main = git(&work, &["rev-parse", "refs/remotes/parent/main"]).await;
+        let tip = git(&work, &["rev-parse", "refs/heads/x"]).await;
+        let h = GitDesktopMcp::with_options(work.clone(), false, false, true, false);
+        let result = h
+            .push(Parameters(PushArgs {
+                branch: Some("x".into()),
+                remote: Some("mine".into()),
+                set_upstream: false,
+            }))
+            .await
+            .expect("the named retry pushes a same-name copy");
+        assert_eq!(text_of(&result), "pushed");
+        assert_eq!(git(&mine, &["rev-parse", "refs/heads/x"]).await, tip);
+        assert_eq!(
+            git(
+                &work,
+                &["rev-parse", "--symbolic-full-name", "x@{upstream}"]
+            )
+            .await
+            .trim(),
+            "refs/remotes/parent/main"
+        );
+        assert_eq!(
+            git(&work, &["rev-parse", "refs/remotes/parent/main"]).await,
+            parent_main
+        );
+    }
+
     #[tokio::test]
     async fn named_push_refuses_cross_name_upstream_and_remedy_publishes() {
         let dir = tempfile::Builder::new()
@@ -2108,6 +2776,15 @@ mod tests {
         assert_ne!(old_main, tip);
         let h = GitDesktopMcp::with_options(work.clone(), false, false, true, false);
 
+        if !all_push_keys_unset(
+            &work,
+            "named_push_refuses_cross_name_upstream_and_remedy_publishes",
+            &["remote.pushDefault", "branch.x.pushRemote"],
+        )
+        .await
+        {
+            return;
+        }
         for remote in [None, Some("origin".to_string())] {
             let result = h
                 .push(Parameters(PushArgs {
@@ -2579,9 +3256,10 @@ mod tests {
             .await
             .expect_err("session branch delete should be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 
         let err = h
             .rename_branch(Parameters(RenameBranchArgs {
@@ -2591,9 +3269,10 @@ mod tests {
             .await
             .expect_err("session branch rename should be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 
         let err = h
             .delete_remote_branch(Parameters(DeleteRemoteBranchArgs {
@@ -2603,9 +3282,10 @@ mod tests {
             .await
             .expect_err("session remote branch delete should be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 
         let err = h
             .checkout_branch(Parameters(BranchNameArgs {
@@ -2614,9 +3294,69 @@ mod tests {
             .await
             .expect_err("session branch checkout should be refused");
         assert!(
-            err.to_string().contains("agent-session branch"),
+            err.to_string().contains("reserved for agent sessions"),
             "got: {err}"
         );
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        for name in ["GD/Session/xyz", "gd/session/xyz"] {
+            let refusals = [
+                h.delete_branch(Parameters(BranchNameArgs { name: name.into() }))
+                    .await,
+                h.rename_branch(Parameters(RenameBranchArgs {
+                    from: name.into(),
+                    to: "renamed".into(),
+                }))
+                .await,
+                h.rename_branch(Parameters(RenameBranchArgs {
+                    from: "feature/x".into(),
+                    to: name.into(),
+                }))
+                .await,
+                h.delete_remote_branch(Parameters(DeleteRemoteBranchArgs {
+                    remote: "origin".into(),
+                    name: name.into(),
+                }))
+                .await,
+                h.checkout_branch(Parameters(BranchNameArgs { name: name.into() }))
+                    .await,
+                h.create_branch(Parameters(CreateBranchArgs {
+                    name: name.into(),
+                    checkout: false,
+                    from: None,
+                    no_track: false,
+                }))
+                .await,
+                h.push(Parameters(PushArgs {
+                    branch: Some(name.into()),
+                    remote: None,
+                    set_upstream: false,
+                }))
+                .await,
+            ];
+            for (tool, result) in [
+                "delete_branch",
+                "rename_branch from",
+                "rename_branch to",
+                "delete_remote_branch",
+                "checkout_branch",
+                "create_branch",
+                "push",
+            ]
+            .into_iter()
+            .zip(refusals)
+            {
+                let err = result.expect_err(tool);
+                assert!(
+                    err.to_string().contains("reserved for agent sessions"),
+                    "{tool} {name}: {err}"
+                );
+                assert_eq!(
+                    err.code,
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    "{tool} {name}: {err}"
+                );
+            }
+        }
     }
 
     /// While a GitDesktop promote holds its window, the branch, stash and history tools
@@ -2702,9 +3442,11 @@ mod tests {
             h.stash_apply(Parameters(StashApplyArgs { index: 0 }))
                 .await
                 .expect_err("stash apply refuses mid-promote"),
-            h.drop_stash(Parameters(StashIndexArgs { index: 0 }))
-                .await
-                .expect_err("stash drop refuses mid-promote"),
+            h.drop_stash(Parameters(StashShaArgs {
+                sha: "a".repeat(40),
+            }))
+            .await
+            .expect_err("stash drop refuses mid-promote"),
             h.merge_branch(Parameters(MergeBranchArgs {
                 branch: "feature".into(),
                 squash: false,

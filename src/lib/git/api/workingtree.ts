@@ -76,12 +76,21 @@ export interface FileBytes {
   tooLarge: boolean;
 }
 
-/** File content at a rev (null rev = working tree; null result = absent). */
+/** File content at a rev (null rev = working tree; null result = absent).
+ *  `probeSize` checks a rev blob's size before reading it, at one extra spawn:
+ *  for reads a document chooses, so an oversized blob is refused unread. */
 export const gitFileBase64 = (
   repoPath: string,
   rev: string | null,
   filePath: string,
-) => invoke<FileBytes | null>("git_file_base64", { repoPath, rev, filePath });
+  probeSize = false,
+) =>
+  invoke<FileBytes | null>("git_file_base64", {
+    repoPath,
+    rev,
+    filePath,
+    probeSize,
+  });
 
 /** Decode base64 file bytes (from git_file_base64) to a UTF-8 string. */
 export function decodeBase64Utf8(b64: string): string {
@@ -123,7 +132,7 @@ export const gitApplyPartial = (
 /** Replace lines `[startLine, startLine + expectedLines.length)` (1-based) of a
  *  file with `replacementLines` — GitHub's "Commit suggestion", applied locally.
  *  The backend verifies `expectedLines` still match before editing (a mismatch is
- *  a specific error), preserves EOL/BOM/trailing newline, and stages the file only
+ *  a specific error), preserves each line's ending and the BOM, and stages the file only
  *  when `stageWhenClean` and it had no other local changes. */
 export const gitReplaceFileLines = (
   repoPath: string,

@@ -5,6 +5,7 @@ import {
   memoizedStoreLoader,
   reloadToleratingEmptyStore,
 } from "@/lib/plugin-store";
+import { writeWithRollback } from "@/lib/plugin-store-rollback";
 
 /**
  * A distilled decision ledger for one PR's over-budget GitDesktop-own comments,
@@ -82,9 +83,9 @@ const STORE_FILE = "own-comments-digest.json";
 const getStore = memoizedStoreLoader(STORE_FILE);
 
 // Serialize every read-modify-write through one in-process queue — without it two
-// overlapping saves each reload the same pre-flush disk snapshot (autoSave's ~100ms
-// debounce) and the later drops the earlier. Mirrors pr-reviews.json's chain,
-// cross-instance store lock around each reload→save included.
+// overlapping saves each reload the same disk snapshot before either saves, and the
+// later drops the earlier. Mirrors pr-reviews.json's chain, cross-instance store
+// lock around each reload→save included.
 let opChain: Promise<unknown> = Promise.resolve();
 function serialize<T>(op: () => Promise<T>): Promise<T> {
   const run = opChain.then(op, op);
@@ -151,19 +152,21 @@ export async function saveDigest(
     const identity = await repoIdentity(repoPath);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repoPath, identity);
       const store = await getStore();
-      const bag =
-        (await store.get<Record<string, OwnCommentsDigest>>(key)) ?? {};
-      bag[record.key] = record;
-      // This write supersedes any pre-lens record for the same PR — dropping it here
-      // is the fold, one PR at a time, never a sweep over the store.
-      const preLens = legacyDigestKey(record.key);
-      if (preLens !== undefined) delete bag[preLens];
-      await store.set(key, bag);
-      // Flush now instead of on autoSave's debounce, so the next serialized reload
-      // can't re-read a pre-write disk snapshot and drop this change.
-      await store.save();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repoPath, identity);
+        const bag =
+          (await store.get<Record<string, OwnCommentsDigest>>(key)) ?? {};
+        bag[record.key] = record;
+        // This write supersedes any pre-lens record for the same PR — dropping it here
+        // is the fold, one PR at a time, never a sweep over the store.
+        const preLens = legacyDigestKey(record.key);
+        if (preLens !== undefined) delete bag[preLens];
+        await store.set(key, bag);
+        // Autosave is off for this store, so only this save persists the change;
+        // the next serialized reload reads it back, not a pre-write snapshot.
+        await store.save();
+      });
     });
   });
 }
@@ -194,32 +197,34 @@ export async function recordDigestFailure(
     const identity = await repoIdentity(repoPath);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repoPath, identity);
       const store = await getStore();
-      const bag =
-        (await store.get<Record<string, OwnCommentsDigest>>(key)) ?? {};
-      const recordKey = digestKey(lens, kind, ref);
-      // Adopt any pre-lens record for this PR rather than stranding its ledger — the
-      // same one-PR-at-a-time fold `saveDigest` does.
-      const preLens = legacyDigestKey(recordKey);
-      const existing =
-        bag[recordKey] ?? (preLens === undefined ? undefined : bag[preLens]);
-      if (preLens !== undefined) delete bag[preLens];
-      bag[recordKey] = {
-        // No record yet → a ledger-less skeleton, so the failure has somewhere to
-        // live without inventing a ledger that was never produced.
-        ...(existing ?? {
-          schemaVersion: 1,
-          fingerprint: failed.fingerprint,
-          ledger: "",
-          model: "",
-          createdAt: failed.at,
-        }),
-        key: recordKey,
-        failed,
-      };
-      await store.set(key, bag);
-      await store.save();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repoPath, identity);
+        const bag =
+          (await store.get<Record<string, OwnCommentsDigest>>(key)) ?? {};
+        const recordKey = digestKey(lens, kind, ref);
+        // Adopt any pre-lens record for this PR rather than stranding its ledger — the
+        // same one-PR-at-a-time fold `saveDigest` does.
+        const preLens = legacyDigestKey(recordKey);
+        const existing =
+          bag[recordKey] ?? (preLens === undefined ? undefined : bag[preLens]);
+        if (preLens !== undefined) delete bag[preLens];
+        bag[recordKey] = {
+          // No record yet → a ledger-less skeleton, so the failure has somewhere to
+          // live without inventing a ledger that was never produced.
+          ...(existing ?? {
+            schemaVersion: 1,
+            fingerprint: failed.fingerprint,
+            ledger: "",
+            model: "",
+            createdAt: failed.at,
+          }),
+          key: recordKey,
+          failed,
+        };
+        await store.set(key, bag);
+        await store.save();
+      });
     });
   });
 }

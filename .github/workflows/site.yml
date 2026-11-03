@@ -21,6 +21,7 @@ on:
       - "CHANGELOG.md"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - ".node-version" # setup-node reads the Node version from it
       - "biome.json"
       - ".github/workflows/site.yml"
       # The guard script is a trigger path for the same reason this workflow
@@ -46,9 +47,9 @@ jobs:
         uses: pnpm/action-setup@v6.1.0
 
       - name: Install Node
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: pnpm
 
       - name: Install dependencies

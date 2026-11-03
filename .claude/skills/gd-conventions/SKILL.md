@@ -1,6 +1,6 @@
 ---
 name: gd-conventions
-description: GitDesktop repo playbook — hard safety rules, frontend and Rust/Tauri conventions, verification commands, and hard-won gotchas that are NOT in CLAUDE.md. Consult this before writing, refactoring, or reviewing ANY code in this repo, even for small changes. Preloaded into the implementer, spec-reviewer and spec-writer subagents; the main conversation should read it before direct implementation work too.
+description: GitDesktop repo playbook — hard repo rules, frontend and Rust/Tauri conventions, verification commands, and hard-won gotchas that are NOT in CLAUDE.md. Consult this before writing, refactoring, or reviewing ANY code in this repo, even for small changes. Preloaded into the implementer, spec-reviewer and spec-writer subagents; the main conversation should read it before direct implementation work too.
 ---
 
 # GitDesktop conventions & gotchas
@@ -9,32 +9,30 @@ You are working in the user's real repository. CLAUDE.md covers the project
 brief and docs-sync; this file adds what past sessions learned the hard way.
 Where this file and generic best practice disagree, this file wins.
 
-## Hard rules (violations have destroyed user state before)
+## Hard rules
 
-1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /
-   show` and `git branch --list`, each optionally prefixed with `-C <path>` to
-   address a task worktree. Everything else — commit, add/stage, checkout,
-   reset, stash, rm, clean, push, pull, fetch, merge, rebase, tag, branch
-   create/delete, worktree, remote, config — is forbidden, even "just to test".
-   The user commits their own work, possibly in parallel with your session; a
-   past subagent's stray commit wiped `.gitignore` and broke the app.
-2. **No stray files.** Create only what your task calls for. Scratch files go
-   in the session scratchpad or `C:/temp`, never the repo; destructive
-   experiments happen in a throwaway repo under `C:/temp`. (One exception, for
-   runs that may create files: the LF-copy gate's `__cigate__<name>` sibling,
-   deleted after the check — reviewers never create it: the LF copy is a file.)
-3. **Don't edit `src/components/ui/`** — vendored shadcn/Base UI primitives.
+1. **Don't edit `src/components/ui/`** — vendored shadcn/Base UI primitives.
    Fix at the feature/call-site level. That folder's `README.md` inventories
    the sanctioned local modifications (a re-vendor silently reverts them);
    any future sanctioned edit updates it in the same change.
-4. **Never repo-wide `cargo fmt`** in `src-tauri` (~35 files of collateral).
+2. **Never repo-wide `cargo fmt`** in `src-tauri` (~35 files of collateral).
    New files only: `rustfmt --edition 2021 <that file>` — and never on a
    `mod.rs`: rustfmt follows its `mod` declarations into every child file
    (measured: 6-file collateral). Verify an edit's formatting with
-   `rustfmt --edition 2021 --check --config skip_children=true` and compare
-   flagged hunks to your lines.
-5. **Report from evidence.** Verification claims come from command output in
-   this session, never memory. Quote failures verbatim.
+   `rustfmt --edition 2021 --check --config skip_children=true <that file>`
+   and compare flagged hunks to your lines.
+3. **`gd/session/*` branches are filtered from every branch surface** and
+   never deleted — the user dogfoods agent sessions on them; deleting one
+   breaks Resume.
+4. **`pnpm lint` is a rewrite, not a check** (`biome check --write` over
+   `src/` AND `site/`). Check form: `pnpm exec biome check ./src/`. In a task
+   worktree that check false-fails on CRLF, so the remedy splits by role.
+   WRITERS: use the per-file LF-copy `biome ci` gate (below), whose
+   `__cigate__<name>` sibling is deleted after the check, or whatever the
+   spec's Verification field names. REVIEWERS: run the check-only form scoped
+   to the package's own files, and in a fresh worktree treat tree-wide
+   formatting as unverifiable and report it as such — never create files (an
+   LF copy is a file), never any `--write` form.
 
 ## Verification commands (allowlisted — run, don't ask)
 
@@ -51,11 +49,10 @@ pnpm run checks                        # guard scripts + self-tests — CI quali
 Frontend changes run the first pair; Rust changes add the cargo pair. Not
 "done" until green.
 
-⚠ **`pnpm lint` is a rewrite, not a check** — it runs `biome check --write
-./src/ ./site/`, mutating every file under `src/` AND `site/` including
-the user's parallel work. Implementers fix only their own files via the
-targeted `pnpm exec biome check --write <files in scope>`; reviewers never
-run any `--write` form.
+⚠ **Formatting fixes stay in scope:** implementers format only their own files,
+via the targeted `pnpm exec biome check --write <files in scope>`, never the
+tree-wide `pnpm lint` (hard rule 4), which would rewrite the user's parallel
+work too.
 
 ⚠ **`biome check` false-fails on CRLF (this Windows worktree).** autocrlf checks
 files out CRLF, and `biome check` (formatter included) flags a CR on **unedited**
@@ -84,19 +81,47 @@ the same change (`listKeyboardNav` in `src/lib/list-keyboard-nav.ts`) — an
 invariant, not polish. A list container that co-hosts a text editor (inline
 edit field, reply box) passes `ignoreTextEntry` so arrows keep moving the
 caret; leave it off where arrows deliberately drive nav from a filter input.
+The clamped pickers (command palette, task picker, the co-author and
+Bitbucket add-reviewer popovers, RepoList, the session composer's @ and /
+menus) read one cursor that `clampHighlight` derives from the stored index
+(`src/features/shortcuts/palette-highlight.ts`; RepoList keeps a -1 no-cursor
+sentinel ahead of it), so the marker, Enter and any aria or scroll the picker
+has read one clamped index even when the list shrinks under it. They step with
+`stepHighlight`, except the composer's @ and / menus, which wrap with a modulo
+from the clamped cursor (don't move them onto `stepHighlight`: it clamps at the
+ends). `scripts/palette-highlight.test.mjs` pins each one, uniform
+palette-shaped pickers in `CALL_SITES` and the rest in per-site `SITE_PINS`.
+Not adopters: `mention-autocomplete.tsx` clamps inline to the same effect, and
+`listKeyboardNav` lists are a separate primitive.
 Destructive paths stay behind confirmation via the
 shared `useConfirm`/`ConfirmDialogHost` primitive (`src/lib/stores/confirm.ts`,
 host in `src/components/confirm-dialog-host.tsx`) — never a bespoke confirm
 dialog. A prompt is repo-scoped by default: switching or closing the repository
 while it is open cancels it (the caller gets `false`, an info toast names what
 didn't happen). Prompts that act outside the open repository (quit/update,
-recents, Settings, Explore, task deletion) pass `scope: "app"`. Commit-level
-destructive prompts (checkout, revert, cherry-pick, undo) share their wording
-through `src/features/history/commit-confirms.ts`: a new route to one of those
-ops imports the existing prompt, never re-spells it.
+recents, Settings, Explore, task deletion) pass `scope: "app"`. A prompt whose
+confirm button must hold or annotate LIVE asks with `heldReason` and updates
+through `setRequestHold(target, hold)` (same store): identity-pinned, a no-op
+once the request moved on; `holdOffline` outranks the hold's reason; and the
+reason/note line is reserved from open so it never moves the buttons, and it is
+the dialog's one polite live region (the publish routes' fork-PR check is the
+reference). Commit-level destructive prompts (checkout, revert, cherry-pick,
+undo) share their wording through `src/features/history/commit-confirms.ts`: a
+new route to one of those ops imports the existing prompt, never re-spells it.
 Staging-over-conflict-markers prompts likewise live in
 `src/features/repository/conflict-confirms.ts`: the generic stage gate and
 Mark resolved both build theirs there.
+A prompt asked from a closing Menu/Popover/ContextMenu item awaits
+`useCloseSettled`'s `waitClosed()`
+(`src/features/repository/publish-confirm.tsx`, its `onOpenChangeComplete`
+spread on that Root) before asking — never a bare rAF from the handler: Base
+UI returns focus to the trigger when the closing popup unmounts, which lands
+after the dialog's initial focus and steals it.
+Whether a push publishes or would CREATE its branch on the remote reads
+`willPublish` / `willCreateOnRemote`
+(`src/features/repository/branch-sync-state.ts`), never an inline
+`!upstream || upstreamGone`; a local upstream (remote `.` or null in the
+branch list) is `isLocalUpstream` from the same module.
 
 **Command palette.** Any new tab/surface/action needs an ACTIONS entry in
 `src/lib/hotkeys/registry.ts` + `useHotkeyAction` wiring in the same change
@@ -127,6 +152,15 @@ to a single key, a dispatcher missing any of them either steals keystrokes from
 a text field or typeahead list, or withholds a named key that should still fire.
 Inner-clause drift between two dispatchers is the regression this prevents; the
 `unguarded-binding-dispatcher` guard in `pnpm run checks` is the ratchet.
+Each dispatcher also takes the listener's bare-Space carve-out: it consumes
+`space` only when its action ran (`consumeRequiresDispatch`), so a disabled
+one leaves the press to the focused control. An Enter/Space handler that
+activates a focused row, card or chip, or a list's marked row from its filter
+input, returns on `hasChordModifier(e)` (binding.ts) before any preventDefault,
+so bound chords reach the window listener, except inside a modal that owns no
+chord of its own, where letting one through would fire app bindings behind the
+dialog (those sites stay unguarded under an `OWNS_CHORD` entry); the
+`scripts/activation-key-chords.test.mjs` scan is the ratchet.
 
 **Patterns the user has ruled on:**
 - No hover-revealed per-row buttons — contextual actions are always-visible,
@@ -185,6 +219,19 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   the same hook directly: `focusableWhenDisabled`/`aria-describedby`/
   `wrapperTitle` passed straight through, plus its own sr-only reason span
   alongside (`src/features/welcome/CloneRepoDialog.tsx` is the reference).
+  Base UI swallows every key but Tab on a disabled `focusableWhenDisabled`
+  button, so a tag carrying that prop takes its `render` from the helper
+  `heldButtonRender(held, render)` in `src/lib/use-disabled-reason.ts`, `held`
+  true exactly while it is disabled and focusable (a busy Load more: its
+  fetching flag), and a new site pairs it with `ARIA_DISABLED_CLASS`; Escape
+  and app hotkeys then still work with focus on it. DisabledReasonButton
+  applies the helper and the class itself; form.SubmitButton applies only the
+  helper, so its caller passes `className={ARIA_DISABLED_CLASS}`
+  (`src/features/welcome/CloneRepoDialog.tsx` is the reference). The
+  `focusable-held-button-render` guard fails any other tag carrying the prop
+  as a literal JSX attribute without that `render`. Out of its reach: a
+  spread or a props object, whether `held` is right (any helper call passes),
+  and a spread after the helper's `render=`, which can override it.
 - A status badge or chip whose explanation isn't visible text is a
   `StatusDetailChip` (`src/components/status-detail-chip.tsx`) — a click popover
   keyboard, touch, and AT all reach, and a plain Badge when there's no detail. A
@@ -207,10 +254,16 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
 - The AI-generate chord in a dialog goes through `useGenerateChord`
   (`src/lib/hotkeys/useGenerateChord.ts`) — never a hand-rolled handler. Its
   invariants: effective-binding read (null = fully inert), `eventToBinding`
-  match, `preventDefault` before `enabled` on any surface WITH a generator,
+  match, `preventDefault` whatever `enabled` says on any surface WITH a generator
+  (bare Space excepted: consumed only when Generate runs, otherwise it only
+  stops propagation, so the focused control's native press still happens),
   run only under the visible button's gate, swallow-don't-cancel while
   generating, handler mounted on `DialogContent` (the X close is a form
   sibling). The hook returns the `hint` string so buttons can't forget it.
+  `enabled` may be a function read at keydown: a shell whose sections come and
+  go passes its sink's `canRun`, never `true`. A key without Ctrl/⌘/Alt that a
+  focused control already default-prevented stays that control's, neither run
+  nor stopped, matching the global listener's defaultPrevented skip.
   Recorded exception: surfaces with several per-row generators and no
   focused-row concept (Edit history's reword buttons) carry no chord.
 - A generator dialog that stays mounted across its own close rides
@@ -262,6 +315,17 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   not a silent gap.
 - Never degrade a surface to dodge machinery: no plain `<pre>` where the app
   highlights, no spinner where skeletons exist.
+- A docked action bar that a bottom-right toast can cover publishes its top
+  edge through `useToastClearance(ref, active)`
+  (`src/lib/use-toast-clearance.ts`), which lifts every toast above it while
+  `active`; when several bars are active, toasts clear the highest. A docked
+  `CommentComposer` passes its `toastClearance` prop instead and measures its
+  own root: a call-site wrapper would break its scroll-pin lookup over its
+  preceding siblings (`scripts/toast-clearance-adopters.test.mjs`). Beyond
+  `position` and `closeButton`, only the offset props ride along on the app
+  Toaster (`AppToaster` in `src/main.tsx`): the vendored wrapper spreads caller
+  props last, so `toastOptions` would drop its `cn-toast` class, `className`
+  its `toaster group` class, and `style` its CSS variables.
 - Caught errors surface via `toastError` (`src/lib/toast.ts`), or `errorMessage`
   (`src/lib/tauri/invoke.ts`) where a toast is wrong (a terminal buffer) — never
   `String(e)`: `invoke` rejects a PLAIN AppError, stringified "[object Object]".
@@ -293,11 +357,13 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   both (one shared constant or prop), so a load whose probe hasn't failed
   never grows at the probe→list flip; while a probe has failed with nothing
   loaded, its retries may pin 1 row.
-- The Changes pane swaps files through a two-slot hold: `FileSlot` in
-  `src/features/diff/DiffViewer.tsx` is the reference implementation, with its
-  transitions in `diff-pane-slots.ts` and the `DiffPaneHold` context
-  (`diff-pane-hold.tsx`) carrying `interactive` and the settle reports down to
-  the surfaces. The held view (the last settled one) stays in flow and
+- The diff panes swap files through a two-slot hold: `useFileSlots` +
+  `FileSlots` in `src/features/diff/file-slot.tsx` is the reference
+  implementation (the Changes pane and every file-rail host render it; it
+  imports nothing that reaches `./DiffSurface`, so hosts stay off the diff
+  chunk), with its transitions in `diff-pane-slots.ts` and the `DiffPaneHold`
+  context (`diff-pane-hold.tsx`) carrying `interactive` and the settle reports
+  down to the surfaces. The held view (the last settled one) stays in flow and
   `inert`; a held FILE slot is also dimmed (`PLACEHOLDER_FADE` +
   `opacity-80` + `delay-100`), while a held placeholder stays undimmed. The
   target prepares out of sight at full size, clipped over the held view (how
@@ -351,8 +417,28 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   the reveal, so while `revealing` the host paints its loading frame, never
   the stale item, and `active` stays false until a visible commit painted the
   view's item, so that move shows the new item directly instead of holding
-  one the user never saw on screen. The History file rail and Compare don't
-  hold yet; they are follow-ups that would adopt one of these. A placeholder
+  one the user never saw on screen. File rails (History's commit and
+  file-history panes, Compare, stashes, the agent worktree, a pull request's
+  Files pane and commit drill-in) hold through `FileSlots`, not `useEntityHold`:
+  they are arrowed at keyboard speed, and the diff pane's bound re-arms per
+  target where the entity hold's runs from the hold's start. A change of the
+  entity a host's `keyedPaneView` carries never holds (it is whatever the rail
+  lists files of: a commit, comparison, stash or pull request; file history's
+  entity is its file, so its commit moves hold, and the agent view's is the
+  worktree): the shown slot re-targets in place under its slot id, so a read
+  that keeps previous data serves it there (History's commit view and Compare
+  dim it, never over a held slot). Each slot child paints its own file: it owns
+  that file's read or takes the host's (the pull request Files pane's patch and
+  composer belong to the parent and are handed down), and builds the comment
+  anchors for its own path. It calls `useSlotRead` with the read it shows (a
+  not-pending stand-in for an in-memory patch), so the host's busy and dim
+  follow the shown slot and a previous entity's answer never counts as settled,
+  and passes any line widget through `useSlotWidget`, so a held slot's composer
+  stays as it was. A value only the shown slot's read supplies, kept for when
+  the slot is held, goes through `useSlotRetained` (`heldRetained`): it comes
+  back only to a held slot of the entity and path it was read under, never to a
+  shown or preparing one. `scripts/diff-pane-hold.test.mjs` pins the host roster
+  (`SLOT_HOSTS`, closed by the lazy diff wrapper's consumers). A placeholder
   across a key whose response can't prove identity may drive RENDERING only,
   with every interactive or forge consumer gated on `!isPlaceholderData`
   (commit-on-remote is the example); the Changes diff takes none, since
@@ -366,8 +452,8 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   placeholder, while the hold and the deferred selection's one-render lag feed
   interaction gates (handlers, hotkeys, palette); a render gate that reads the
   lag flickers before the hold starts.
-- The preparing-slot rule: every two-slot host's preparing slot (the Changes
-  pane's `FileSlot`, the Actions tab's `RunSlots`, and any host that adopts the
+- The preparing-slot rule: every two-slot host's preparing slot (the diff
+  panes' `FileSlot`, the Actions tab's `RunSlots`, and any host that adopts the
   pattern) hides only by a full clip (`[clip-path:inset(50%)]`) plus `inert`,
   set as the `preparing` entry of the host's role-keyed class map, written as a
   plain class string (a literal, a literal-only `+` chain or interpolation-free
@@ -417,8 +503,12 @@ Inner-clause drift between two dispatchers is the regression this prevents; the
   govern.
 
 **Layout gotchas.** `DialogContent` is a grid — truncating flex content needs
-`min-w-0` on the grid item; cap tall dialogs at `max-h-[85vh]`. Link-styled
-clickables add `cursor-pointer` at the call site (vendored Button sets none).
+`min-w-0` on the grid item; cap tall dialogs at `max-h-[85vh]`. A Dialog/Sheet
+title that can reach the close button (dynamic children, `truncate`, or static
+text of >=40 chars) carries `pr-8` on the title or its first-row container;
+`showCloseButton={false}` exempts — the `dialog-title-inset` suite in
+`pnpm run checks` is the ratchet. Link-styled clickables add `cursor-pointer`
+at the call site (vendored Button sets none).
 Main-side panels (children of RepositoryView's `<main>`, a display:block host) root
 with `flex h-full min-h-0 flex-col` — `flex-1` is inert there, and the panel's
 natural height document-scrolls the whole tab, chrome included (#261's
@@ -428,11 +518,10 @@ dedupe the animate group, so `animate-none` vs an existing `animate-in` is a
 build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
 
 **State & rendering gotchas.**
-- **`gd/session/*` branches are filtered from every branch surface** (lists,
-  pickers, bulk actions) — the user dogfoods agent sessions on them; deleting
-  one breaks Resume. Hard invariant.
-- `<Activity>`-hidden subtrees still render and fetch — gate query `enabled`
-  on the active tab; gate agent-surface notifications on the tab being watched.
+- `<Activity>`-hidden subtrees still render but hold no query observers, so
+  they fetch nothing while hidden; the re-show refetches anything past its
+  staleTime. Keep a heavy query's `enabled` gated on the active tab as a
+  backstop; gate agent-surface notifications on the tab being watched.
 - Open-TRANSITION resets ride `useSeedOnOpen` (`src/lib/use-seed-on-open.ts`) —
   a bare `useEffect(() => { if (open) seed(); }, [open])` re-fires when a hidden
   `<Activity>` tab re-mounts its effects on show, wiping the user's draft. The
@@ -448,7 +537,26 @@ build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
   animation (`{ animate: false }`), still applying after any pending
   transition's update; the screen navigators always crossfade. A plain `set()`
   right after a navigator can be clobbered by that later apply — navigate in
-  ONE atomic action.
+  ONE atomic action. A side effect that must count only when a navigation
+  LANDS (a read-mark, an analytics event) rides the navigator's `onApplied`,
+  run inside the transition callback after the landing's set: `openPr`,
+  `openRun`, `openAgentTab` and `openRepoView` skip it on a stillValid-refused
+  landing and on a cross-repo landing superseded during its warm-up
+  (`openIssue` takes none). Those five navigators' cross-repo arms hold on that
+  warm-up, so they apply up to its budget (250 ms) after the request.
+  `openRepo` applies every call that reaches its callback (a skipped view
+  transition still runs its update), so its callers gate with
+  `claimRepoOpen`/`repoOpenWatermark` before calling. `onApplied` itself never
+  bumps the epoch.
+- Navigators that can leave Settings open with
+  `if (interceptSettingsLeave(() => get().<self>(<original args>))) return;`
+  ahead of their own epoch bump: the intercept bumps for the request and hands
+  the move to Settings' leave guard (registered while anything is unsaved or a
+  save is writing), which asks, holds the move until the write lands, or lets
+  it go; the resume re-invokes the navigator with its original arguments.
+  System landings escape only via `bypassLeaveGuard: true` (`openRepo`) or
+  `closeRepoUnguarded`. The exempt navigators and both escapes are pinned by
+  `scripts/settings-leave-guard.test.mjs`.
 - Opening a repo the user picked goes through `useOpenRecordedRepo`
   (`src/features/repository/useOpenRepoByPath.ts`): it warms the repo's shell
   reads (`warmRepoShell`, a 250 ms budget on cold keys), records it in recents,
@@ -457,18 +565,26 @@ build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
   the request claims first (`claimRepoOpen`); one whose pre-open await may end
   in something other than an open (BranchSwitcher's worktree lookups) takes
   `repoOpenWatermark()` and yields to a newer open instead. The known bypasses
-  call `openRepo` directly (RepoDialogs' failure reopen, a worktree promote's
-  landing), warm without recording (`useOpenWorktree`), or switch without
-  warming (the store navigators' cross-repo arms: notification and My work
-  jumps). The reads that paint the repo view stay cached `REPO_SHELL_GC_TIME`
+  hold on the same warm-up: RepoDialogs' failure reopen and a worktree
+  promote's landing call `openRepo` after awaiting `claimWarmRepoShell`
+  (ui.ts), `useOpenWorktree` warms without recording, and the store
+  navigators' cross-repo arms (notification and My work jumps) hold through the
+  provider `useOpenRepoByPath` registers (`registerRepoShellWarmup`). The
+  reads that paint the repo view stay cached `REPO_SHELL_GC_TIME`
   (`src/lib/query-cache-times.ts`) through curated `<thing>Options` factories:
   the local ones are spread by their hook and the warm-up, the network-backed
   ones (`publishTargetsOptions`, `latestRunOptions`) by their hook only. A
-  warmed read nothing on the first paint shows (`remoteBranchesOptions`, the
-  closed branch menu's Remote group) warms unheld (`into: []`), so it never
-  spends the budget; BranchSwitcher prefetches it once per repo for the
-  switches that skip the warm-up, and its hook stays open-gated. Never a
-  `["repo"]` prefix default (it would catch the notification baselines).
+  warmed read nothing on the first paint shows warms unheld (`into: []`), so
+  it never spends the budget: `remoteBranchesOptions` and `branchesOptions`
+  (the closed branch menu's Remote group and its local list). The shell
+  factories without a window of their own carry `REPO_SHELL_WARM_STALE_MS`
+  (src/lib/query-cache-times.ts), so the mount right after a warm-up serves
+  the prefetched answer instead of respawning git; an observer that must
+  re-check on open (PromoteWorktreeDialog's status and op-state preconditions)
+  passes `staleTime: 0` explicitly. BranchSwitcher still prefetches remote
+  branches once per repo for a same-repo remount from a non-repo view, and
+  its hook stays open-gated. Never a `["repo"]` prefix default (it would
+  catch the notification baselines).
 - React Compiler already memoizes call results — don't add `useMemo` for perf
   reflexively (~40% false-positive rate); render reads of mutable module
   state go stale under it.
@@ -484,6 +600,12 @@ build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
   previous data via `keepPreviousDataForKeyAxes`
   (`src/lib/git/queries/core.ts`), and callers gate derived UI on
   `!isPlaceholderData` — a disabled query still renders its placeholder.
+- The remote PR and issue list hooks file a SAME-state placeholder through
+  `filterPlaceholderRows` (another tab's page passes whole; a non-empty one
+  that files down to nothing serves none), and `remoteStateMatches`
+  (`src/lib/remote-state-filter.ts`) is the one predicate that files a remote
+  row into the Open or Closed tab (`scripts/remote-row-state-wiring.test.mjs`
+  pins the sites).
 - Virtualized lists: a variable-height first row races `measureElement` —
   mount the virtualizer in a child gated on data (`docs/list-virtualization.md`).
 - Multi-toggle settings batch behind a Save/Discard bar (draft + dirty), not
@@ -516,15 +638,20 @@ build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
 - `interactionEpoch` bumps belong to the user's request, synchronously (the
   store contract on `UiState.interactionEpoch`): a late bump retires whatever
   newer action is pending, a repo open included. Automatic corrections and
-  prunes write through `clearSelectedFile`, `defaultCompareBranch` and
-  `clearRemoteSelections`, which never bump, and a navigator's `beforeSelect`
-  never bumps (`noteUserInteraction` is a no-op there; the navigator already
-  counted the gesture). A continuation that would bump after its await bumps
-  at its request instead, re-checks the epoch and live repo after the await,
-  and lands through a non-bumping write (`useAmendCommit` + `landAmend` is the
+  prunes write through setters that never bump (`clearSelectedFile`,
+  `advanceSelectedFile`, `clearSelectedCommit`, `defaultCompareBranch` and
+  `clearRemoteSelections`), and a navigator's `beforeSelect` never bumps
+  (`noteUserInteraction` is a no-op there; the navigator already counted the
+  gesture). A continuation that would bump after its await bumps at its
+  request instead, re-checks the epoch and live repo after the await, and
+  lands through a non-bumping write (`useAmendCommit` + `landAmend` is the
   reference); the guarded post-await writes in the bullet above still bump
-  late, a tracked follow-up. Review-enforced, not guarded: a regex over effect
-  and continuation bodies would fail open.
+  late, a tracked follow-up. The store's one sanctioned late bump: a held
+  cross-repo navigator's settle-time Settings re-check, up to the warm-up
+  budget after the request and only while Settings' leave guard is
+  registered (it asks about unsaved edits, or holds the move while a save is
+  writing). Review-enforced, not guarded: a regex over effect and
+  continuation bodies would fail open.
 - A follow-up that needs the DOM from a state flip (focus a just-revealed
   input, re-pin a grown scroll region) never rides a bare
   `requestAnimationFrame` from the event handler: when the state lives in
@@ -550,6 +677,22 @@ one grep away on the named symbol. Grows via Conventions-sync.
 - **Repo-identity keying** — per-repo state keys on the repo IDENTITY
   (`useRepoIdentity` / the shared `--git-common-dir` resolver), never a raw
   checkout path; a raw-path key diverges across worktrees of one repo.
+- **Held repo navigation** — every route that opens a repo warms the shell
+  first and, except the worktree promote's landing (a system move off a
+  folder it is deleting), yields to newer intent: picked opens via
+  `useOpenRecordedRepo` / `useOpenWorktree`, the ui-store navigators'
+  cross-repo arms via the `registerRepoShellWarmup` provider (registered in
+  useOpenRepoByPath.ts; same-repo arms stay synchronous), and the two direct
+  `openRepo` sites via `claimWarmRepoShell` (ui.ts). A new route that opens a
+  repo goes through one of these, never a bare `openRepo`. Except at the
+  promote's landing, which ignores its claim and keeps `bypassLeaveGuard`, a
+  held landing checks a `claimRepoOpen` claim (plus RepoDialogs' request-time
+  `repoOpenWatermark`) for supersession and re-runs `interceptSettingsLeave` at
+  settle — the guard can be registered during the hold without an epoch bump. A
+  caller whose own awaits precede the navigator call claims (`claimRepoOpen`)
+  before them and checks that claim before calling, so a newer click retires an
+  older held landing and a newer open retires the click (My work's `openItem`,
+  the Activity dock's `navigate`).
 - **View lens** — a PR/issue number or blob is valid only in the lens that
   produced it (origin vs upstream vs local match); navigation and dock entry
   points thread the lens (`beforeSelect`), never pass a bare number across.
@@ -563,8 +706,19 @@ one grep away on the named symbol. Grows via Conventions-sync.
   query never resolves.
 - **Retry focus rescue** — a Retry control whose press can unmount it (an
   error arm swapping to a skeleton or notice) rides `useRetryFocusRescue`
-  (ConversationListPanel) with a stable `tabIndex={-1}` host element; focus
-  must never fall to `<body>` on the shown→hidden edge.
+  (ConversationListPanel) with a host that survives the swap: a `tabIndex={-1}`
+  box, or a persistent control such as the list's driving search input. A host
+  handed to the `hostRef` callback imperatively is captured once, so it must
+  outlive the Retry's owner. Focus must never fall to `<body>` on the
+  shown→hidden edge. A detail pane's error-arm Retry carries no disabled
+  state or in-flight label (the arm unmounts the moment the retry fetches),
+  pinned by `scripts/detail-pane-retry.test.mjs`.
+- **Detail-pane retention** — a detail pane over a read renders through
+  `resolveDetailPane` + `DegradedListNotice`: a failed refresh keeps the loaded
+  content under the notice and its Retry, never a swap to an error on a raw
+  `isError`, which would make a transient failure read as data loss.
+  `scripts/detail-pane-retention.test.mjs` pins the adopters; a new pane joins
+  its `SITES`.
 - **Empty-picker copy** — a picker's line while it draws no options rides
   `emptyPickerCopy` (remote-section-state); a read parked with nothing loaded,
   or over a failure, says offline; only a successful read may claim none.
@@ -573,6 +727,29 @@ one grep away on the named symbol. Grows via Conventions-sync.
   truncated says "may be incomplete" with no Retry; a failure offers Retry; a
   park never does. Several sub-lists of ONE read share one line and one Retry
   through `unknownListsNotice`, never stacked per-list notices.
+- **Fail toward unknown** — empty, negative or advisory copy ("no X", "not
+  pushed", "unavailable") renders only from a SUCCESSFUL read that answered so,
+  gated on the read's data, never on its absence: a failed read keeps loaded
+  content under a notice or says it couldn't load, with Retry. An infinite query
+  splits a failed Load more from a failed refresh through `splitInfiniteFailure`
+  (remote-section-state) before `listNotice`. A failure that must hold through
+  the read's own background refetches (a board notice, a hold reason) reads
+  `failedSinceLastSuccess` from the same module, never `refreshFailed`, which
+  goes quiet while a refetch is in flight. The Rust twin of "Advisory probes
+  fail SAFE toward inaction": a probe returns Err for a failed git run, never a
+  defaulted verdict, and reads its negative answer only from a run that gave it
+  (exit 0 with nothing matched, or an unborn HEAD). The shared unborn probe is
+  `unborn_head` (git/history.rs), which on git 2.43+ tells a missing branch ref
+  from a broken one; a read that runs first and probes only after it fails goes
+  through `read_unless_unborn` (same file). `commit_on_remote` and
+  `git_unpushed_count` in git/branches.rs are the models.
+- **AppError message classifiers** — a check over an AppError's `message`
+  matches through `appErrorDetail` (`@/lib/error-summary`), since the wire
+  message keeps the Rust Display lead (`invalid argument: …`); it strips only
+  `": "`-ended leads from the shared `DISPLAY_LEADS` mirror. A git failure
+  reads its `stderr`, which carries no lead. Model:
+  `src/features/history/blame-errors.ts`, pinned over serialized payloads by
+  `scripts/blame-errors.test.mjs`.
 - **Settings list retention** — a repo-settings list read renders through
   `RemoteListSection` (repo-settings/parts), never `AsyncListBody` fed a raw
   query error: a failed or parked refresh keeps loaded rows under a notice.
@@ -613,14 +790,24 @@ one grep away on the named symbol. Grows via Conventions-sync.
   menu popup (keyboard navigation is unaffected). The override keeps the row
   hit-testable; Base UI's `useButton` still gates clicks on disabled rows.
 - **Confirm-swap focus** — a control that swaps with an inline confirm hands
-  focus across the swap via `useConfirmSwapFocus` (repo-settings/parts): the
+  focus across the swap via `useConfirmSwapFocus` from
+  `@/components/confirm-swap-focus` (re-exported by repo-settings/parts): the
   same ref on the trigger and on `InlineConfirm`'s `swapFocusRef`, keyed per
   row in lists; without it the dialog's focus fallback sends focus to the
   popup when the focused node unmounts. A confirm that removes its own row or
   container lands on a successor: mark the row `data-confirm-row`, the section
   root `data-confirm-section`, and its first input or add control
-  `data-confirm-fallback`. The act button holds by reason while pending, so it
-  keeps focus through the write.
+  `data-confirm-fallback`. A roving-stop row is its own successor when the row
+  element carries a literal `data-confirm-swap`, and a leave that takes the
+  section itself tries the `data-confirm-host` ancestor's fallbacks before the
+  host. A successor never runs, sends or deletes on Enter, since a held Enter
+  repeats. One whose fresh Enter still acts ignores a repeat: a button takes
+  `onKeyDown={ignoreHeldEnter}` from the same module (preventing the keydown
+  cancels its click), while an editor-opening row or an add input checks
+  `!e.repeat` in its own Enter handler. A row whose safe control is a
+  component that takes no DOM props marks it with `markSwapStop(selector)` on
+  the row ref. The act button holds by reason while pending, so it keeps
+  focus through the write.
 - **Invalidation keys** — cache invalidation goes through the shared key
   builders in `src/lib/git/queries/`; a hand-built key or raw-path key
   silently fails to co-invalidate siblings.
@@ -630,6 +817,75 @@ one grep away on the named symbol. Grows via Conventions-sync.
   chains would republish it through the barrel. Guards: `queries-internal-import`
   (callers outside), `queries-internal-reexport` (re-exports anywhere inside),
   `queries-barrel-internal-reference` (the barrel may not name it at all).
+- **Git-only invalidation** — a git mutation that can't change forge state
+  (fetch, pull, checkout, switch, stash, whole-file discard) passes
+  `localOnly: true` to `useRepoMutation`, which invalidates the repo subtree
+  filtered by `isLocalRepoQuery` (`queries/local-query-filter.ts`): a query
+  is local when it sets `networkMode: "always"` (the split the ratchet test
+  `networkmode-local-queries` enforces), minus the overrides it names in
+  `NETWORKED_ALWAYS_OVERRIDES`. The ratchet fails only on networked "always"
+  reads it can recognize (named callees, the `forge`/`gh`/`jira` families,
+  classified commands); any other networked read under "always" (a `fetch…`
+  helper, a raw `fetch()`) can't be listed as-is, since an entry matching no
+  recognized read fails as stale. Route its callee through a recognized name
+  first (a `NETWORK_CALLEES` entry or a `forge`/`gh`/`jira` name; a misfiled
+  command moves to `NETWORK_COMMANDS` or `MIXED_COMMANDS`), then list it in
+  `NETWORKED_ALWAYS`, state `refetchOnReconnect` on the query itself, and add
+  a repo-rooted key to `NETWORKED_ALWAYS_OVERRIDES`. Push, tag push and forge
+  writes keep the whole-repo default, since a push moves PR heads and starts
+  runs; reset, merge, rebase, revert and cherry-pick still take it for now,
+  and hot working-tree ops keep their narrow `invalidate`. The window-focus
+  pass refetches only active queries that are stale by their own staleTime
+  or errored, never a blanket invalidation.
+- **Push-like run recheck** — writes whose own default trigger starts CI for
+  the code they touch arm `recheckRunsAfterPush` (`queries/push-writes.ts`) on
+  success, because the run can appear, or flip status, after the settle-time
+  read. They are: pushing commits or tags; opening, reopening or landing a pull
+  request (origin-lens merge, GitLab arm-auto-merge) or updating its branch; a
+  resolve push; publishing or deleting a release; publishing a repository;
+  creating a linked branch on the origin lens; dispatching a workflow; and
+  re-running, playing or approving a run. Out of scope: non-default activity
+  types (ready-for-review) and other events (labels, comments, reviews, Pages
+  builds). Deletion pushes and cancel are reasoned exclusions. Some arms also
+  hand it `prChecksRecheck` (`queries/pr-actions.ts`), so the PR's checks
+  rollup and the list's CI badges are re-read with the run lists. Create, the
+  merge-resolve push (`useMergeRemotePr`), update-branch (on accept and on the
+  head move), reopen and merge name their PR; the finish-resolve push
+  (`useFinishRemotePrResolve`) covers every PR in its lens. A plain push,
+  re-run, re-run job, play job and approve name no PR and cover both lenses.
+  Merge hands them because a Bitbucket fast-forward puts the PR's head sha on
+  the base, and Bitbucket's checks read that sha's statuses; for any other
+  merge it is a precaution. A later arm re-arms the per-repo timer, and its
+  one fire covers every coalesced arm's reads. A remote-branch delete instead
+  schedules `recheckListsLater` with the keys its own call site builds
+  (GitHub closes a head-deleted PR asynchronously); a PR merge (unless queued),
+  close or reopen and an issue close or reopen arm the same re-read with
+  lens-scoped list keys, since the forge's list membership lags the row's own
+  state. Its per-repo entry holds the union of the keys owed and fires ONE
+  invalidation. Guards: `scripts/push-recheck-family.test.mjs` pins the arm
+  sites (the run rechecks, keyed on the api callees; the branch-delete and the
+  merge, close and reopen list re-reads, which no other write schedules), and
+  `scripts/push-writes.test.mjs` pins the union fire.
+- **Remote state re-file** — a write that changes a remote PR's or issue's
+  open/closed state (a merge unless queued, a close, a reopen) re-files that
+  row in every cached list page of its lens on success, right after arming
+  its delayed list re-read (it doesn't wait for that re-read to fire),
+  through `patchRowState` (`src/lib/remote-state-filter.ts`) via the
+  module-private twins `patchPrListState` / `patchIssueListState`: it
+  rewrites the row's state only, never inserting or removing a row, and an
+  untouched page bails so it keeps its identity. One deliberate non-member:
+  GitLab's arm-auto-merge (`useGlArmAutoMerge`) patches nothing even though
+  arming can merge at once, because its void outcome can't tell armed from
+  merged; the whole-repo invalidation covers an immediate merge. The
+  src/-wide scan in `scripts/remote-row-state-wiring.test.mjs` pins every
+  caller of the five forge state writes it can see; that test's header lists
+  the shapes the scan can't see.
+- **Run-scoped forge reads** — an automation pass shares its diff and each
+  action's review-activity read, and an interactive review run shares its one
+  review-activity read, through `createRunReads`
+  (`src/lib/automations/run-reads.ts`): single-flight, rejection-evicting, and
+  entries the run's own delivery can change are evicted after each action that
+  ran. Consumers never mutate a shared result.
 - **Mutation identity pinning** — every mutation is constructed through
   `useMutation` from `@/lib/started-mutation`, never react-query's own (guard:
   `raw-react-query-mutation`, with `started-mutation-present` pinning the
@@ -746,11 +1002,35 @@ one grep away on the named symbol. Grows via Conventions-sync.
   (`src/lib/plugin-store.ts`), never a hand-rolled `??= load(storeName(…))` or a
   bare `store.reload()`: the former memoizes a REJECTED load (store dead until
   restart), the latter swallows an unreadable file and saves the cache over it.
+  The `raw-store-reload` guard allowlists two files. `writeWithRollback`'s own
+  `reload({ ignoreDefaults: true })` (below): the tolerant reload treats a
+  missing or empty file as success without touching memory, so the failed
+  values would stay; the raw one rejects there and the helper falls back to
+  its pre-write snapshot instead. And the relocate migration's reloads
+  (`src/lib/repo-data-migration.ts`): re-homing runs outside the feature
+  modules' write queues and writes back unconditionally, so the tolerant
+  reload's tolerate-or-rethrow decision isn't the guard it needs. Every opener
+  passes `storeLoadOptions(file)`: autosave is off unless the file is in
+  `AUTOSAVE_STORES`, so each write force-saves or its file joins that list
+  (pinned by `scripts/plugin-store-rollback.test.mjs`).
 - **Plugin-store writes take the cross-process lock** — a store a second app
   instance (or the MCP server) can write wraps its read-modify-write in
   `withAppStoreLock` (`src/lib/app-store-lock.ts`): identity/git resolution
   BEFORE the lock, reload → mutate → forced `save()` inside it, all within the
   module's serialize queue. Advisory and fail-open; cold-start instances skip it.
+  Everything after the entry reload, the forced `save()` included, runs inside
+  `writeWithRollback(store, …)` (`src/lib/plugin-store-rollback.ts`), returned
+  from the lock callback: a failed write restores the store when it can (from
+  disk, else from its snapshot; when both fail, nothing is restored or saved)
+  and rethrows the original error, which callers' error handlers match on.
+- **Settings writes seed the cache** — component-started settings writes go
+  through the `src/lib/settings/queries.ts` hooks, and any new settings
+  `useMutation` spreads `...settingsSeedCallbacks(queryClient,
+  settingsKeys.settings)` (`src/lib/settings/heal.ts`): a resolved write leaves
+  its committed snapshot cached even when the re-read fails, unless a newer
+  settings mutation started. Raw api writers that bypass the hooks invalidate
+  the cache themselves. The queries.ts pin in
+  `scripts/settings-cache-seed.test.mjs` enforces the spread.
 - **Per-record repo scope** — a record offered per-repo-or-globally carries a
   `scope` string: the `"global"` sentinel (also the absent-value default) or
   an identity key. Reads match BOTH key forms (raw + identity, most-preferred
@@ -792,7 +1072,9 @@ one grep away on the named symbol. Grows via Conventions-sync.
   API) misroutes. A REV use keeps git's form or the full ref, never a stripped
   bare name, which resolves to a same-named tag first. `symbolic-ref` also
   answers on an unborn branch — a site that must refuse before the first commit
-  checks `head_is_unborn`.
+  checks `git::history::unborn_head`, which errs on a non-repository or an
+  unresolvable detached HEAD, and on git 2.43+ on a corrupt branch ref too
+  (`branches::head_is_unborn` still reads any failed probe as unborn).
 - **Branch names as revs** — a branch name never reaches a REV position (a
   range, a `^{commit}` peel, a rev-taking argv, a `fetch` refspec source) bare:
   gitrevisions resolves a same-named tag first. Resolve it via
@@ -808,6 +1090,12 @@ one grep away on the named symbol. Grows via Conventions-sync.
 
 - **Large ints over IPC:** snowflake/`u64` ids lose precision as JS numbers —
   serialize as strings end-to-end.
+- **Lean forge reads:** an MCP tool that needs one or two forge fields reads
+  them with a narrow `--json` view on the GitHub arm (`gh_pr_title_body`,
+  `gh_issue_node_id`, `gh_issue_summary`), never the full view, and non-GitHub
+  arms keep their `forge_*_view` until they get a lean read of their own. Reads
+  that should revalidate keep their argv unshaped (see *Cached GitHub reads stay
+  true*).
 - **Advisory probes fail SAFE toward inaction:** a probe whose verdict can
   unlock a destructive offer (`BranchRewriteStatus` is the model) keeps its
   VERDICT "unknown" on any failed sub-probe, and never ships a defaulted
@@ -818,6 +1106,17 @@ one grep away on the named symbol. Grows via Conventions-sync.
   reflog miss AND patch-twins present — strong evidence, not proof; the
   failure direction stays inaction), and the destructive action targets the
   measured sha, never a re-resolved ref.
+- **Cached GitHub reads stay true:** gh REST GETs that adopt runner.rs's
+  conditional layer (`run_gh_cached_get`/`run_gh_cached_get_raw`) key on
+  (repo_path, host, argv) with the auth epoch in the value, detect a 304
+  from the `-i` status line only, and never cache a failure; `bypasses()`
+  sends paginated, jq/template, include/cache, non-GET and field-without-GET
+  argv straight through. An in-app write that moves a cached repos/{slug} or
+  stack field evicts after the attempt (`invalidate_repo_meta_after` /
+  `invalidate_stack_memo_after` on the spawn's result), and form-feeding
+  reads stay fresh. Account-derived memos read the epoch before the fetch,
+  keep it in the value, and always carry a TTL (a terminal `gh auth` is
+  invisible to the app).
 - **GraphQL nullability:** fields without `!` deserialize into `Option<T>`;
   never `unwrap_or_default()` a `from_value`; confirm a field exists before
   querying it.
@@ -843,17 +1142,47 @@ one grep away on the named symbol. Grows via Conventions-sync.
   `parseableDate` for ISO strings, `validEpochMs` for epoch numbers
   (`src/lib/time.ts`); never raw `new Date(x)` on forge/CLI data.
 - **Windows spawning:** never pass multi-line argv to `.cmd` shims
-  (BatBadBut rejection) — feed multi-line input via stdin.
+  (BatBadBut rejection) — feed multi-line input via stdin. Generated launcher
+  scripts build through `agent_sandbox`'s `cmd_script_quoted`/`cmd_script_arg`
+  helpers under `CMD_SCRIPT_PRELUDE` (refusals before any write; `%` escaped;
+  trailing backslashes per the receiving program) — never inline
+  quote-wrapping into a script body.
 - **User input → git refspecs/argv** routes through the existing chokepoints:
   `validate_ref_name` (git/branches.rs), `validate_tag_name` (git/ops.rs),
   pushes via `build_push_args` (git/remote.rs) — never construct an inline
-  refspec or re-derive the validation. MCP tools push only through
-  `git_push_same_name_core` (it refuses a named push onto a differently named
-  branch of a named remote) and the HEAD-only `git_force_push_head_core`
-  (git/remote.rs); `git_push_core`, the GUI's follow-tracking entry, stays
-  private to `git::remote` so no MCP tool can reach it. Refs reaching a
-  compare-endpoint basehead route through `forge::validate_compare_branch`
-  (guard: check-rust-invariants check E).
+  refspec or re-derive the validation. Session-reserved branch names refuse
+  through the shared `refuse_session_branch_name`/`is_session_branch_name`
+  guard (git/branches.rs, case-insensitive) at every branch-minting entry
+  point; the two local-switch routes refuse only guess-creation so existing
+  session-named branches stay reachable — never re-derive the prefix check.
+  MCP tools push only through `git_push_same_name_core` (it refuses a named
+  push onto a differently named branch of a named remote) and the HEAD-only
+  `git_force_push_head_core` (git/remote.rs); `git_push_core`, the GUI's
+  follow-tracking entry, stays private to `git::remote` so no MCP tool can
+  reach it. Refs reaching a compare-endpoint basehead route through
+  `forge::validate_compare_branch` (guard: check-rust-invariants check E).
+  Branch names in GitHub REST paths encode via the escaping idiom (the
+  `refuse_braced` + `escape_branch_path` pair in rulesets.rs, and the twin
+  `escape_head_branch_path` in github/pr.rs — `%`/`#` encoded, braces refused
+  before the call); Bitbucket requests resolve through the one choke point
+  `forge::http::resolve_url`, which accepts absolute URLs only on `BB_API_BASE`.
+  A repo-relative path that a git/ write command receives over IPC and joins
+  onto the working tree passes `discard_rel_path` (git/ops.rs) before the join
+  (in conflict.rs through its wrapper `conflict_rel_path`), even when git
+  listed it first, with the site's own operation sentence around its reason,
+  and git receives the spelling it returns. The one exemption is an ignore
+  rule's `source`, which may legitimately be absolute or inside `.git`.
+  MCP git write tools that take paths pass `GitDesktopMcp::toplevel()` to
+  their cores, or call a core that anchors itself as the discard cores do, so
+  paths resolve from the root `repo_status` reports.
+- **Patch-producing `git diff` argv carry `--no-ext-diff`; never add
+  `--no-textconv`:** external drivers replace the app's patches;
+  exemptions require `--numstat`/`--name-only`/`--name-status` and no literal
+  option after the verb and before `--` outside check K's known-no-patch
+  list, since other options may enable a patch or trust a driver's verdict.
+  Anything else, including `--quiet`, `--exit-code`, `--binary` and patch
+  flags, needs `--no-ext-diff`; `--ext-diff` is refused before `--` in any
+  argv-shaped group (guard: check-rust-invariants check K).
 - **Merges into a checkout check for ignored files first:** git's merge
   default silently replaces an ignored file the incoming side tracks, and
   merge-ort ignores `--no-overwrite-ignore` on 3-way merges (measured, git
@@ -912,6 +1241,47 @@ one grep away on the named symbol. Grows via Conventions-sync.
   `@lezer/highlight` drops theme coloring — neither shows in build or tests.
   Remedy is `pnpm dedupe`, then an `overrides:` pin in `pnpm-workspace.yaml`
   for a split that survives it.
+- **Rate limits and absent gh reads:** limit copy comes from `forge-backoff.ts`,
+  never a hard-coded provider: `rateLimitSummary` gives the one-sentence reason
+  and `rateLimitClause` is the one spelling of "while {Provider}'s API rate
+  limit is in effect", both over the one kind→provider map `FORGE_KIND_HOSTS`
+  and the runner-pinned `HELD_RATE_LIMIT_TEXTS`. `rateLimitSummary` answers only
+  for a bare limit, so a cause an app headline wraps keeps that headline. A Rust
+  gh read that can mean absence sends a failure through `classify_gh_failure` in
+  a pure `*_outcome` fn (RateLimited/Transport → Err, NotFound/Answered →
+  absence), never "none" on a non-zero exit (guard: check-rust-invariants check
+  J). The exceptions: star status (github/pr.rs, forge/github.rs) and the
+  Explore README map Answered → Err too. An exit-0 body that won't parse rejects
+  as well, while a parsed body missing a field keeps that field's meaning; the
+  lock read needs a readable `locked`. The repo view is exempt: unreadable, it
+  stays forge-status's Unresolved.
+- **gh rate-limit hold:** `github/runner.rs` holds a gh call whose argv
+  classifies to a limited (host, bucket) pair (REST core, GraphQL or search)
+  and returns gh-shaped rate-limit stderr without spawning. Evidence comes
+  from `forge::session::gh_error_is_rate_limit` (the one shared predicate) or
+  a 429 status line. A hold ends when it runs out, when a call on its bucket
+  that started after it succeeds (or gets a non-limit 4xx), on a recheck that
+  sees quota (primary holds only, never before any secondary evidence on the
+  hold has run out: a quota read can't lift a secondary limit), or on an
+  auth-epoch bump. A result from a call or probe that started before the hold
+  may lengthen it but never clears or shortens it. A new gh family joins
+  `classify_call` only after its bucket is verified in gh's source, and
+  unknown argv is never held. Frontend retry and backoff key on the shared
+  `isRateLimitError` / `isAuthError` (`src/lib/forge-backoff.ts`), never a
+  re-spelled match.
+- **CI run polling** (run lists, run details, PR rollups) takes its cadence
+  from `src/lib/github/run-poll.ts` (a run-age ladder that `waiting` runs ride
+  like any active run, and a list rule congruent with `notifyPollInterval`),
+  never a flat per-run interval; the branch badge's `useLatestRun` and the run
+  notifier keep their own cadence. GitHub PR rollups watch runs through one
+  head-sha list poll plus jobs reads only while the rollup is open
+  (`useHeadRuns` / `useRunJobs`). While open, the bounded re-check in
+  `src/features/pulls/check-recheck.ts` covers a check still pending over a
+  finished row. Keyed on the check's attempt (the run's full job-id set),
+  never the row, it reads the head list on first sight, re-reads it with the
+  PR's checks at 15/30/60 s, then parks. A row seen executing pauses it and
+  its next finish starts one fresh episode; collapsing the rollup or hiding
+  its tab pauses it without resolving it.
 
 ## Code comments
 
@@ -982,11 +1352,8 @@ sweep stale "coming soon" mentions when a feature ships.
 - **Conventions-sync:** a change that builds a reusable primitive adds its line
   to THIS file in the same change (the docs-sync rule, applied to idioms). A
   change to a hard rule also updates every file that states that rule, wherever
-  it is restated — the always-loaded excerpt `.claude/rules/git-safety.md`, the
-  repo `AGENTS.md`, the agent definitions, and any carrier added later;
-  `scripts/check-rule-mirrors.mjs` holds the gated list for the git whitelist
-  and fails when a carrier drops the rule's core (the codex spec preamble
-  restates it condensed, synced by hand).
+  it is restated — the always-loaded excerpt `.claude/rules/repo-safety.md`, the
+  repo `AGENTS.md`, and any carrier added later.
 - **No inline gate predicates in CI YAML:** a check's logic never ships as an
   inline `node -e`/shell string in a workflow file — it is invisible to biome,
   to `node --test`, and to every static review lane (four independent defects
@@ -1017,4 +1384,4 @@ registration wired for new UI; docs-sync per the spec's `Docs-sync:` field
 (gaps flagged, never silently skipped); footprint sweep via
 `git --no-pager status` accounting for YOUR files only (the tree may hold the
 user's parallel WIP and sibling packages — don't touch or explain what isn't
-yours); nothing committed, ever.
+yours).
