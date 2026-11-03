@@ -3,8 +3,9 @@
 //! These commands feed a conflicted file's three sides to the frontend (which
 //! asks the configured review model to propose a merge) and apply the user's
 //! accepted result. Nothing here calls a model — the AI round-trip lives in the
-//! webview, reusing the same streaming engine as PR review. The only write path
-//! is `git_resolve_conflict`, gated behind an explicit user accept in the UI.
+//! webview, reusing the same streaming engine as PR review. The write paths are
+//! `git_resolve_conflict_core` and `git_checkout_conflict_side_core`, both reached
+//! only through an explicit user action in the UI.
 
 use std::path::{Component, Path};
 
@@ -13,7 +14,8 @@ use tauri::State;
 
 use crate::error::{AppError, AppResult};
 use crate::git::runner::{
-    acquire_repo_lock, run_git, run_git_mutating, run_git_raw, DEFAULT_TIMEOUT, LOCK_WAIT_TIMEOUT,
+    acquire_repo_lock, run_git, run_git_raw, run_git_raw_index_retry, DEFAULT_TIMEOUT,
+    LOCK_WAIT_TIMEOUT,
 };
 use crate::state::AppState;
 
@@ -53,6 +55,63 @@ pub struct ConflictSides {
     /// UTF-8 — every string here that an AI resolution splices and writes back is
     /// then lossy, so the AI flow must refuse even when the working file is clean.
     pub undecodable: bool,
+    /// Lowercase hex SHA-1 of the working file's raw bytes at this read; `None`
+    /// when the file is absent (`working_exists` false). The write guard's
+    /// expected value: `git_resolve_conflict` refuses when the live bytes no
+    /// longer hash to it, unless they already equal the content being written.
+    pub working_hash: Option<String>,
+    /// Whether the raw working bytes match the single surviving side's raw
+    /// blob bytes after CRLF→LF normalization (the byte-truth twin of the
+    /// frontend's `nlf`: every 0x0D 0x0A pair → 0x0A, lone 0x0D kept).
+    /// `None` unless exactly one of ours/theirs is present AND the working
+    /// file exists.
+    pub working_matches_survivor: Option<bool>,
+}
+
+/// Lowercase hex SHA-1 of `bytes`.
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    // digest 0.11's output Array has no LowerHex, so hex-encode byte by byte.
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `nlf` (conflict-parse.ts) on bytes: one left-to-right pass replacing each
+/// non-overlapping `\r\n` pair with `\n`, every other byte kept as-is.
+fn nlf_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            out.push(b'\n');
+            i += 2;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Verdict of a hash-guarded conflict-resolution write.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ResolveConflictOutcome {
+    /// The live bytes matched the caller's read; the resolution was written
+    /// (and staged when asked).
+    Written,
+    /// The working file changed after the caller's read — edited, deleted, or
+    /// created where the read saw none. Nothing was written or staged.
+    ChangedOnDisk,
 }
 
 /// The AI-ignore gate's answer for one conflicted path. `unreadable` implies
@@ -65,19 +124,100 @@ pub struct AiIgnoreVerdict {
     pub unreadable: bool,
 }
 
-/// Rejects paths that could be read as a git flag or escape the repo root. The
-/// path comes from git status (trusted-ish), but the write path
-/// (`git_resolve_conflict`) makes traversal worth refusing defensively.
+/// Rejects empty paths and paths that could escape the repo root. The
+/// path comes from git status (trusted-ish), but the write paths
+/// (`git_resolve_conflict_core`, `git_checkout_conflict_side_core`) make traversal
+/// worth refusing defensively.
 fn validate_rel_path(path: &str) -> AppResult<()> {
     let p = Path::new(path);
     if path.is_empty()
-        || path.starts_with('-')
         || p.is_absolute()
         || p.components().any(|c| matches!(c, Component::ParentDir))
     {
         return Err(AppError::InvalidArgument(format!("invalid path: {path}")));
     }
     Ok(())
+}
+
+/// The sentence refusal for the leading-dash check and the shared path gate; the pane keys
+/// on its opening via ConflictFileView.tsx's PATH_REFUSAL_PREFIX.
+fn conflict_path_refusal(path: &str, why: &str) -> AppError {
+    let shown = crate::git::ops::discard_shown(path);
+    AppError::InvalidArgument(format!(
+        "Can't resolve the conflict in {shown} — {why}. Nothing was changed."
+    ))
+}
+
+/// Refuse leading-dash paths with a sentence before the three `invalid path:` refusals;
+/// the shared gate then refuses or returns git's spelling.
+fn conflict_rel_path(path: &str) -> AppResult<String> {
+    if path.starts_with('-') {
+        return Err(conflict_path_refusal(path, "its path starts with \"-\""));
+    }
+    validate_rel_path(path)?;
+    crate::git::ops::discard_rel_path(path).map_err(|why| conflict_path_refusal(path, why))
+}
+
+/// The refusal reason for a symbolic link AT the conflicted path. Distinct from
+/// `DISCARD_LINKED` (a linked ancestor): the conflict pane keeps Accept all
+/// offered for this one, keyed on this string, pinned by
+/// scripts/conflict-path-refusal.test.mjs.
+const CONFLICT_LINKED_LEAF: &str = "it's a symbolic link";
+
+/// Whether the leaf is a Windows directory link (a junction or directory
+/// symlink). Git for Windows may lstat a junction as a directory and clear it
+/// recursively, reaching through it, so this leaf is refused like an ancestor.
+#[cfg(windows)]
+fn leaf_is_directory_link(base: &str, rel: &str) -> std::io::Result<bool> {
+    use std::os::windows::fs::FileTypeExt;
+    let full = Path::new(base).join(rel);
+    let spelling = crate::fsops::verbatim_path(&full)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no verbatim form"))?;
+    match std::fs::symlink_metadata(spelling) {
+        Ok(m) => Ok(m.file_type().is_symlink_dir()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(windows))]
+fn leaf_is_directory_link(_base: &str, _rel: &str) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Refuses `path` when a component below `base` is a symbolic link or junction:
+/// an ancestor or a Windows directory-link leaf always (`DISCARD_LINKED`), any
+/// other leaf link when `include_leaf` (`CONFLICT_LINKED_LEAF`). `base` must be
+/// the root the caller's read or write joins, so the walk covers exactly the
+/// path that gets opened.
+async fn refuse_linked_path(base: &str, path: &str, include_leaf: bool) -> AppResult<()> {
+    let (walk_base, walk_rel) = (base.to_string(), path.to_string());
+    let why = tauri::async_runtime::spawn_blocking(move || -> std::io::Result<_> {
+        use crate::git::ops::linked_component;
+        let carrier = linked_component(&walk_base, &walk_rel, false)?
+            || leaf_is_directory_link(&walk_base, &walk_rel)?;
+        Ok(if carrier {
+            Some(crate::git::ops::DISCARD_LINKED)
+        } else if include_leaf && linked_component(&walk_base, &walk_rel, true)? {
+            Some(CONFLICT_LINKED_LEAF)
+        } else {
+            None
+        })
+    })
+    .await
+    .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(AppError::Io)?;
+    match why {
+        Some(why) => Err(conflict_path_refusal(path, why)),
+        None => Ok(()),
+    }
 }
 
 /// Reads a blob from an unmerged index stage (1 = base, 2 = ours, 3 = theirs).
@@ -87,18 +227,19 @@ fn validate_rel_path(path: &str) -> AppResult<()> {
 /// after the listing (`None`, agreeing with the index); still listed is an
 /// `AppError::Git`, never `None`, so a failed read can't pass for an absent side.
 /// The `bool` is whether the blob's raw bytes are invalid UTF-8 (the text is
-/// then a lossy decode), decided before decoding.
+/// then a lossy decode), decided before decoding; the raw bytes ride along for
+/// byte-truth compares.
 async fn stage_blob(
     repo: &str,
     present: &[u8],
     stage: u8,
     path: &str,
-) -> AppResult<Option<(String, bool)>> {
+) -> AppResult<Option<(String, bool, Vec<u8>)>> {
     if !present.contains(&stage) {
         return Ok(None);
     }
     // `:N:path` is a single rev-spec arg; a leading `-` in the path can't be read
-    // as a flag because the `:N:` prefix comes first. validate_rel_path already
+    // as a flag because the `:N:` prefix comes first. conflict_rel_path already
     // refused absolute/traversal paths.
     let spec = format!(":{stage}:{path}");
     let out = run_git_raw(Some(repo), &["show", &spec], DEFAULT_TIMEOUT).await?;
@@ -111,7 +252,7 @@ async fn stage_blob(
     }
     let out = out.exit_verdict()?;
     let undecodable = std::str::from_utf8(&out.stdout).is_err();
-    Ok(Some((out.stdout_lossy(), undecodable)))
+    Ok(Some((out.stdout_lossy(), undecodable, out.stdout)))
 }
 
 /// The unmerged index stages present for `spec` (1 = base, 2 = ours, 3 = theirs).
@@ -179,7 +320,10 @@ pub async fn git_conflict_sides(
     path: String,
     exclude: Vec<String>,
 ) -> AppResult<ConflictSides> {
-    validate_rel_path(&path)?;
+    let path = conflict_rel_path(&path)?;
+    // Ahead of every read: a link on the path would feed a file outside the
+    // repository to the hash, the editor and the AI prompt.
+    refuse_linked_path(&repo_path, &path, true).await?;
 
     let ai_ignored = is_ai_ignored(&repo_path, &path, &exclude).await?;
 
@@ -219,17 +363,29 @@ pub async fn git_conflict_sides(
     let undecodable = working_undecodable
         || [&base, &ours, &theirs]
             .iter()
-            .any(|blob| blob.as_ref().is_some_and(|(_, bad)| *bad));
+            .any(|blob| blob.as_ref().is_some_and(|(_, bad, _)| *bad));
+    // From the reads' own Options, not `present`: the re-list arm in
+    // `stage_blob` can read a listed stage as gone, and `deletedSide` reads these.
+    let survivor = match (&ours, &theirs) {
+        (Some((_, _, raw)), None) | (None, Some((_, _, raw))) => Some(raw),
+        _ => None,
+    };
+    let working_matches_survivor = survivor
+        .filter(|_| working_exists)
+        .map(|raw| nlf_bytes(&working_bytes) == nlf_bytes(raw));
+    let working_hash = working_exists.then(|| sha1_hex(&working_bytes));
 
     Ok(ConflictSides {
         working,
-        base: base.map(|(text, _)| text),
-        ours: ours.map(|(text, _)| text),
-        theirs: theirs.map(|(text, _)| text),
+        base: base.map(|(text, _, _)| text),
+        ours: ours.map(|(text, _, _)| text),
+        theirs: theirs.map(|(text, _, _)| text),
         ai_ignored,
         working_exists,
         working_undecodable,
         undecodable,
+        working_hash,
+        working_matches_survivor,
     })
 }
 
@@ -245,8 +401,13 @@ tokio::task_local! {
 /// conflict resolved (drops it from the conflict count and lets the
 /// merge/rebase/cherry-pick Continue). Per-region resolution writes without
 /// staging while markers remain, then stages on the final region; the AI flow
-/// and whole-file accepts stage immediately. The UI only reaches this after the
-/// user reviews and accepts.
+/// stages unless its proposal still carries markers. The UI only reaches this
+/// after the user reviews and accepts.
+///
+/// `expected_hash` is the `working_hash` of the read the content was built
+/// from; `None` means that read found no file, so a missing key fails closed
+/// for any file that exists now. Either way, live bytes that already equal the
+/// content being written proceed, since rewriting them loses nothing.
 #[tauri::command]
 pub async fn git_resolve_conflict(
     state: State<'_, AppState>,
@@ -254,17 +415,59 @@ pub async fn git_resolve_conflict(
     path: String,
     content: String,
     stage: bool,
-) -> AppResult<()> {
-    validate_rel_path(&path)?;
+    expected_hash: Option<String>,
+) -> AppResult<ResolveConflictOutcome> {
+    git_resolve_conflict_core(&state, repo_path, path, content, stage, expected_hash).await
+}
+
+async fn git_resolve_conflict_core(
+    state: &AppState,
+    repo_path: String,
+    path: String,
+    content: String,
+    stage: bool,
+    expected_hash: Option<String>,
+) -> AppResult<ResolveConflictOutcome> {
+    let path = conflict_rel_path(&path)?;
     let full = Path::new(&repo_path).join(&path);
+
+    // One hold across compare, write and add, so two in-app writers can't both
+    // pass the compare and interleave their writes. Lock-free runners only while
+    // held (see `run_git_mutating`).
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a conflict resolution").await?;
+    // Under the hold, before the live read: a link on the path would compare
+    // and overwrite (or, dangling, create) a file outside the repository.
+    refuse_linked_path(&repo_path, &path, true).await?;
+
+    // Any read failure but NotFound is an error, never a defaulted verdict.
+    let live = match tokio::fs::read(&full).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(AppError::Io(e)),
+    };
+    let unchanged = match (&expected_hash, &live) {
+        (None, None) => true,
+        (Some(hash), Some(bytes)) => sha1_hex(bytes) == *hash,
+        _ => false,
+    };
+    // Rewriting the bytes already on disk loses nothing (a retry after a landed
+    // write whose add failed); a file deleted since the read always refuses.
+    let already_written = live.as_deref() == Some(content.as_bytes());
+    if !unchanged && !already_written {
+        return Ok(ResolveConflictOutcome::ChangedOnDisk);
+    }
+
     tokio::fs::write(&full, content)
         .await
         .map_err(AppError::Io)?;
     if stage {
         let spec = crate::git::pathspec::literal(&path);
-        run_git_mutating(&state, &repo_path, &["add", "--", &spec], DEFAULT_TIMEOUT).await?;
+        run_git_raw_index_retry(&repo_path, &["add", "--", &spec], DEFAULT_TIMEOUT)
+            .await?
+            .exit_verdict()?;
     }
-    Ok(())
+    Ok(ResolveConflictOutcome::Written)
 }
 
 /// Resolves a whole conflicted file by taking one side outright: `side` is
@@ -289,7 +492,7 @@ pub(crate) async fn git_checkout_conflict_side_core(
     path: String,
     side: String,
 ) -> AppResult<()> {
-    validate_rel_path(&path)?;
+    let path = conflict_rel_path(&path)?;
     let (flag, stage) = match side.as_str() {
         "ours" => ("--ours", 2u8),
         "theirs" => ("--theirs", 3u8),
@@ -310,6 +513,10 @@ pub(crate) async fn git_checkout_conflict_side_core(
     // held (see `run_git_mutating`).
     let domain = state.working_tree_lock(&repo_path).await;
     let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a conflict resolution").await?;
+    // Not a leaf link, which git replaces or removes itself (a Windows directory
+    // link stays refused): a linked ancestor could carry the checkout or removal
+    // outside the repository.
+    refuse_linked_path(&repo_path, &path, false).await?;
 
     // A side that removed the file (deleted it, or renamed it away) has no stage
     // entry, and `checkout --ours|--theirs` then exits 1 ("does not have our
@@ -354,19 +561,13 @@ pub(crate) async fn git_checkout_conflict_side_core(
 /// paths never surface).
 #[tauri::command]
 pub async fn git_diff_contents(old: String, new: String) -> AppResult<String> {
-    let dir = std::env::temp_dir().join(format!(
-        "gd-conflict-diff-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(AppError::Io)?;
-    let old_path = dir.join("ours");
-    let new_path = dir.join("proposed");
+    let dir =
+        tokio::task::spawn_blocking(|| crate::agent_sandbox::private_temp_dir("gd-conflict-diff-"))
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(AppError::Io)?;
+    let old_path = dir.path().join("ours");
+    let new_path = dir.path().join("proposed");
     let result = async {
         tokio::fs::write(&old_path, &old).await.map_err(AppError::Io)?;
         tokio::fs::write(&new_path, &new).await.map_err(AppError::Io)?;
@@ -374,6 +575,7 @@ pub async fn git_diff_contents(old: String, new: String) -> AppResult<String> {
             None,
             &[
                 "diff",
+                "--no-ext-diff",
                 "--no-index",
                 "--no-color",
                 "--",
@@ -394,13 +596,13 @@ pub async fn git_diff_contents(old: String, new: String) -> AppResult<String> {
         Ok(out.stdout_lossy())
     }
     .await;
-    let _ = tokio::fs::remove_dir_all(&dir).await;
+    let _ = tokio::task::spawn_blocking(move || dir.close()).await;
     result
 }
 
-/// Test-only helper: the body of `git_resolve_conflict` without the Tauri
-/// `State` (the repo lock the command takes isn't needed in a single-threaded
-/// test), so the resolve path is exercised end-to-end against a real repo.
+/// `git_resolve_conflict_core`'s write-then-add without the path gate, the literal
+/// pathspec, `State`, the working-tree lock, the expected-hash guard, or the
+/// add's one-shot index.lock retry.
 #[cfg(test)]
 pub(crate) async fn resolve_for_test(repo: &str, path: &str, content: &str) {
     use crate::git::runner::run_git;
@@ -416,6 +618,209 @@ pub(crate) async fn resolve_for_test(repo: &str, path: &str, content: &str) {
 mod tests {
     use super::*;
     use crate::git::runner::run_git;
+
+    #[tokio::test]
+    async fn private_temp_diff_contents_concurrent_calls_stay_separate() {
+        let (first, second) = tokio::join!(
+            git_diff_contents("first-old\n".into(), "first-new\n".into()),
+            git_diff_contents("second-old\n".into(), "second-new\n".into()),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(first.contains("\n-first-old\n"));
+        assert!(first.contains("\n+first-new\n"));
+        assert!(!first.contains("second-old"));
+        assert!(!first.contains("second-new"));
+        assert!(second.contains("\n-second-old\n"));
+        assert!(second.contains("\n+second-new\n"));
+        assert!(!second.contains("first-old"));
+        assert!(!second.contains("first-new"));
+    }
+
+    #[tokio::test]
+    async fn conflict_commands_refuse_git_dir_paths() {
+        let (dir, repo) = conflicted_repo("path-gate", "file.txt", &[]).await;
+        let state = AppState::default();
+        let probe = dir.path().join(".git/gd-probe.txt");
+        std::fs::write(&probe, "keep\n").unwrap();
+        let config = std::fs::read(dir.path().join(".git/config")).unwrap();
+        for path in [".git/config", "sub/.git/x", ".git/gd-probe.txt"] {
+            let expected = format!(
+                "invalid argument: Can't resolve the conflict in {path} — it's inside the repository's .git folder. Nothing was changed."
+            );
+            assert_eq!(
+                git_conflict_sides(repo.clone(), path.into(), vec![])
+                    .await
+                    .err()
+                    .expect("conflict path must refuse")
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_resolve_conflict_core(
+                    &state,
+                    repo.clone(),
+                    path.into(),
+                    "x".into(),
+                    false,
+                    None
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_checkout_conflict_side_core(&state, repo.clone(), path.into(), "ours".into())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(std::fs::read(&probe).unwrap(), b"keep\n");
+        assert_eq!(
+            std::fs::read(dir.path().join(".git/config")).unwrap(),
+            config
+        );
+        assert!(!dir.path().join("sub/.git/x").exists());
+        #[cfg(windows)]
+        let absolute = "C:\\x";
+        #[cfg(not(windows))]
+        let absolute = "/x";
+        for path in ["", absolute, "../x"] {
+            let expected = format!("invalid argument: invalid path: {path}");
+            assert_eq!(
+                git_conflict_sides(repo.clone(), path.into(), vec![])
+                    .await
+                    .err()
+                    .expect("conflict path must refuse")
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_resolve_conflict_core(
+                    &state,
+                    repo.clone(),
+                    path.into(),
+                    "x".into(),
+                    false,
+                    None
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_checkout_conflict_side_core(&state, repo.clone(), path.into(), "ours".into())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_commands_refuse_leading_dash_paths() {
+        let (dir, repo) = conflicted_repo("dash-path-gate", "file.txt", &[]).await;
+        let state = AppState::default();
+        for path in ["-x", "-dir/x"] {
+            let shown = crate::git::ops::discard_shown(path);
+            let expected = format!(
+                "invalid argument: Can't resolve the conflict in {shown} — its path starts with \"-\". Nothing was changed."
+            );
+            assert_eq!(
+                git_conflict_sides(repo.clone(), path.into(), vec![])
+                    .await
+                    .err()
+                    .expect("conflict path must refuse")
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_resolve_conflict_core(
+                    &state,
+                    repo.clone(),
+                    path.into(),
+                    "x".into(),
+                    false,
+                    None
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+            assert_eq!(
+                git_checkout_conflict_side_core(&state, repo.clone(), path.into(), "ours".into())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert!(!dir.path().join("-x").exists());
+        assert!(!dir.path().join("-dir").exists());
+        assert_eq!(conflict_rel_path("dir/-x").unwrap(), "dir/-x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conflict_rel_path_refuses_windows_alias_spellings() {
+        for path in ["C:x", "\\x", "/x"] {
+            assert_eq!(conflict_rel_path(path).unwrap_err().to_string(), format!(
+                "invalid argument: Can't resolve the conflict in {path} — it isn't inside this repository's working tree. Nothing was changed."
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolve_refuses_windows_alias_spellings() {
+        let (dir, repo) = conflicted_repo("resolve-alias", "file.txt", &[]).await;
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        let probe = dir.path().join(".git/gd-probe.txt");
+        std::fs::write(&probe, "keep\n").unwrap();
+        let shell = "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+        std::fs::create_dir(dir.path().join(shell)).unwrap();
+        for (path, why) in [
+            (
+                "a./b.txt",
+                "Windows reads a name ending in a dot or space as a different path",
+            ),
+            (
+                "a /b.txt",
+                "Windows reads a name ending in a dot or space as a different path",
+            ),
+            (
+                ".GIT/gd-probe.txt",
+                "it's inside the repository's .git folder",
+            ),
+            (
+                "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}/y",
+                "Windows treats a name ending in .{GUID} as a shell link",
+            ),
+        ] {
+            let err = git_resolve_conflict_core(
+                &AppState::default(),
+                repo.clone(),
+                path.into(),
+                "x".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.to_string(), format!(
+                "invalid argument: Can't resolve the conflict in {path} — {why}. Nothing was changed."
+            ));
+            assert!(!dir.path().join("a/b.txt").exists());
+            assert_eq!(std::fs::read(&probe).unwrap(), b"keep\n");
+            assert!(!dir.path().join(shell).join("y").exists());
+        }
+    }
 
     fn temp_repo(tag: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::Builder::new()
@@ -614,6 +1019,19 @@ mod tests {
         path: &str,
         deleted_by: &str,
     ) -> (tempfile::TempDir, String) {
+        modify_delete_repo_with(tag, path, deleted_by, b"ours\n", b"theirs\n").await
+    }
+
+    /// `modify_delete_repo` whose modifying side commits the given BYTES (`ours`
+    /// when theirs deletes, `theirs` when ours deletes), so a survivor blob can be
+    /// minted that isn't valid UTF-8.
+    async fn modify_delete_repo_with(
+        tag: &str,
+        path: &str,
+        deleted_by: &str,
+        ours: &[u8],
+        theirs: &[u8],
+    ) -> (tempfile::TempDir, String) {
         let (dir, repo) = temp_repo(tag);
         git_ok(&repo, &["init"]).await;
         git_ok(&repo, &["config", "user.email", "t@t"]).await;
@@ -631,7 +1049,7 @@ mod tests {
         if deleted_by == "theirs" {
             git_ok(&repo, &["rm", "-q", "--", path]).await;
         } else {
-            std::fs::write(&file, "theirs\n").unwrap();
+            std::fs::write(&file, theirs).unwrap();
             git_ok(&repo, &["add", "--", path]).await;
         }
         git_ok(&repo, &["commit", "-m", "feature"]).await;
@@ -640,7 +1058,7 @@ mod tests {
         if deleted_by == "ours" {
             git_ok(&repo, &["rm", "-q", "--", path]).await;
         } else {
-            std::fs::write(&file, "ours\n").unwrap();
+            std::fs::write(&file, ours).unwrap();
             git_ok(&repo, &["add", "--", path]).await;
         }
         git_ok(&repo, &["commit", "-m", "ours"]).await;
@@ -1182,5 +1600,576 @@ mod tests {
         assert!(sides.working.contains("<<<<<<<"), "fixture not conflicted");
         assert!(!sides.working_undecodable);
         assert!(!sides.undecodable);
+    }
+
+    async fn sides_of(repo: &str, path: &str) -> ConflictSides {
+        git_conflict_sides(repo.into(), path.into(), vec![])
+            .await
+            .unwrap()
+    }
+
+    async fn resolve(
+        repo: &str,
+        path: &str,
+        content: &str,
+        stage: bool,
+        expected_hash: Option<String>,
+    ) -> ResolveConflictOutcome {
+        git_resolve_conflict_core(
+            &AppState::default(),
+            repo.into(),
+            path.into(),
+            content.into(),
+            stage,
+            expected_hash,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn sha1_hex_is_lowercase_hex_of_the_bytes() {
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    /// The wire shapes the TS mirror narrows on.
+    #[tokio::test]
+    async fn resolve_outcome_and_sides_wire_keys() {
+        assert_eq!(
+            serde_json::to_value(ResolveConflictOutcome::Written).unwrap(),
+            serde_json::json!({ "kind": "written" })
+        );
+        assert_eq!(
+            serde_json::to_value(ResolveConflictOutcome::ChangedOnDisk).unwrap(),
+            serde_json::json!({ "kind": "changedOnDisk" })
+        );
+        let (_dir, repo) = conflicted_repo("guard-wire", "file.txt", &[]).await;
+        let json = serde_json::to_value(sides_of(&repo, "file.txt").await).unwrap();
+        let disk = std::fs::read(Path::new(&repo).join("file.txt")).unwrap();
+        assert_eq!(json["workingHash"], serde_json::json!(sha1_hex(&disk)));
+        assert_eq!(
+            json.get("workingMatchesSurvivor"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    /// The refusal contract: an outside edit landing after the read (UTF-8 or
+    /// not) keeps its exact bytes on disk, and the index keeps its stages.
+    #[tokio::test]
+    async fn resolve_refuses_an_outside_edit_after_the_read() {
+        let (_dir, repo) = conflicted_repo("guard-edit", "file.txt", &[]).await;
+        let read = sides_of(&repo, "file.txt").await;
+        assert!(read.working_hash.is_some());
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            before.contains("file.txt"),
+            "fixture not conflicted: {before}"
+        );
+        let file = Path::new(&repo).join("file.txt");
+        for edit in [b"outside edit\n".as_slice(), b"outside \xFC edit\n"] {
+            std::fs::write(&file, edit).unwrap();
+            for stage in [false, true] {
+                let outcome = resolve(
+                    &repo,
+                    "file.txt",
+                    "resolved\n",
+                    stage,
+                    read.working_hash.clone(),
+                )
+                .await;
+                assert_eq!(outcome, ResolveConflictOutcome::ChangedOnDisk);
+                assert_eq!(std::fs::read(&file).unwrap(), edit);
+                assert_eq!(stdout_of(&repo, &["ls-files", "-u"]).await, before);
+            }
+        }
+    }
+
+    /// A file deleted after a read that saw it refuses even when the content is
+    /// empty: the identical-bytes exemption never recreates a deleted file.
+    #[tokio::test]
+    async fn resolve_refuses_a_file_deleted_after_the_read() {
+        let (_dir, repo) = conflicted_repo("guard-deleted", "file.txt", &[]).await;
+        let read = sides_of(&repo, "file.txt").await;
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+        let file = Path::new(&repo).join("file.txt");
+        std::fs::remove_file(&file).unwrap();
+        for content in ["resolved\n", ""] {
+            let outcome =
+                resolve(&repo, "file.txt", content, true, read.working_hash.clone()).await;
+            assert_eq!(
+                outcome,
+                ResolveConflictOutcome::ChangedOnDisk,
+                "{content:?}"
+            );
+            assert!(!file.exists(), "the deleted file came back: {content:?}");
+            assert_eq!(stdout_of(&repo, &["ls-files", "-u"]).await, before);
+        }
+    }
+
+    /// A read that found no file passes `None`: a file created since then
+    /// refuses, and one still absent takes the write.
+    #[tokio::test]
+    async fn resolve_null_hash_refuses_a_created_file_and_writes_an_absent_one() {
+        let (_dir, repo) = modify_delete_repo("guard-null", "file.txt", "ours").await;
+        let file = Path::new(&repo).join("file.txt");
+        std::fs::remove_file(&file).unwrap();
+        let read = sides_of(&repo, "file.txt").await;
+        assert!(!read.working_exists);
+        assert_eq!(read.working_hash, None);
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+
+        std::fs::write(&file, "recreated\n").unwrap();
+        let outcome = resolve(&repo, "file.txt", "resolved\n", true, None).await;
+        assert_eq!(outcome, ResolveConflictOutcome::ChangedOnDisk);
+        assert_eq!(std::fs::read(&file).unwrap(), b"recreated\n");
+        assert_eq!(stdout_of(&repo, &["ls-files", "-u"]).await, before);
+
+        std::fs::remove_file(&file).unwrap();
+        let outcome = resolve(&repo, "file.txt", "resolved\n", true, None).await;
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        assert_eq!(std::fs::read(&file).unwrap(), b"resolved\n");
+        let unmerged = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            unmerged.trim().is_empty(),
+            "conflict left behind: {unmerged}"
+        );
+    }
+
+    /// An outside save of the very same bytes (CRLF intact) hashes equal, so the
+    /// guard never refuses an unchanged file.
+    #[tokio::test]
+    async fn resolve_accepts_an_identical_bytes_resave() {
+        let (_dir, repo) = conflicted_repo("guard-resave", "file.txt", &[]).await;
+        let file = Path::new(&repo).join("file.txt");
+        let crlf = b"<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> feature\r\n";
+        std::fs::write(&file, crlf).unwrap();
+        let read = sides_of(&repo, "file.txt").await;
+        std::fs::write(&file, crlf).unwrap();
+        let outcome = resolve(&repo, "file.txt", "ours\r\n", false, read.working_hash).await;
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        assert_eq!(std::fs::read(&file).unwrap(), b"ours\r\n");
+    }
+
+    /// The per-region walk: each accept carries the hash of the read taken after
+    /// the previous write, so a two-region file resolves without a false refusal
+    /// (while the first read's hash, stale after our own write, refuses).
+    #[tokio::test]
+    async fn resolve_walks_a_multi_region_file_on_fresh_reads() {
+        let (_dir, repo) = conflicted_repo("guard-walk", "file.txt", &[]).await;
+        let file = Path::new(&repo).join("file.txt");
+        let region =
+            |n: u8| format!("<<<<<<< HEAD\nours{n}\n=======\ntheirs{n}\n>>>>>>> feature\n");
+        std::fs::write(&file, format!("a\n{}mid\n{}z\n", region(1), region(2))).unwrap();
+
+        let first = sides_of(&repo, "file.txt").await;
+        let step1 = format!("a\nours1\nmid\n{}z\n", region(2));
+        let outcome = resolve(&repo, "file.txt", &step1, false, first.working_hash.clone()).await;
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        assert!(stdout_of(&repo, &["ls-files", "-u"])
+            .await
+            .contains("file.txt"));
+
+        let second = sides_of(&repo, "file.txt").await;
+        assert_ne!(second.working_hash, first.working_hash);
+        let done = "a\nours1\nmid\ntheirs2\nz\n";
+        let stale = resolve(&repo, "file.txt", done, true, first.working_hash).await;
+        assert_eq!(stale, ResolveConflictOutcome::ChangedOnDisk);
+        let outcome = resolve(&repo, "file.txt", done, true, second.working_hash).await;
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        assert_eq!(std::fs::read(&file).unwrap(), done.as_bytes());
+        let unmerged = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            unmerged.trim().is_empty(),
+            "conflict left behind: {unmerged}"
+        );
+    }
+
+    /// The stage step runs under the held working-tree lock, so it must use a
+    /// lock-free runner: a re-locking one would wait out LOCK_WAIT_TIMEOUT.
+    #[tokio::test]
+    async fn resolve_stages_under_its_own_lock() {
+        let (_dir, repo) = conflicted_repo("guard-stage", "file.txt", &[]).await;
+        let read = sides_of(&repo, "file.txt").await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            resolve(&repo, "file.txt", "merged\n", true, read.working_hash),
+        )
+        .await
+        .expect("the stage step stalled on the held lock");
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        let unmerged = stdout_of(&repo, &["ls-files", "-u", "--", "file.txt"]).await;
+        assert!(
+            unmerged.trim().is_empty(),
+            "conflict left behind: {unmerged}"
+        );
+        let staged = stdout_of(&repo, &["diff", "--cached", "--name-only"]).await;
+        assert!(staged.contains("file.txt"), "not staged: {staged}");
+    }
+
+    /// A retry after a landed write whose add failed: disk already holds the
+    /// content, so the stale hash doesn't refuse and the stage goes through.
+    #[tokio::test]
+    async fn resolve_retry_over_its_own_landed_write_stages() {
+        let (_dir, repo) = conflicted_repo("guard-retry", "file.txt", &[]).await;
+        let read = sides_of(&repo, "file.txt").await;
+        let file = Path::new(&repo).join("file.txt");
+        std::fs::write(&file, "merged\n").unwrap();
+        let outcome = resolve(&repo, "file.txt", "merged\n", true, read.working_hash).await;
+        assert_eq!(outcome, ResolveConflictOutcome::Written);
+        let unmerged = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            unmerged.trim().is_empty(),
+            "conflict left behind: {unmerged}"
+        );
+        let staged = stdout_of(&repo, &["diff", "--cached", "--name-only"]).await;
+        assert!(staged.contains("file.txt"), "not staged: {staged}");
+    }
+
+    /// `nlf` is one non-overlapping left-to-right pass over CRLF pairs only.
+    #[test]
+    fn nlf_bytes_mirrors_the_frontend_nlf() {
+        assert_eq!(nlf_bytes(b"a\r\nb\r\n"), b"a\nb\n");
+        assert_eq!(nlf_bytes(b"a\r\r\n"), b"a\r\n");
+        assert_eq!(nlf_bytes(b"a\rb\r"), b"a\rb\r");
+        assert_eq!(nlf_bytes(b"a\n"), b"a\n");
+        assert_eq!(nlf_bytes(b"\xEF\xBB\xBFa\r\n"), b"\xEF\xBB\xBFa\n");
+        assert_eq!(nlf_bytes(b"\r\n\n"), b"\n\n");
+    }
+
+    /// Byte truth for the deletion arms: lossy decodes can collide or differ by
+    /// replacement chars, the raw compare can't.
+    #[tokio::test]
+    async fn working_matches_survivor_compares_raw_bytes() {
+        let (_dir, repo) =
+            modify_delete_repo_with("survivor", "file.txt", "ours", b"", b"th\xFCirs\n").await;
+        assert_modify_delete(&repo, "file.txt", 3, 2).await;
+        let file = Path::new(&repo).join("file.txt");
+
+        let untouched = sides_of(&repo, "file.txt").await;
+        assert_eq!(untouched.working_matches_survivor, Some(true));
+
+        // Lossy decodes collide (both "th\u{FFFD}irs\n"), the bytes differ.
+        std::fs::write(&file, b"th\xFDirs\n").unwrap();
+        let edited = sides_of(&repo, "file.txt").await;
+        assert_eq!(edited.working, edited.theirs.clone().unwrap());
+        assert_eq!(edited.working_matches_survivor, Some(false));
+
+        std::fs::write(&file, b"th\xFCirs\r\n").unwrap();
+        assert_eq!(
+            sides_of(&repo, "file.txt").await.working_matches_survivor,
+            Some(true),
+            "a CRLF-only difference reads unedited"
+        );
+
+        std::fs::write(&file, b"th\xFCirs\r\r\n").unwrap();
+        assert_eq!(
+            sides_of(&repo, "file.txt").await.working_matches_survivor,
+            Some(false),
+            "\\r\\r\\n normalizes to \\r\\n, which differs from the LF blob"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            sides_of(&repo, "file.txt").await.working_matches_survivor,
+            None,
+            "no verdict without a working file"
+        );
+
+        let (_dir2, both) = conflicted_repo("survivor-both", "file.txt", &[]).await;
+        assert_eq!(
+            sides_of(&both, "file.txt").await.working_matches_survivor,
+            None
+        );
+    }
+
+    fn linked_refusal(path: &str) -> String {
+        let shown = crate::git::ops::discard_shown(path);
+        format!(
+            "invalid argument: Can't resolve the conflict in {shown} — it's reached through a symbolic link or junction. Nothing was changed."
+        )
+    }
+
+    #[cfg(unix)]
+    fn leaf_refusal(path: &str) -> String {
+        let shown = crate::git::ops::discard_shown(path);
+        format!(
+            "invalid argument: Can't resolve the conflict in {shown} — it's a symbolic link. Nothing was changed."
+        )
+    }
+
+    /// A directory link: a junction on Windows (no privilege needed), a symlink
+    /// elsewhere.
+    fn directory_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .expect("run mklink");
+            assert!(
+                made.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// A conflicted path reached through a linked directory refuses both the
+    /// read and the write, and the file it points at keeps its bytes.
+    #[tokio::test]
+    async fn conflict_commands_refuse_a_linked_ancestor() {
+        let (dir, repo) = conflicted_repo("link-ancestor", "sub/file.txt", &[]).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("file.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        directory_link(&dir.path().join("sub"), outside.path());
+
+        let read = git_conflict_sides(repo.clone(), "sub/file.txt".into(), vec![])
+            .await
+            .err()
+            .expect("a linked ancestor must refuse the read");
+        assert_eq!(read.to_string(), linked_refusal("sub/file.txt"));
+        let write = git_resolve_conflict_core(
+            &AppState::default(),
+            repo,
+            "sub/file.txt".into(),
+            "resolved\n".into(),
+            true,
+            Some(sha1_hex(b"precious\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(write.to_string(), linked_refusal("sub/file.txt"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conflict_sides_refuse_a_linked_survivor() {
+        let (dir, repo) = modify_delete_repo("link-read", "file.txt", "ours").await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("file.txt")).unwrap();
+        let error = git_conflict_sides(repo, "file.txt".into(), vec![])
+            .await
+            .err()
+            .expect("a linked survivor must refuse the read");
+        assert_eq!(error.to_string(), leaf_refusal("file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_refuses_a_linked_survivor() {
+        let (dir, repo) = modify_delete_repo("link-write", "file.txt", "ours").await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("file.txt")).unwrap();
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+        let error = git_resolve_conflict_core(
+            &AppState::default(),
+            repo.clone(),
+            "file.txt".into(),
+            "resolved\n".into(),
+            true,
+            Some(sha1_hex(b"precious\n")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), leaf_refusal("file.txt"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert_eq!(stdout_of(&repo, &["ls-files", "-u"]).await, before);
+    }
+
+    /// A dangling link reads as absent through the link, which a `None` hash
+    /// would accept: the write would create its target outside the repository.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_refuses_a_dangling_link() {
+        let (dir, repo) = modify_delete_repo("link-dangling", "file.txt", "ours").await;
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("created.txt");
+        std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("file.txt")).unwrap();
+        let read = git_conflict_sides(repo.clone(), "file.txt".into(), vec![])
+            .await
+            .err()
+            .expect("a dangling link must refuse the read");
+        assert_eq!(read.to_string(), leaf_refusal("file.txt"));
+        let error = git_resolve_conflict_core(
+            &AppState::default(),
+            repo,
+            "file.txt".into(),
+            "resolved\n".into(),
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), leaf_refusal("file.txt"));
+        assert!(!target.exists(), "the write created the link's target");
+    }
+
+    /// Taking a side refuses a linked ancestor before any git call, so neither
+    /// the stages nor the file it points at change.
+    #[tokio::test]
+    async fn checkout_side_refuses_a_linked_ancestor() {
+        let (dir, repo) = conflicted_repo("link-ancestor-side", "sub/file.txt", &[]).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("file.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        directory_link(&dir.path().join("sub"), outside.path());
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            before.contains("sub/file.txt"),
+            "fixture not conflicted: {before}"
+        );
+
+        for side in ["ours", "theirs"] {
+            let error = git_checkout_conflict_side_core(
+                &AppState::default(),
+                repo.clone(),
+                "sub/file.txt".into(),
+                side.into(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), linked_refusal("sub/file.txt"), "{side}");
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n", "{side}");
+            assert_eq!(
+                stdout_of(&repo, &["ls-files", "-u"]).await,
+                before,
+                "{side}"
+            );
+        }
+    }
+
+    /// Taking the surviving side over a leaf link: git replaces the link with a
+    /// regular file holding that side, and the file it pointed at keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_side_replaces_a_leaf_link_with_the_side() {
+        let (dir, repo) = modify_delete_repo("link-side-keep", "file.txt", "ours").await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+
+        git_checkout_conflict_side_core(
+            &AppState::default(),
+            repo.clone(),
+            "file.txt".into(),
+            "theirs".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(std::fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "theirs\n"
+        );
+        let unmerged = stdout_of(&repo, &["ls-files", "-u"]).await;
+        assert!(
+            unmerged.trim().is_empty(),
+            "conflict left behind: {unmerged}"
+        );
+    }
+
+    /// Taking the deleting side over a leaf link removes the link, never the file
+    /// it pointed at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_side_removes_a_leaf_link_for_the_deletion() {
+        let (dir, repo) = modify_delete_repo("link-side-delete", "file.txt", "ours").await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+
+        git_checkout_conflict_side_core(
+            &AppState::default(),
+            repo.clone(),
+            "file.txt".into(),
+            "ours".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(
+            std::fs::symlink_metadata(&file).is_err(),
+            "the link survived"
+        );
+        assert_deleted_and_resolved(&repo, "file.txt").await;
+    }
+
+    /// A junction AT the conflicted path is refused like a linked ancestor by
+    /// every command, side checkout included, and the directory it points at
+    /// keeps its contents.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn conflict_commands_refuse_a_junction_leaf() {
+        let (dir, repo) = conflicted_repo("link-junction-leaf", "file.txt", &[]).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::remove_file(dir.path().join("file.txt")).unwrap();
+        directory_link(&dir.path().join("file.txt"), outside.path());
+        let before = stdout_of(&repo, &["ls-files", "-u"]).await;
+
+        let read = git_conflict_sides(repo.clone(), "file.txt".into(), vec![])
+            .await
+            .err()
+            .expect("a junction leaf must refuse the read");
+        assert_eq!(read.to_string(), linked_refusal("file.txt"));
+        let write = git_resolve_conflict_core(
+            &AppState::default(),
+            repo.clone(),
+            "file.txt".into(),
+            "resolved\n".into(),
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(write.to_string(), linked_refusal("file.txt"));
+        for side in ["ours", "theirs"] {
+            let error = git_checkout_conflict_side_core(
+                &AppState::default(),
+                repo.clone(),
+                "file.txt".into(),
+                side.into(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), linked_refusal("file.txt"), "{side}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n");
+        assert_eq!(stdout_of(&repo, &["ls-files", "-u"]).await, before);
     }
 }

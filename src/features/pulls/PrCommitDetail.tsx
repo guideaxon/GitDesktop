@@ -1,5 +1,5 @@
 import { CopyIcon } from "@phosphor-icons/react";
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { DetailRail, DetailRailRow } from "@/components/detail-rail";
 import { DiffStat } from "@/components/diff-stat";
 import { PathText } from "@/components/path-text";
@@ -7,7 +7,10 @@ import { RelativeTime } from "@/components/relative-time";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import { DegradedListNotice } from "@/features/conversations/ConversationListPanel";
+import {
+  DegradedListNotice,
+  useRetryFocusRescue,
+} from "@/features/conversations/ConversationListPanel";
 import {
   detailNoticeMessage,
   offlinePendingMessage,
@@ -16,21 +19,36 @@ import {
 } from "@/features/conversations/remote-section-state";
 import { DiffPlaceholder } from "@/features/diff/DiffPlaceholder";
 import { DiffContent, type LineWidget } from "@/features/diff/DiffSurfaceLazy";
+import {
+  FileSlots,
+  keyedPaneView,
+  placeholderPaneView,
+  type SlotRead,
+  useFileSlots,
+  useSlotRead,
+  useSlotWidget,
+} from "@/features/diff/file-slot";
 import { FileRowActions } from "@/features/history/FileRowActions";
 import { copyText } from "@/lib/clipboard";
+import { presentError } from "@/lib/error-summary";
 import { sectionIsBinary, splitUnifiedDiff } from "@/lib/git/diff-split";
 import {
   useCommitComments,
   useObjectsPresent,
   usePrCommitDiff,
 } from "@/lib/git/queries";
-import type { PrCommitOut, RemoteLens } from "@/lib/git/types";
+import type {
+  CommitCommentOut,
+  PrCommitOut,
+  RemoteLens,
+} from "@/lib/git/types";
 import { listKeyboardNav } from "@/lib/list-keyboard-nav";
 import { parseableDate } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
   CommitComments,
   CommitLineComposer,
+  type DiffSections,
   useCommitLineAnchors,
 } from "./CommitComments";
 
@@ -119,58 +137,12 @@ export function PrCommitDetail({
     rowAttr: "data-path",
   });
 
-  // Line-anchored comments on the SELECTED file that resolve to a new-side line
-  // render inline in the diff; ones that can't resolve fall back to the
-  // CommitComments labelled group. Grouping + range chips live in the shared hook.
-  const lineAnchors = useCommitLineAnchors(
-    comments.data,
-    sections,
-    effectivePath,
-    { provider, repoPath, lens },
-  );
-
-  const selected = files.find((f) => f.path === effectivePath);
-  const fileDiff = selected
-    ? {
-        filePath: selected.path,
-        text: selected.section,
-        isBinary: selected.isBinary,
-        isTruncated: false,
-      }
-    : undefined;
-
-  // Line-anchored comment creation: when the viewer can comment, clicking a diff
-  // line opens the inline composer below it. Anchored to the SELECTED file's
-  // section (GitHub recovers the diff `position` from it). Absent otherwise, so
-  // the diff stays read-only exactly as before.
-  const lineWidget = useMemo<LineWidget | undefined>(() => {
-    if (!canCommentCommits || !effectivePath) return undefined;
-    return {
-      enabled: true,
-      render: ({ side, line, fromLine, onClose }) => (
-        <CommitLineComposer
-          repoPath={repoPath}
-          sha={commit.oid}
-          path={effectivePath}
-          side={side}
-          line={line}
-          fromLine={fromLine}
-          provider={provider}
-          fileSection={sections.get(effectivePath)}
-          onClose={onClose}
-          lens={lens}
-        />
-      ),
-    };
-  }, [
-    canCommentCommits,
-    effectivePath,
-    repoPath,
-    commit.oid,
-    provider,
-    sections,
-    lens,
-  ]);
+  // The file's diff swaps through the pane's two-slot hold, within this
+  // commit; another one re-targets the shown slot in place.
+  const diffTarget = effectivePath
+    ? keyedPaneView(repoPath, commit.oid, effectivePath, effectivePath)
+    : placeholderPaneView(commit.oid);
+  const diffSlots = useFileSlots(diffTarget);
 
   // A failed or parked refresh keeps the loaded commit under a notice; only a
   // read with nothing loaded replaces the rail and pane.
@@ -182,9 +154,36 @@ export function PrCommitDetail({
     fetching: diff.isFetching,
   });
   const failed = refreshFailed(diff);
+  // The root survives every arm, so a Retry that swaps the error arm for the
+  // skeleton lands focus there instead of on <body>.
+  const { hostRef, retryRef } = useRetryFocusRescue(
+    pane === "error" && diff.isError,
+  );
+  // Degraded content is the same arm, so a failed or recovered refresh never
+  // moves focus.
+  const arm = pane === "content-degraded" ? "content" : pane;
+  // An arm swap or record switch that unmounts the focused node would drop
+  // focus to <body>; land it on the host. Change-only, so a mount never takes
+  // focus from elsewhere.
+  const focusHost = useRef<HTMLDivElement | null>(null);
+  const viewFrame = `${arm}:${commit.oid}`;
+  const lastViewFrame = useRef(viewFrame);
+  useLayoutEffect(() => {
+    if (lastViewFrame.current === viewFrame) return;
+    lastViewFrame.current = viewFrame;
+    if (document.activeElement === document.body)
+      focusHost.current?.focus({ preventScroll: true });
+  }, [viewFrame]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div
+      ref={(node) => {
+        hostRef(node);
+        focusHost.current = node;
+      }}
+      tabIndex={-1}
+      className="flex h-full flex-col outline-none"
+    >
       <header className="space-y-1 border-b px-4 py-3">
         <Button
           variant="ghost"
@@ -246,7 +245,27 @@ export function PrCommitDetail({
             );
           case "error":
             return (
-              <DiffPlaceholder message="Could not load this commit's changes" />
+              <DiffPlaceholder
+                message="Could not load this commit's changes"
+                action={
+                  diff.isError ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <p className="max-w-md text-center text-xs">
+                        {presentError(diff.error).summary}
+                      </p>
+                      <Button
+                        ref={retryRef}
+                        variant="outline"
+                        size="sm"
+                        className="cursor-pointer"
+                        onClick={() => void diff.refetch()}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  ) : undefined
+                }
+              />
             );
           case "content":
           case "content-degraded":
@@ -288,6 +307,9 @@ export function PrCommitDetail({
                             type="button"
                             key={file.path}
                             data-path={file.path}
+                            aria-current={
+                              effectivePath === file.path || undefined
+                            }
                             className={cn(
                               "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs",
                               effectivePath === file.path
@@ -312,22 +334,34 @@ export function PrCommitDetail({
                   </DetailRail>
                   <main className="flex min-w-0 flex-1 flex-col">
                     <div className="min-h-0 flex-1">
-                      {effectivePath && fileDiff ? (
-                        <DiffContent
-                          filePath={effectivePath}
-                          data={fileDiff}
-                          isPending={false}
-                          isError={false}
-                          repoPath={repoPath}
-                          previewRev={
-                            commitPresent.data === true ? commit.oid : undefined
-                          }
-                          lineAnchors={lineAnchors}
-                          lineWidget={lineWidget}
-                        />
-                      ) : (
-                        <DiffPlaceholder message="No file changes in this commit" />
-                      )}
+                      <FileSlots
+                        slots={diffSlots}
+                        target={diffTarget}
+                        busy={diffSlots.holding || diffSlots.read.loading}
+                      >
+                        {(view) =>
+                          view.kind === "file" ? (
+                            <PrCommitFileDiffSlot
+                              repoPath={repoPath}
+                              sha={commit.oid}
+                              path={view.file}
+                              sections={sections}
+                              comments={comments.data}
+                              canComment={canCommentCommits}
+                              provider={provider}
+                              lens={lens}
+                              previewRev={
+                                commitPresent.data === true
+                                  ? commit.oid
+                                  : undefined
+                              }
+                              reportRead={diffSlots.reportRead}
+                            />
+                          ) : (
+                            <DiffPlaceholder message="No file changes in this commit" />
+                          )
+                        }
+                      </FileSlots>
                     </div>
                     <CommitComments
                       repoPath={repoPath}
@@ -349,5 +383,90 @@ export function PrCommitDetail({
         }
       })()}
     </div>
+  );
+}
+
+/** One file's diff in the commit's pane slot: its section of the commit's
+ *  patch, with the comments anchored to it and its own line composer, so a
+ *  held file never shows the next one's. */
+function PrCommitFileDiffSlot({
+  repoPath,
+  sha,
+  path,
+  sections,
+  comments,
+  canComment,
+  provider,
+  lens,
+  previewRev,
+  reportRead,
+}: {
+  repoPath: string;
+  sha: string;
+  path: string;
+  sections: DiffSections;
+  comments: CommitCommentOut[] | undefined;
+  canComment: boolean;
+  provider: "github" | "gitlab" | "bitbucket";
+  lens: RemoteLens;
+  previewRev: string | undefined;
+  reportRead: (read: SlotRead) => void;
+}) {
+  // The patch is in memory: never a placeholder, never pending.
+  useSlotRead(reportRead, { isPlaceholderData: false, isPending: false });
+  const section = sections.get(path);
+  // Line-anchored comments on this file that resolve to a new-side line
+  // render inline in the diff; ones that can't resolve fall back to the
+  // CommitComments labelled group. Grouping + range chips live in the shared hook.
+  const lineAnchors = useCommitLineAnchors(comments, sections, path, {
+    provider,
+    repoPath,
+    lens,
+  });
+  // Line-anchored comment creation: when the viewer can comment, clicking a diff
+  // line opens the inline composer below it. Anchored to this file's section
+  // (GitHub recovers the diff `position` from it). Absent otherwise, so the diff
+  // stays read-only exactly as before.
+  const widget = useMemo<LineWidget | undefined>(() => {
+    if (!canComment) return undefined;
+    return {
+      enabled: true,
+      render: ({ side, line, fromLine, onClose }) => (
+        <CommitLineComposer
+          repoPath={repoPath}
+          sha={sha}
+          path={path}
+          side={side}
+          line={line}
+          fromLine={fromLine}
+          provider={provider}
+          fileSection={sections.get(path)}
+          onClose={onClose}
+          lens={lens}
+        />
+      ),
+    };
+  }, [canComment, path, repoPath, sha, provider, sections, lens]);
+  const lineWidget = useSlotWidget(widget);
+  return (
+    <DiffContent
+      filePath={path}
+      data={
+        section === undefined
+          ? undefined
+          : {
+              filePath: path,
+              text: section,
+              isBinary: sectionIsBinary(section),
+              isTruncated: false,
+            }
+      }
+      isPending={false}
+      isError={false}
+      repoPath={repoPath}
+      previewRev={previewRev}
+      lineAnchors={lineAnchors}
+      lineWidget={lineWidget}
+    />
   );
 }

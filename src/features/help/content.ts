@@ -490,17 +490,36 @@ the last list up, with a line above it saying it couldn't refresh.
 ## Staging
 
 - Click a file to see its diff. Toggle **unified / split** at the top of the diff.
-- Stage or unstage a file with the **+ / −** button on its row, or **Stage all**.
+- Stage or unstage a file with the **+ / −** button on its row, or press
+  {{key:space}} on the focused row; {{key:enter}} on a row opens its diff.
+  **Stage all** and **Unstage all** do the whole list.
+- When the file you're viewing has nothing left to stage, the next file in
+  **Changes** opens in its place (the one above it, at the end of a section),
+  whether you staged it whole or line by line. Files the filter hides, files in
+  a folded folder and conflicted files are skipped. If the staged file's row had
+  focus, focus moves to that file's row too. Unstaging works the same way in
+  **Staged**. When no file is left in the section, the diff pane goes back to
+  *Select a file to see its changes*, and if the row had focus, focus moves to
+  the file's new row (or above the list, when the filter or a folded folder
+  hides that row).
 - File rows show their own **+added -deleted** line counts, left of that button. They
   count per side, so a file you staged and then edited again shows what's staged on
   its Staged row and what's still outside it on its Changes row. Binary files read
   \`bin\`; untracked files count every line as an addition from the moment they
   appear (files Git converts as it stores them, such as Git LFS files, wait until
   they're staged), and conflicted rows show none while the conflict is unresolved.
-- **Hunk-level staging** — in a file's diff, each hunk has its own Stage / Unstage /
-  Discard buttons.
+- **Hunk-level staging** — in a file's diff, each hunk has its own Stage hunk and
+  Discard… buttons, or Unstage hunk on a staged file's diff. Discard returns the hunk
+  to the file's staged version when part of the file is staged, to the last commit
+  otherwise, and removes it from an untracked file. To discard a staged hunk, unstage
+  it first. A very large diff opens with up to its first 1,000 lines, and every hunk
+  shown in full keeps its hunk buttons; **Show full diff** at the bottom brings in the
+  rest. A hunk that limit cuts short gets its buttons once the full diff shows; until
+  then, a drag selection still acts on just its visible lines.
 - **Line-level staging** — drag across the line-number gutter to select specific lines,
-  spanning as many hunks as you like, then stage or discard just those. In both the
+  spanning as many hunks as you like, then stage or discard just those (or unstage
+  them, on a staged file's diff). Discarded lines go back where a discarded hunk would:
+  to the staged version or the last commit, or out of an untracked file. In both the
   unified and the split view a drag picks up every changed line it crosses, added and
   removed alike; hold Shift while dragging to take one side of a change on its own.
   Hold {{key:mod}} while dragging and the new run joins the selection instead of
@@ -516,15 +535,16 @@ the last list up, with a line above it saying it couldn't refresh.
   excluded) with the funnel button.
 - The **Directory tree view** button in the filter row swaps the flat list for a
   compacted directory tree: single-child folder chains merge into one row, and shared
-  prefixes roll up. Click a folder to collapse or expand it (Enter or Space does the
-  same); from the keyboard ↑ and ↓ walk folders and files alike, ← folds the folder
-  you're on or jumps to its parent, and → unfolds a folder or steps inside it.
-  Collapsing a folder drops its hidden files from a multi-selection, and the diff you
-  have open stays open. Selection, staging, and filtering behave the same in both
-  views; file rows keep their {{secondaryclick}} menu, while a folder row opens the
-  whole-list menu. Your choice is remembered for every repository. *Toggle
-  directory tree view* in the command palette ({{kbd:command-palette}}) flips it
-  too (palette-only by default — bind a key in **Settings → Keyboard**).
+  prefixes roll up. Click a folder to collapse or expand it ({{key:enter}} or
+  {{key:space}} does the same); from the keyboard ↑ and ↓ walk folders and files
+  alike, ← folds the folder you're on or jumps to its parent, and → unfolds a
+  folder or steps inside it. Collapsing a folder drops its hidden files from a
+  multi-selection, and the diff you have open stays open. Selection, staging,
+  and filtering behave the same in both views; file rows keep their
+  {{secondaryclick}} menu, while a folder row opens the whole-list menu. Your
+  choice is remembered for every repository. *Toggle directory tree view* in
+  the command palette ({{kbd:command-palette}}) flips it too (palette-only by
+  default — bind a key in **Settings → Keyboard**).
 - **Discard all changes…** clears the whole working tree after a confirm. It sits on the
   changes list's own {{secondaryclick}} menu (over the header or the empty space below
   the files), in the branch ⋮ menu beside **Stash all changes…**, and in the command
@@ -534,7 +554,9 @@ the last list up, with a line above it saying it couldn't refresh.
   swept away without a recycle-bin copy. On a large working tree that can take a while,
   and another GitDesktop action started meanwhile waits for it: if the discard is still
   going after ten seconds, that action stops with *A discard is still running — try
-  again when it finishes.* rather than landing partway through.
+  again when it finishes.* rather than landing partway through. On Windows, if any new
+  file Git lists sits behind a junction or other link, or has a path part ending in a dot,
+  a space, or \`.{GUID}\`, nothing is discarded and the message names that file.
 
 ## The diff viewer
 
@@ -543,8 +565,9 @@ the last list up, with a line above it saying it couldn't refresh.
   button from the toolbar; *Change diff language…* in the command palette (palette-only
   by default — bind a key in **Settings → Keyboard**) still opens the picker.
 - **Image diffs** render side by side; a file too large to decode safely shows a
-  **Too large to preview** pane instead. Click a rendered side, or Tab to it and press
-  Enter, to open it fullscreen: the image over a dimmed backdrop, its label and pixel
+  **Too large to preview** pane instead. A side that couldn't be read says why, with
+  **Retry** when reading it again could help. Click a rendered side, or Tab to it and
+  press Enter, to open it fullscreen: the image over a dimmed backdrop, its label and pixel
   dimensions along the bottom, and a **Fit** / **100%** toggle. In **Fit** view ← and → move
   between the old and new sides; at **100%** the arrow keys pan the zoomed image, and
   Esc closes either way. The **SVG** preview above a text diff and the image diffs
@@ -553,7 +576,8 @@ the last list up, with a line above it saying it couldn't refresh.
   diff toolbar. **Preview** renders the file's new version as formatted prose
   (headings, tables, highlighted code fences), so a docs change reads the way it will
   ship, and frontmatter (an unbroken leading \`---\` or \`+++\` block) stays out of the
-  render. MDX renders approximately: components and expressions appear as plain text.
+  render. Images stored in the repository render from the version being previewed.
+  MDX renders approximately: components and expressions appear as plain text.
   **Raw** stays the default for every file. The toggle appears on the working tree,
   commit details, stashes, an agent session's worktree changes, a file's history, and
   branch compare — on those a deleted file previews its last version instead. A pull
@@ -592,13 +616,18 @@ Write a **summary** (there's a 72-character budget indicator) and an optional
 {{ai}}- **Generate with AI** ({{kbd:generate-commit-message}}) — write the summary and
   description from your staged diff (see *AI & automations*).
 {{/ai}}- After committing, **Undo** ({{kbd:undo-commit}}) reverses the last commit and
-  returns your message to the box. Undoing a branch's *first* commit asks first — it
-  has no parent to fall back to, so the branch ref goes with it. If another Git
+  returns your message to the box. If the box already holds a title or description
+  other than that commit's message, Undo asks before replacing it, and Cancel does
+  nothing. Undoing a branch's *first* commit also asks — it has no parent to fall
+  back to, so the branch ref goes with it. If another Git
   process commits or switches branches after History last showed it, or while the
   undo runs, Undo stops without undoing anything and says so. Undo also asks you
   to finish or abort a merge, cherry-pick or revert in progress, and to resolve
-  any conflicts, first. On a detached first commit there is nothing to undo onto,
-  and Undo says that instead.
+  any conflicts, first. On a detached first commit, or when the latest commit's
+  parent was never fetched (the oldest commit of a shallow clone), there is nothing
+  to undo onto, and Undo says so instead. Fetching more history from a terminal
+  (\`git fetch --deepen=1\`) gives that commit a parent, and Undo works again once
+  you're back in the app.
 
 > Discarding an **untracked** file moves it to the recycle bin, so it's recoverable —
 > it isn't deleted outright. The exception is a name Windows reserves for a device
@@ -619,13 +648,18 @@ entry shows the author's avatar (from GitHub or Gravatar, or their initials). Cl
 a commit to see its message, author, and full diff; **Shift + ↑ / ↓** extends the
 selection to compare a range.
 
+If the history can't be read, the tab says why and offers **Retry**. A failed refresh or
+**Load more** keeps the commits already loaded under a line saying so.
+
 ## Commit actions
 
 {{Secondaryclick}} a commit (or use the commit detail view) for:
 
-- **Amend** the most recent commit (reword, or fold in staged changes). The amend stays
-  tied to where you started it: that commit, on that branch or on a detached HEAD. If a
-  new commit lands, or HEAD detaches from that branch or reattaches from a detached
+- **Amend** the most recent commit (reword, or fold in staged changes). If the commit
+  box already holds a title or description other than that commit's message, Amend
+  asks before replacing it, and Cancel does nothing. The amend stays tied to where you
+  started it: that commit, on that branch or on a detached HEAD. If a new commit
+  lands, or HEAD detaches from that branch or reattaches from a detached
   start, the commit box holds the amend and says why until HEAD is back where you
   started; switching to another branch shows that branch's own draft instead. While it
   holds, **Stop amending** ends amend mode with your message kept. If another Git
@@ -644,7 +678,9 @@ selection to compare a range.
   cherry-pick that includes a merge is disabled — select the merge on its own to
   choose its mainline.
 - **Reset** the current branch to a commit — a **mixed reset**, so the changes from later
-  commits return to your working tree as uncommitted changes.
+  commits return to your working tree as uncommitted changes. If HEAD moves while the
+  dialog is open, or another Git process commits or switches branches before the reset
+  starts, nothing is reset and a toast says so.
 - **Edit history** — open the interactive-rebase editor over your unpushed commits, newest
   on top, where each commit gets an action: **pick** (keep), **reword** (edit its message),
   **squash** (combine it into the next older commit you keep, joining the messages),
@@ -656,14 +692,20 @@ selection to compare a range.
   first and last, and {{key:enter}} or {{key:space}} opens the commit's action menu.
   {{key:alt+up}} and {{key:alt+down}} move the commit one place, as its arrow buttons do;
   {{key:alt+home}} and {{key:alt+end}} send it to the top or bottom.{{ai}} Reword can
-  regenerate a message with AI.{{/ai}} A "Result" count shows what you'll end up with. With
-  no **edit**, it applies all at once — a conflict rolls it back. If you choose **edit**, it
-  starts a rebase that **pauses** at that commit — amend it in the **Changes** tab (stage and
-  commit/amend as usual), then **Continue** from the banner there. A quick
-  **Squash N commits…** is also on the context menu when you select adjacent commits.
+  regenerate a message with AI.{{/ai}} A "Result" count shows what you'll end up with.
+  Reworded and squashed commits keep their original author; a squash keeps its first
+  commit's author. With no **edit**, it applies all at once — a conflict rolls it back. If
+  you choose **edit**, it starts a rebase that **pauses** at that commit — amend it in the
+  **Changes** tab (stage and commit/amend as usual), then **Continue** from the banner
+  there. A quick **Squash N commits…** is also on the context menu when you select adjacent
+  commits; both it and **Edit history** wait while a merge, rebase, cherry-pick or revert
+  is in progress, and the menu says to finish the operation in **Changes** first.
 - **Create a branch** or **create a tag** at a commit, **check out** a commit (it asks
   first and explains the detached HEAD you land in), or copy
   its SHA.
+
+The commit detail view stays on screen if a background refresh fails, with a line saying it
+couldn't refresh and a **Retry**. A commit that fails to load says why and offers **Retry**.
 
 ## Commit comments
 
@@ -671,7 +713,8 @@ When the repo is connected to **GitHub**, **GitLab**, or **Bitbucket** and the c
 **pushed**, opening it shows a **comments pane** below the diff: a **whole-commit composer**
 plus its thread, and **clickable line numbers** on the diff — click or drag a range to anchor
 a comment to those lines (create / edit / delete your own). An **unpushed** commit shows a
-push hint instead, and a local-only repo shows no comment pane at all.
+push hint instead, and a local-only repo shows no comment pane at all. If the app can't
+check whether the commit is on the remote, it says so and offers **Retry**.
 
 ## Exploring a file's past
 
@@ -686,6 +729,11 @@ list (in **History**, or a PR's **Commits** tab), in a PR's **Files** tab, or in
 that commit or branch — you see the file *as of* that revision, not your working copy.
 The **Blame file…** command (from the command palette) opens a fuzzy picker of every
 tracked file and blames the one you choose as it is now.
+
+Blame keeps its lines up if a background refresh fails, with a line saying it couldn't
+refresh and a **Retry**. A file that fails to blame says why and offers **Retry**. File
+history and the **Blame file…** picker work the same way: a failed refresh keeps what's
+shown, and a list that can't load says why and offers **Retry**.
 
 > History-rewriting actions (reset, Edit history, squash) only ever touch **unpushed**
 > commits, and a push of rewritten history becomes a safe
@@ -730,7 +778,8 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
   the list, then **archive** them (reversible) or **delete** them together. The current
   branch, the default branch, and branches checked out in another folder are never
   included (archiving still offers one whose worktree you're already deleting); deleting
-  also skips protected branches.
+  also skips protected branches. A branch that couldn't be archived or deleted stays in the
+  list with the reason under its name, ready to retry.
 {{ai}}- **Generate a branch name with AI** from your working-tree changes when creating
   or renaming one. Whenever the working tree can't describe the branch being named —
   it's clean, or you're renaming a branch you aren't on — it names it from that
@@ -751,9 +800,13 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
   (see *Stash and reapply*).
 - {{Secondaryclick}} a branch to **merge**, **squash and merge**, **rebase**, or **update it
   from the default branch** ({{kbd:update-from-default}}) — the last *without* checking it
-  out. On a branch listed under **Promotion branches** in *Branch rules*, that update offer
-  is withheld, since a promotion branch takes its changes through promotions; the reason
-  rides the menu item's label, and its own **Update from _origin/…_** is unaffected.
+  out. The update brings in the newest base: when your local default branch is behind its
+  own upstream (**_origin/…_** in the common case), it merges that upstream tip instead,
+  and the menu item and the toast name the tip that was merged. When the local default has
+  commits its upstream lacks, the item says how many, and a second item offers the
+  upstream. On a branch listed under **Promotion branches** in *Branch rules*, that update
+  offer is withheld, since a promotion branch takes its changes through promotions; the
+  reason rides the menu item's label, and its own **Update from _origin/…_** is unaffected.
 - **Change base…** — from the switcher's menu or the command palette — rebases the current
   branch onto a *different* branch, for the "I branched off the wrong one" case: pick the
   branch you meant to base on and the branch you actually did, and only your branch's own
@@ -770,12 +823,20 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
   branch you're on, that reset rewrites your files too, so it stops and names any
   untracked files or folders (ignored ones aside) sitting where the upstream version has
   files; move them aside and run it again. If the branch moved, or you switched onto or
-  off it, since you confirmed, or it is checked out in another worktree or being rebased
-  or bisected anywhere, the reset leaves it alone and says why. This is the "just merged
-  a PR — bring the default branch current before I switch back" flow; every branch's row
-  shows its own push/pull state (↑/↓ vs. its upstream) after a fetch, so the branches
-  with commits to pull are visible at a glance, and *Update default branch from its
-  remote* is available from the command palette too.
+  off it, after you confirmed but before the reset started, or it is checked out in
+  another worktree or being rebased or bisected anywhere, the reset leaves it alone and
+  says why. On the branch you're on, the reset checks the branch once more just before
+  it updates your files: if another Git process has committed on it since the reset
+  moved it, the reset stops with your files as they were, and the toast says where the
+  branch points now when it can tell. The
+  reset of the branch you're on also measures it against its upstream again when you
+  confirm: if the upstream moved after the menu opened, or that check can't tell
+  whether it still has every commit on the branch, nothing is reset and the toast asks
+  you to reopen the branch menu. This is the "just merged a PR — bring the
+  default branch current before I switch back" flow; every branch's row shows its own
+  push/pull state (↑/↓ vs. its upstream) after a fetch, so the branches with commits
+  to pull are visible at a glance, and *Update default branch from its remote* is
+  available from the command palette too.
 - **While an update runs, its branch is held.** Switching to that branch, renaming or
   deleting it, or starting a second update is turned away with a short message until the
   update completes. Every worktree of the repository sees the same hold. An update a crash
@@ -791,7 +852,11 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
   upstream-deleted branch offers **Publish**; on a repo with several remotes you pick the
   destination (one **Publish to _…_** item per remote). Neither checks the branch out or
   touches your working tree, so it works even for a branch checked out in another worktree.
-  The list stays open while the push runs, so you can keep switching and browsing, and the
+  A publish that would create the branch on the remote asks first, from these items and
+  from {{kbd:push-to-origin}} alike: a prompt names the branch and its destination, with
+  **Cancel** focused, and the list closes for it if it was open. A branch the remote
+  already has (as of the last fetch) just pushes and starts tracking it. Otherwise the
+  list stays open while the push runs, so you can keep switching and browsing, and the
   branch's row shows a spinner naming where the push is going. A push from the sync bar
   may not name one, since git's own push settings decide where it lands.
   {{kbd:push-to-origin}} is the keyboard shortcut for pushing to **origin** specifically:
@@ -827,9 +892,11 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
 **Stash all changes** ({{kbd:stash-all}}) sets your working changes aside; **View
 stashes** lists them to apply, pop, or drop (each asks first, and the apply and pop
 prompts say whether the stash stays in the list afterwards), and **Pop latest stash**
-restores the most recent. Setting changes aside is refused while conflicts are still
-unresolved, or while a merge, rebase, cherry-pick or revert is in progress — finish or abort it first, so a
-resolution you've already staged can't be swept out of the operation.
+restores the most recent. A drop only ever targets the stash you picked, even when another
+tool adds or drops a stash while the list is open; if the list changes mid-drop, a message
+reports the result. Setting changes aside is refused while conflicts are still
+unresolved, or while a merge, rebase, cherry-pick or revert is in progress — finish or abort
+it first, so a resolution you've already staged can't be swept out of the operation.
 
 **Recover lost work** (in the branch ⋮ menu, or the command palette) opens the
 **Recoverable** tab in the stashes dialog. It scans your repository (with \`git fsck\`) for
@@ -838,6 +905,10 @@ resolution you've already staged can't be swept out of the operation.
 with a file-by-file diff preview. **Restore to working tree** re-applies the one you pick;
 it's non-destructive (it applies the stash, never dropping or committing anything), so you
 can safely preview and recover work you thought was gone.
+
+In both tabs, a stash's file list stays up if a background refresh fails, with a line
+saying it couldn't refresh and a **Retry**. One that fails to load says why and offers
+**Retry**.
 
 **Operation history** (in the branch ⋮ menu, or the command palette) opens a
 journal of the *risky* operations GitDesktop runs: local PR merges, cherry-picks, history
@@ -860,6 +931,9 @@ show. The base-branch picker is searchable — type to filter — hides archived
 shows which branches live in other worktrees plus, when a branch has diverged, how far it
 is ahead of and behind your current branch. From here you can merge, rebase, or jump
 straight to opening a pull request.
+
+The diff stays on screen if a background refresh fails, with a line saying it couldn't
+refresh and a **Retry**. One that fails to load says why and offers **Retry**.
 
 {{Secondaryclick}} any commit in the ahead or behind list for **Checkout commit**,
 **Cherry-pick commit**, **Create branch from commit…**, **Create tag…**, and **Copy SHA**.
@@ -944,8 +1018,11 @@ actions away until it finishes.
 
 The branch's own items read **Rename branch…** and **Delete branch…**, so the two pairs
 can't be confused; a deleted worktree leaves its branch behind, and **Delete branch…**
-un-disables once the worktree is gone. The dropdown's own action rows say why when one of
-them is unavailable. When you're in a linked worktree the switcher reminds you that a
+un-disables once the worktree is gone. A branch with a pull request shows a chip under its
+name whose icon marks the pull request's state, and its context menu adds
+**View pull request #…** (**View merge request #…** on GitLab; **View local pull request**
+for a local one) to jump straight to it. The dropdown's own action rows say why when one
+of them is unavailable. When you're in a linked worktree the switcher reminds you that a
 branch checkout lands *there* (not the main workspace) and offers a one-click
 **Open main workspace**. That action and **Promote this worktree to main workspace** are in
 the command palette too.
@@ -966,13 +1043,18 @@ right on the **Push** and **Pull** buttons.
 - **Pull** ({{kbd:pull}}) is fast-forward only by design — it won't create surprise merge
   commits; the menu's caret offers rebase and merge for reconciling a diverged branch.
 - **Push** ({{kbd:push}}) sends your commits. For a branch with no upstream yet, you'll
-  see **Publish branch** instead. When the branch tracks a remote branch with a different
-  name (after renaming a pushed branch, say) and Git would refuse a plain push, **Push**
-  opens a small menu: push to the branch it tracks, or publish under its own name and
-  track that. When Git knows the tracked branch is the remote's default branch, only the
-  publish item appears. While the names differ there's no force push: a diverged branch
-  is reconciled from the **Pull** menu first. Setups that route pushes elsewhere keep a
-  plain **Push**.
+  see **Publish branch** instead. A push that would create the branch on the remote asks
+  first, naming the branch and where it's going: **Cancel** has the focus, so
+  {{key:enter}} backs out, and **Publish** sends it. A branch the remote already has (as
+  of the last fetch) just pushes, without asking. Afterwards the message says "Published"
+  only when that fetch showed the branch was new to the remote, and "Pushed" otherwise.
+  When the branch tracks a remote branch with a different name (after renaming a pushed
+  branch, say) and Git would refuse a plain push, **Push** opens a small menu: push to
+  the branch it tracks, or publish under its own name and track that, which asks the
+  same question when it would create the branch there. When Git knows the tracked branch
+  is the remote's default branch, only the publish item appears. While the names differ
+  there's no force push: a diverged branch is reconciled from the **Pull** menu first.
+  Setups that route pushes elsewhere keep a plain **Push**.
 
 ## Publish a local repo
 
@@ -990,6 +1072,14 @@ leaves the cached list in place.
 
 **GitLab** publishes into your own namespace, and **Bitbucket** asks for a **workspace**
 (see *Bitbucket repositories*).
+
+Publishing pushes the current branch's full history, so it can take a few minutes.
+Closing the dialog doesn't stop it: a status line at the top of the repository shows it
+until it finishes, and **Publish repository…** in the sync bar reads **Publishing…** and
+stays disabled meanwhile, so a second publish can't start. Until it finishes, pushes from
+the sync bar and the branch list, tag pushes, new pull requests, and deleting a branch or
+tag on a remote stop with a note that a publish is running, in the repository and
+in its worktrees.
 
 ## Stash and reapply
 
@@ -1074,15 +1164,22 @@ ids, the force-push confirmation warns that pushing would put the old history ba
 and the Pull menu offers a confirmed **Reset to _origin/…_** that lines the two up
 instead. The reset won't overwrite untracked files or folders unless they're ignored: if
 any sit where the upstream version has files, it stops and names them so you can move
-them aside first. If the branch moves or you switch branches before the reset runs,
-or another Git process commits or switches branches while it runs, nothing is reset
-and the view refreshes so you can decide again.
+them aside first. If the branch moves or you switch branches before the reset starts,
+nothing is reset. Just before it updates your files, the reset checks the branch once
+more: if another Git process has switched branches or committed on it since the reset
+moved it, the reset stops with your files as they were, and the toast says where the
+branch points now when it can tell. If the upstream moves after the Pull menu measured
+it, or the check when you confirm can't tell whether it still has every commit on the
+branch, nothing is reset and the toast asks you to reopen the menu. In each case the
+view refreshes so you can decide again.
 
 ## Resolving conflicts
 
 During a **merge**, **rebase**, **cherry-pick**, or **revert**, a slim banner appears in
-**Changes** naming the operation and its conflict count, with **Abort** and a finish control
-that names it too (**Finish merge**, **Continue rebase**, **Continue cherry-pick**,
+**Changes** naming the operation and its conflict count, or "no conflicts left" once none
+remain (a rebase paused for an edit or a break, or stopped after an exec step or for
+another reason, says so instead), with **Abort** and a finish control named for the
+operation (**Finish merge**, **Continue rebase**, **Continue cherry-pick**,
 **Continue revert**). Conflicts from reapplying your stashed changes get the same banner
 without **Abort** or a finish control, since nothing is left in progress: resolve the files,
 and after a **Stash and reapply** the banner then offers to drop or keep the backup stash.
@@ -1093,8 +1190,13 @@ editor**: each conflict region shows **Current (ours)** over **Incoming (theirs)
 accepts ask first, since taking a side replaces the file wholesale, conflict regions you
 already settled by hand included. A conflicted file that isn't UTF-8 text skips the
 per-region accepts and resolves through the whole-file accepts or your editor, keeping its
-bytes exact. Files mark
-themselves resolved as you go — the \`!\` badge clears — and the finish control stays
+bytes exact. If the file changed on disk after the editor read it (saved from another
+editor, say), **Accept current**, **Accept incoming**, and **Both** write nothing: a message
+says so, and the editor re-reads the file so its regions match what's on disk. A conflicted
+file that is itself a symbolic link skips the per-region accepts{{ai}} and
+**Resolve with AI**{{/ai}}; its whole-file accepts replace or remove the link, not what it
+points to. A file under a linked folder, or a Windows folder link, refuses them too. Files
+mark themselves resolved as you go — the \`!\` badge clears — and the finish control stays
 disabled, saying so, until every conflict is resolved. When one side of a conflict removed
 a file, the editor names the removal instead of showing regions, and the same whole-file
 accept actions choose between keeping the file and taking the deletion; when you've edited
@@ -1116,7 +1218,9 @@ on the file's context menu, and in the command palette ({{kbd:command-palette}})
 **Resolve conflict with AI**). Your configured **Review** model (Settings → AI) merges the
 file's sides and streams a proposal; you review it as a diff against your side, flip to the
 proposed file or the *ours* / *theirs* / *base* versions, then **Accept & stage** to apply
-it — nothing is written until you accept. **Regenerate** for another attempt, or
+it — nothing is written until you accept. If the file changed on disk after the proposal
+started, accepting writes nothing and the proposal stays on screen until you regenerate it
+from the file as it is now. **Regenerate** for another attempt, or
 **Discard** to drop the proposal. When a proposal still has conflict markers, a warning
 says so and the button reads **Accept**: it writes the file but leaves it unstaged and
 moves on. The file stays listed as conflicted: finish it in the conflict editor, or
@@ -1140,9 +1244,11 @@ authenticated; when you're not signed in the tab shows a **Sign in** button that
 sign-in in-app, and if a session **expired or was revoked** it becomes **Reconnect**
 instead of a dead end. When GitHub's **API rate limit** is in effect, the tab says so,
 with the time access resumes when GitHub reports it; your sign-in is untouched, so
-there's nothing to reconnect. GitLab does the same when its CLI names the limit.) When a
-token is within a week of expiring, a quiet **dismissible notice** at the top of this
-tab (and the Issues tab) reminds you to reconnect before it lapses.
+there's nothing to reconnect. GitLab does the same when its CLI names the limit.) While a
+GitHub limit is in effect, GitDesktop holds back most of the requests the limit covers
+until it lifts, and most actions that need one say so. When a token is within a week of
+expiring, a quiet **dismissible notice** at the top of this tab (and the Issues tab)
+reminds you to reconnect before it lapses.
 
 What you can *do* here follows your access on the repository: when you lack the access an
 action needs — push access to **merge** or to flip a pull request between **draft** and
@@ -1312,8 +1418,9 @@ forge instead, so the number always lands where it belongs); on GitLab, **#123**
 issue and **!123** a merge request. **@user** opens that person's profile in your
 browser. Hover a reference, or land on it with Tab, and a preview card names what you'd
 be opening: an issue, pull request, or merge request shows its state (Open, Merged,
-Closed, or Draft) beside its number, then its title and author, while **@user** shows
-that person's avatar and handle. Esc dismisses the card. **Bitbucket** bodies leave
+Closed, or Draft; **Open or draft** when GitHub could only confirm that a pull request
+is open) beside its number, then its title and author, while **@user** shows that
+person's avatar and handle. Esc dismisses the card. **Bitbucket** bodies leave
 references plain, matching Bitbucket itself, and a reference inside backticks or a fenced
 code block stays plain text everywhere.
 
@@ -1471,7 +1578,13 @@ things follow from that (**GitHub** only — the fork model here is GitHub's):
   work, GitDesktop offers to push your commits to its **branch on the fork** instead,
   wiring up the remote it needs — the pull request picks them up. That takes the contributor's
   *Allow edits by maintainers*; without it the offer says so, and publishing to your
-  own remote anyway is still one click away.
+  own remote anyway is still one click away. When publishing asks first, its prompt opens
+  while GitDesktop looks for that pull request and holds **Publish** for up to 10
+  seconds; the offer takes the prompt's place as soon as the pull request turns up. A
+  **Publish** pressed after those 10 seconds, before the pull request turns up, goes
+  ahead without the offer, and so does a publish whose check itself fails (for example
+  when GitHub's API can't be reached or the GitHub CLI is signed out). Offline,
+  **Publish** waits for the connection.
 
 ## Review comments
 
@@ -1555,6 +1668,11 @@ thread and **line-anchored comments** on the commit's diff (click a line, or dra
 with create / edit / delete of your own, on GitHub, GitLab, and Bitbucket. A dragged range is
 a real range on **GitLab**; **GitHub** and **Bitbucket** commit comments anchor to a single
 line, and the composer says so.
+
+The detail view keeps the commit's changes on screen if a background refresh fails, with a
+line saying it couldn't refresh and a **Retry**; while you're offline, the line says so
+instead. One that fails to load says why and offers **Retry**, and while you're offline,
+one that hasn't loaded yet says it will load once you're back online.
 
 Create a PR with **Create pull request** ({{kbd:create-pr}}) or from the Compare tab — as
 a **draft** if you like, and set its **labels** and **assignees** right in the dialog
@@ -2003,6 +2121,11 @@ ones. The open / closed / all filter maps to Jira's status **categories** — "T
 **assignee**, and **labels**, plus the Markdown **description** and **comments** — the
 command palette's **Focus the comment box** jumps to the composer here too. Every
 issue links out with **View in Jira**.
+
+An issue you're reading stays on screen if a background refresh fails, with a line at the
+top saying it couldn't refresh and a **Retry**; while you're offline, the line says so
+instead. One that fails to load says why and offers **Retry**, and while you're offline,
+one that hasn't loaded yet says it will load once you're back online.
 
 When the project uses them, issues also show their **agile fields** — **story points** (both
 on the list rows and in the detail), **sprint**, a clickable **epic / parent** (open it to
@@ -2615,7 +2738,11 @@ part in GitHub Discussions for the repo. (Discussions must be enabled on the rep
   into actionable work (the new issue links back to it).
 - If GitDesktop can see that your GitHub sign-in can't write discussions, the
   discussion list, the New discussion dialog, and the thread all say so up front and
-  offer an in-app reconnect (or a copyable refresh command) before a write fails.`,
+  offer an in-app reconnect (or a copyable refresh command) before a write fails.
+- A discussion you're reading stays on screen if a background refresh fails, with a line
+  at the top saying it couldn't refresh and a **Retry**. One that fails to load says why
+  and offers **Retry**, and while you're offline, one that hasn't loaded yet says it will
+  load once you're back online.`,
   },
   {
     id: "releases",
@@ -2957,7 +3084,15 @@ Bitbucket).
 - Quick links jump to the pages best viewed on the web — GitHub's Pulse, Network,
   Dependents, and Actions (the Network graph is where forks of forks live); GitLab's
   Activity, CI/CD analytics, and value stream analytics; or Bitbucket's Commits,
-  Branches, Pipelines, and Deployments.`,
+  Branches, Pipelines, and Deployments.
+
+The repository statistics stay up if a background refresh fails, with a line saying they
+couldn't refresh and a **Retry**. If they fail to load, the panel says why and offers
+**Retry**. On the board, a chart whose local read fails says so, and one line at the top
+offers a single **Retry** for every failed chart. When a failed chart has nothing loaded,
+that line gives the first failure's reason in board order, if known. A local chart that
+fails to refresh keeps its last loaded data. While you're offline, a hosted card with
+nothing loaded says it will load once you're back online.`,
   },
   {
     id: "code-todos",
@@ -2979,12 +3114,20 @@ Very large working trees are capped at 2,000 matches.
 
 Results are **grouped by file** in collapsible sections. **Filter** them by typing text or
 a path fragment, or narrow to one or more **markers** (show only \`FIXME\`s, say). The list
-is fully keyboard-navigable.
+is fully keyboard-navigable. A failed rescan keeps the last results under a line saying
+so, with a **Retry**.
 
 ## The detail pane
 
 Select a TODO to see a **syntax-highlighted excerpt** of the code around that line, along
 with **blame attribution** — who wrote that line, and how long ago.
+
+The excerpt and its attribution stay on screen if a background refresh fails, with a line
+saying it couldn't refresh and a **Retry**. A file Git doesn't track yet (or any file
+before the repository's first commit) shows its excerpt read straight from disk, marked
+*Not tracked yet*. If Git can't read a tracked file's
+history, the excerpt still shows, with the reason and a **Retry**. Only when nothing can be
+read does the pane say why and offer **Retry**.
 
 From there you can:
 
@@ -3035,10 +3178,12 @@ keeps its sources in context. When a report is ready you can **Turn it into a Pl
 distills the whole session into a plan-ready brief to hand the planner, falling back to the
 full session if distillation is unavailable) or **Save report** as a local Markdown
 file (written to \`.gitdesktop/research/\` for you to review and commit — never committed for
-you). It's **read-only**: it searches and reads, but never changes your code. Pick any agent —
-**Claude**, **Codex**, **GitHub Copilot**, or **opencode** (the picker opens on your
-**Settings → AI** default agent) — each uses its own native web search and fetch.
+you). It searches and reads, and outside opencode it never changes your code. Pick any agent
+(**Claude**, **Codex**, **GitHub Copilot**, or **opencode**; the picker opens on your
+**Settings → AI** default agent), and each uses its own native web search and fetch.
 (opencode's web *search* needs its Exa integration enabled — web *fetch* always works.)
+On opencode, the session also loads the repository's own opencode config and plugins, which
+can widen what it does, so use another agent for a repository you don't trust.
 
 ## Plan a task (read-only)
 
@@ -3048,7 +3193,9 @@ context, approach, affected files, acceptance criteria, and a test plan. It can 
 clarifying questions; answer them and it refines the plan in the same conversation.
 The cited file paths are validated against the repo, so the plan stays grounded. From
 a finished plan you can **file it as a GitHub or local issue**, or **hand it straight
-to an implementing session**.
+to an implementing session**. On opencode, the planner also loads the repository's own
+opencode config and plugins, which can take it past read-only, so use another agent for a
+repository you don't trust.
 
 ## Delegate a task
 
@@ -3063,7 +3210,10 @@ throwaway branch (\`gd/session/…\`) that never touches your working tree, and 
 **checkpoint** each turn. It works in the open: the conversation shows a **step-by-step
 transcript** of each file it reads, edits, searches, and command it runs, interleaved
 with its narration. **Expand any edit step** to see that file's diff inline, watch its
-**live changes** mid-turn, or read the cumulative diff under **Changes**.
+**live changes** mid-turn, or read the cumulative diff under **Changes**. If a step's diff
+fails to refresh, the last one stays with a line saying it couldn't refresh and a
+**Retry**, and its live changes pause until a refresh succeeds, such as after **Retry** or
+when you come back to the window. One that fails to load says why and offers **Retry**.
 
 In the composer you can:
 
@@ -3081,8 +3231,10 @@ In the composer you can:
 
 Register **Model Context Protocol** servers under **Settings → MCP servers** — local
 (\`stdio\`) processes or remote (HTTP) endpoints, with environment variables / headers and
-**secrets kept in your OS keychain**, never in your settings file. Each session opts into
-the ones you choose from the composer's **MCP** picker. **Claude**, **Copilot**, and
+**secrets kept in your OS keychain**, never in your settings file. Edits to the list,
+secrets included, apply only when you press **Save changes**; **Discard** asks first and
+leaves stored secrets exactly as they were. Each session opts into the ones you choose
+from the composer's **MCP** picker. **Claude**, **Copilot**, and
 **opencode** run MCP servers on the **host** *or* in a **container**; **Codex** runs them
 in a **container** only (local/\`stdio\` servers — host Codex can't approve MCP tool calls,
 so it needs the container's sandbox). **Remote (HTTP)** servers are checked against your
@@ -3170,9 +3322,10 @@ revert, cherry-pick, and tags — plus two always-on reads it pairs with: list s
 preview a merge's outcome. On top of that, **Allow destructive** (\`--allow-destructive\`,
 which requires \`--allow-git-write\` too — on its own it grants nothing) unlocks the
 **irreversible** operations: delete a branch, discard changes, reset, force-push (with
-lease), delete a remote branch, drop a stash, delete a tag, and drop commits on a guarded
-rebase pull. Agent-session branches (\`gd/session/*\`) are refused by the branch-mutating
-tools, so an in-flight agent session is never broken.
+lease), delete a remote branch, drop a stash (by the sha that list stashes reports), delete
+a tag, and drop commits on a guarded rebase pull. Agent-session branches
+(\`gd/session/*\`) are refused by the branch-mutating tools, so an in-flight agent session
+is never broken.
 
 The server also exposes GitDesktop's own **AI generation recipes** (always on, no flag):
 \`generate_commit_message\`, \`generate_pr_description\`, and \`generate_branch_name\` each hand
@@ -3197,8 +3350,9 @@ GitHub results are rougher — ones with a manifest add cleanly, the rest arrive
 
 Already have servers configured? Use **Import** in that panel to pull them in from the
 open repo's \`.mcp.json\` or your global Claude config — you pick which ones, they arrive
-**disabled** for you to review, and any secret-looking values are moved to your keychain.
-Nothing is inherited automatically; the source files are left untouched.
+**disabled** for you to review, and any secret-looking values are moved to your keychain
+when you save. A server whose secret can't be stored there is held, with the reason on its
+row. Nothing is inherited automatically; the source files are left untouched.
 
 Each server is **scoped** either **Global** (every repo) or to **one repo** — import sets
 this from where the server came from, and you can change it when editing. The panel groups
@@ -3373,7 +3527,8 @@ runs and a toast tells you when the description is ready; **View** reopens it on
   deleted from \`.gitdesktop/aiignore\`, so commit the change to share it; global
   rules leave your Settings patterns and stop applying in every repository. Going
   the other way, the **Tracked** tab's **Exclude … from AI** hides a whole selection
-  in one step.
+  in one step. If your AI settings can't be read, the **AI excluded** tab says so and
+  offers **Retry**.
 - **Hide AI** (Settings → General) hides the AI surfaces (finished AI activity in the
   activity dock and notification inbox included), mutes AI desktop notifications, and
   pauses your automations — nothing new runs or posts while it's on. Your configuration
@@ -3401,8 +3556,9 @@ draft readied elsewhere is picked up by the background catch-up poller within it
   *Target branch*, or *Either branch*. A **Try a branch** field tells you live whether a branch
   would run, and names the exclude that skips it. Glob syntax matches branch rules — \`*\` within
   a path segment, \`**\` across \`/\`, \`?\` one character, \`{a,b}\` alternation.
-- **Save / Discard.** Both surfaces edit a draft behind Save / Discard (no per-toggle
-  autosave) — close with unsaved changes and the app confirms first.
+- **Save / Discard.** Both surfaces edit a draft (no per-toggle autosave): the repo dialog
+  behind Cancel / **Save changes**, and Settings behind **Save changes** / **Discard**, where
+  Discard asks first.
 - **Per-repo overrides.** The repo dialog shows the **effective** state (global defaults merged
   with this repo's overrides), badges each overridden cell as *Overridden*, and can enable an
   action that's globally off. **Reset to global defaults** drops every override so the repo
@@ -3500,7 +3656,7 @@ tab menu, or from the command palette ({{kbd:command-palette}}).
   description, like a CLI's \`--help\` — shown as a reference wherever you set arguments.
 - **Run it.** Click a task, or use **Run a task…** from the command palette. A
   confirm-gated run shows the arguments prefilled and lets you **adjust them for that run**
-  (the saved task is untouched) — press Enter to run. Runs happen in an **interactive**
+  (the saved task is untouched) — press {{key:enter}} to run. Runs happen in an **interactive**
   terminal, so a script that prompts you — the next version to release, a yes/no — works,
   and output keeps its colour. **Stop** ends a run and the processes it started; **Rerun**
   starts a fresh one with the same arguments.
@@ -3511,7 +3667,9 @@ tab menu, or from the command palette ({{kbd:command-palette}}).
   turn it off per task once you trust it (it then always runs its saved arguments). Even
   then, a task pointed at a script in the repo confirms its **first** run in each
   repository, so a path that resolves differently from repo to repo gets a look first.
-  Starting a task while another is still running asks before it replaces it.`,
+  Starting a task while another is still running asks before it replaces it: the prompt
+  starts on **Cancel**, and {{key:enter}} in its arguments field won't stop the running
+  task, so choose **Stop & run** to replace it.`,
   },
   {
     id: "keyboard",
@@ -3561,18 +3719,30 @@ bindings (formatted for your platform) — rebind any of them in **Settings → 
 Every shortcut is **rebindable** in **Settings → Keyboard**: click a binding, press a new
 combination, and if it clashes with another action the app moves it for you. A shortcut can
 be a single key: a bare character key stays quiet while you're typing or in a menu or
-picker, and fires everywhere else. The list there is filterable by action name, category,
-or key — {{kbd:focus-filter}} jumps to the filter while the section is open. Many actions
-(creating issues/releases, repository settings, stash views{{ai}}, most agent
-commands{{/ai}}) are palette-only until you bind a key. Defaults match GitHub Desktop
-where there's an equivalent.`,
+picker, and fires everywhere else. {{key:space}} stays quiet as well on rows, cards
+and controls that use it themselves (a file in **Changes** stages, a board card
+peeks, a checkbox or switch toggles, a tab opens, a linked-issue chip flips its
+keyword), and when its shortcut has nothing to act on, {{key:space}} presses the
+focused button or scrolls as usual. The list there is filterable by action name,
+category, or key — {{kbd:focus-filter}} jumps to the filter while the section is
+open. Many actions (creating issues/releases, repository settings, stash
+views{{ai}}, most agent commands{{/ai}}) are palette-only until you bind a key.
+Defaults match GitHub Desktop where there's an equivalent.`,
   },
   {
     id: "settings",
     label: "Settings & updates",
     body: `# Settings & updates
 
-Open **Settings** from the header gear (or {{kbd:open-settings}}). Sections:
+Open **Settings** from the header gear (or {{kbd:open-settings}}). Leaving Settings with
+unsaved changes asks to save or discard first, whether you leave through Back,
+{{key:escape}}, the command palette, a shortcut, a notification, or by opening a
+repository. A move made while a save is still writing waits for it and continues once it
+lands; if the save fails, Settings stays open with your changes. Edits wait behind a
+**Save changes** / **Discard** bar: **Discard** asks first and counts any secret values
+you typed, and a failed save says so and keeps the bar up until one succeeds.
+
+Sections:
 
 - **General** — hide AI features (which also hides finished AI activity in the activity
   dock and notification inbox, mutes AI desktop notifications, and pauses your automations

@@ -48,6 +48,11 @@ export const capabilities: Capability[] = [
   },
   {
     group: "Diffs & staging",
+    label:
+      "Space on a focused file stages or unstages it — staging the last change in the file you're viewing opens the next file in the list (the one above it, at the end of a section), and unstaging works the same way in Staged",
+  },
+  {
+    group: "Diffs & staging",
     label: "Stage or discard part of a brand-new, untracked file",
   },
   {
@@ -57,7 +62,7 @@ export const capabilities: Capability[] = [
   {
     group: "Diffs & staging",
     label:
-      "Raw ⇄ Preview toggle on markdown & MDX diffs — read the change as rendered prose",
+      "Raw ⇄ Preview toggle on markdown & MDX diffs — read the change as rendered prose, repository images included",
     highlight: true,
   },
   {
@@ -306,7 +311,7 @@ export const capabilities: Capability[] = [
   {
     group: "Forges & trackers",
     label:
-      "Sign in & reconnect in-app — session-expired detection & token-expiry warnings, rate limits told apart (with GitHub's reset time), plus scope hints that reconnect with the needed scope",
+      "Sign in & reconnect in-app — session-expired detection & token-expiry warnings, rate limits told apart (with GitHub's reset time, and most GitHub requests a limit covers held back until it lifts), plus scope hints that reconnect with the needed scope",
   },
   {
     group: "Forges & trackers",

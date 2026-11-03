@@ -1,7 +1,11 @@
 use tauri::State;
 
 use crate::error::{AppError, AppResult};
-use crate::git::runner::{run_git, run_git_mutating_input, run_git_raw, DEFAULT_TIMEOUT};
+use crate::git::history::unborn_head;
+use crate::git::ops::{discard_rel_path, discard_shown, linked_component, DISCARD_LINKED};
+use crate::git::runner::{
+    run_git, run_git_mutating_input, run_git_raw, GitOutput, DEFAULT_TIMEOUT,
+};
 use crate::git::types::{DiffStatEntry, FileDiff, StagedDiff};
 use crate::image_sniff::{dimensions_within_caps, has_raster_magic, sniff_image};
 use crate::state::AppState;
@@ -9,8 +13,14 @@ use crate::state::AppState;
 /// Cap on file bytes shipped for image previews.
 const IMAGE_MAX_BYTES: usize = 20_000_000;
 
-/// One file's bytes for the webview, or the reason they are being withheld. A refusal
-/// is a STATE rather than an error: the diff view has a pane to show for it.
+#[cfg(test)]
+thread_local! {
+    static PROBE_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SHOW_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VERIFY_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One file's bytes for the webview, or a size refusal the diff view can display.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileBytes {
@@ -32,25 +42,148 @@ fn is_repo_relative(path: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+enum PreviewRead {
+    Absent,
+    TooLarge,
+    Bytes(Vec<u8>),
+}
+
+fn preview_read_refusal(raw: &str, why: &str) -> AppError {
+    AppError::InvalidArgument(format!("Can't read {} — {why}.", discard_shown(raw)))
+}
+
+fn read_preview_worktree(repo: &str, raw: &str, rel: &str) -> AppResult<PreviewRead> {
+    use std::io::Read;
+    let path = std::path::Path::new(repo).join(rel);
+    #[cfg(windows)]
+    let path = crate::fsops::verbatim_path(&path)
+        .ok_or_else(|| preview_read_refusal(raw, "the path has no verbatim form"))?;
+    if linked_component(repo, rel, true)? {
+        return Err(preview_read_refusal(raw, DISCARD_LINKED));
+    }
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(PreviewRead::Absent)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !metadata.is_file() {
+        return Err(preview_read_refusal(raw, "it isn't a regular file"));
+    }
+    if metadata.len() > IMAGE_MAX_BYTES as u64 {
+        return Ok(PreviewRead::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(IMAGE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(PreviewRead::Bytes(bytes))
+}
+
+/// Absence is what git reports as a missing path or stage (it words an unknown
+/// full object id the same way), a missing ancestor of a base that resolves, or a
+/// HEAD/@ read while HEAD is unborn. Other failures stay errors, so a bad
+/// revision name can't pass for an absent file.
+async fn preview_rev_failure(repo: &str, rev: &str, out: GitOutput) -> AppResult<()> {
+    if [
+        "does not exist in '",
+        "exists on disk, but not in ",
+        "does not exist (neither on disk nor in the index)",
+        "is in the index, but not at stage",
+    ]
+    .iter()
+    .any(|text| out.stderr.contains(text))
+    {
+        return Ok(());
+    }
+    let mut base = rev;
+    loop {
+        let before_digits = base.trim_end_matches(|c: char| c.is_ascii_digit());
+        let Some(prefix) = before_digits.strip_suffix(['~', '^']) else {
+            break;
+        };
+        if prefix.is_empty() {
+            break;
+        }
+        base = prefix;
+    }
+    if matches!(base, "HEAD" | "@") && unborn_head(repo).await? {
+        return Ok(());
+    }
+    if out.stderr.contains("invalid object name '") && base.len() < rev.len() {
+        let base = format!("{base}^{{commit}}");
+        #[cfg(test)]
+        VERIFY_SPAWNS.with(|n| n.set(n.get() + 1));
+        let verified = run_git_raw(
+            Some(repo),
+            &["rev-parse", "--verify", "--quiet", &base],
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+        if verified.code == 0 {
+            return Ok(());
+        }
+    }
+    out.exit_verdict().map(|_| ())
+}
+
 /// Raw file bytes (base64) at a revision, or from the working tree when
 /// `rev` is None. `None` result = the file doesn't exist there (e.g. the
-/// old side of an added file). Drives the image diff view.
+/// old side of an added file). `probe_size` opts document-chosen revision
+/// reads into a size check before buffering; omitted means a single read.
 #[tauri::command]
 pub async fn git_file_base64(
     repo_path: String,
     rev: Option<String>,
     file_path: String,
+    probe_size: Option<bool>,
 ) -> AppResult<Option<FileBytes>> {
     use base64::Engine;
-    let bytes: Option<Vec<u8>> = match rev {
+    let read = match rev {
         Some(rev) => {
             if rev.is_empty() || rev.starts_with('-') {
                 return Err(AppError::InvalidArgument(format!("invalid rev: {rev}")));
             }
             let spec = format!("{rev}:{file_path}");
+            if probe_size == Some(true) {
+                #[cfg(test)]
+                PROBE_SPAWNS.with(|n| n.set(n.get() + 1));
+                let out = run_git_raw(
+                    Some(&repo_path),
+                    &["cat-file", "-s", &spec],
+                    DEFAULT_TIMEOUT,
+                )
+                .await?;
+                if out.code != 0 {
+                    preview_rev_failure(&repo_path, &rev, out).await?;
+                    return Ok(None);
+                }
+                let size = out.stdout_lossy().trim().parse::<u64>().map_err(|_| {
+                    AppError::Command("Git returned an unreadable file size.".into())
+                })?;
+                if size > IMAGE_MAX_BYTES as u64 {
+                    return Ok(Some(FileBytes {
+                        base64: None,
+                        mime: None,
+                        too_large: true,
+                    }));
+                }
+            }
+            #[cfg(test)]
+            SHOW_SPAWNS.with(|n| n.set(n.get() + 1));
             let out = run_git_raw(Some(&repo_path), &["show", &spec], DEFAULT_TIMEOUT).await?;
-            // Nonzero exit = the path doesn't exist at that revision.
-            (out.code == 0).then_some(out.stdout)
+            if out.code != 0 {
+                preview_rev_failure(&repo_path, &rev, out).await?;
+                PreviewRead::Absent
+            } else {
+                PreviewRead::Bytes(out.stdout)
+            }
         }
         None => {
             if !is_repo_relative(&file_path) {
@@ -58,12 +191,24 @@ pub async fn git_file_base64(
                     "invalid path: {file_path}"
                 )));
             }
-            tokio::fs::read(std::path::Path::new(&repo_path).join(&file_path))
+            let rel = discard_rel_path(&file_path)
+                .map_err(|why| preview_read_refusal(&file_path, why))?;
+            tokio::task::spawn_blocking(move || read_preview_worktree(&repo_path, &file_path, &rel))
                 .await
-                .ok()
+                .map_err(|e| AppError::Command(e.to_string()))??
         }
     };
-    let Some(bytes) = bytes else { return Ok(None) };
+    let bytes = match read {
+        PreviewRead::Absent => return Ok(None),
+        PreviewRead::TooLarge => {
+            return Ok(Some(FileBytes {
+                base64: None,
+                mime: None,
+                too_large: true,
+            }))
+        }
+        PreviewRead::Bytes(bytes) => bytes,
+    };
     if bytes.len() > IMAGE_MAX_BYTES {
         return Ok(Some(FileBytes {
             base64: None,
@@ -180,6 +325,64 @@ fn hunk_section(header: &str) -> &str {
     }
 }
 
+/// File-header lines that pair a diff with a different source path.
+const PAIRING_HEADERS: [&str; 6] = [
+    "similarity index ",
+    "dissimilarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+];
+
+/// A rename/copy file header rewritten as a plain modification of the NEW path, so
+/// a partial patch edits that path in place; applied in reverse, the pairing would
+/// undo the rename itself. Mode and index lines stay, and a header without pairing
+/// lines comes back unchanged. Names reuse the diff's own `+++` token, quoting
+/// included; the TAB git appends there for a name with a space stays on the
+/// `---`/`+++` lines and never reaches `diff --git`.
+fn plain_modification_header(header: &str) -> std::borrow::Cow<'_, str> {
+    let lines: Vec<&str> = header.split('\n').collect();
+    let pairs = |l: &str| PAIRING_HEADERS.iter().any(|p| l.starts_with(p));
+    let minus = lines.iter().find_map(|l| l.strip_prefix("--- "));
+    let plus = lines.iter().find_map(|l| l.strip_prefix("+++ "));
+    let (true, Some(minus), Some(plus)) = (lines.iter().any(|l| pairs(l)), minus, plus) else {
+        return std::borrow::Cow::Borrowed(header);
+    };
+    let (new_name, tab) = match plus.strip_suffix('\t') {
+        Some(name) => (name, "\t"),
+        None => (plus, ""),
+    };
+    let Some(old_side) = old_side_spelling(minus.strip_suffix('\t').unwrap_or(minus), new_name)
+    else {
+        return std::borrow::Cow::Borrowed(header);
+    };
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.starts_with("diff --git ") {
+            out.push(format!("diff --git {old_side} {new_name}"));
+        } else if line.starts_with("--- ") {
+            out.push(format!("--- {old_side}{tab}"));
+        } else if !pairs(line) {
+            out.push(line.to_string());
+        }
+    }
+    std::borrow::Cow::Owned(out.join("\n"))
+}
+
+/// `new`'s name under the prefix `old` carries (`b/x` beside `a/y` gives `a/x`),
+/// keeping `new`'s C-quoting. `None` for a name without a prefix.
+fn old_side_spelling(old: &str, new: &str) -> Option<String> {
+    let old = old.strip_prefix('"').unwrap_or(old);
+    let (quote, new) = match new.strip_prefix('"') {
+        Some(rest) => ("\"", rest),
+        None => ("", new),
+    };
+    let prefix = &old[..old.find('/')?];
+    let name = &new[new.find('/')? + 1..];
+    Some(format!("{quote}{prefix}/{name}"))
+}
+
 /// Build a patch containing only the user-selected changed lines from a
 /// single-file unified diff, neutralizing the rest so the result still applies
 /// cleanly. `reverse` means the patch will be applied with `--reverse`
@@ -206,6 +409,7 @@ pub fn build_partial_patch(diff_text: &str, selected: &[SelectedLine], reverse: 
         return String::new();
     };
     let header = lines[..first_hunk].join("\n");
+    let header = plain_modification_header(&header);
 
     let mut out_hunks = String::new();
     let mut i = first_hunk;
@@ -342,6 +546,121 @@ const VIEWER_MAX_BYTES: usize = 1_000_000;
 /// Default cap on staged diff text shipped for AI prompt building.
 const AI_DEFAULT_MAX_BYTES: usize = 1_000_000;
 
+/// One file's diff output, paired with its rename source when the surface pairs it.
+pub(crate) struct PathDiff {
+    /// Raw bytes of the run whose text is shown.
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) old_path: Option<String>,
+}
+
+/// Runs `content -- <file_path>` (literal pathspec) and, when that shows the file
+/// as an addition, re-runs it with the rename source's pathspec too: a one-path
+/// pathspec hides the source, so an unpaired rename always renders as an add.
+/// `probe` is the same diff in `--name-status -z` form with NO pathspec, so the
+/// surface's own rename detection decides and the pane agrees with its file list.
+/// A failed probe or re-run is `Err`; a re-run without exactly one rename section
+/// keeps the single-path output.
+pub(crate) async fn diff_with_rename_pairing(
+    repo: &str,
+    file_path: &str,
+    content: &[&str],
+    probe: &[&str],
+) -> AppResult<PathDiff> {
+    let new_spec = crate::git::pathspec::literal(file_path);
+    let mut args = content.to_vec();
+    args.extend(["--", new_spec.as_str()]);
+    let single = run_git(Some(repo), &args, DEFAULT_TIMEOUT).await?.stdout;
+    let unpaired = |stdout| PathDiff {
+        stdout,
+        old_path: None,
+    };
+    if !shows_new_file(&single) {
+        return Ok(unpaired(single));
+    }
+    let names = run_git(Some(repo), probe, DEFAULT_TIMEOUT).await?;
+    // A source name that isn't UTF-8 can't round-trip into a pathspec.
+    let Some(old) = rename_source(&names.stdout, file_path.as_bytes())
+        .and_then(|old| String::from_utf8(old.to_vec()).ok())
+    else {
+        return Ok(unpaired(single));
+    };
+    let old_spec = crate::git::pathspec::literal(&old);
+    args.push(old_spec.as_str());
+    let rerun = run_git(Some(repo), &args, DEFAULT_TIMEOUT).await?;
+    Ok(match sole_rename_section(&rerun.stdout) {
+        Some(stdout) => PathDiff {
+            stdout,
+            old_path: Some(old),
+        },
+        None => unpaired(single),
+    })
+}
+
+/// Whether diff output renders a file as an addition. Hunk lines always carry a
+/// `+`/`-`/space prefix, so a line-start `new file mode ` can only be a header.
+fn shows_new_file(stdout: &[u8]) -> bool {
+    stdout
+        .split(|&b| b == b'\n')
+        .any(|l| l.starts_with(b"new file mode "))
+}
+
+/// The source of the rename `--name-status -z` output pairs into `new_path`,
+/// compared byte-for-byte (`-z` names are raw, never C-quoted). Rows are
+/// `<status>\0<path>\0`, or `<status>\0<old>\0<new>\0` for renames and copies;
+/// log-family output leads a status token with `\n`. Copies never count.
+fn rename_source<'a>(name_status_z: &'a [u8], new_path: &[u8]) -> Option<&'a [u8]> {
+    let mut tokens = name_status_z.split(|&b| b == 0);
+    while let Some(token) = tokens.next() {
+        let status = &token[token.iter().take_while(|&&b| b == b'\n').count()..];
+        let Some(&kind) = status.first() else {
+            continue;
+        };
+        if kind == b'R' || kind == b'C' {
+            let old = tokens.next()?;
+            if tokens.next()? == new_path && kind == b'R' {
+                return Some(old);
+            }
+        } else {
+            tokens.next()?;
+        }
+    }
+    None
+}
+
+/// The one section of a two-pathspec run that carries a `rename from`/`rename to`
+/// pair, after any preamble ahead of the first section (a `show` commit header),
+/// or `None` when the run holds zero or several. The source's literal pathspec
+/// also matches files under a directory now at that path, so extra sections occur.
+fn sole_rename_section(stdout: &[u8]) -> Option<Vec<u8>> {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for line in stdout.split_inclusive(|&b| b == b'\n') {
+        if line.starts_with(b"diff --git ") {
+            starts.push(at);
+        }
+        at += line.len();
+    }
+    let mut found = None;
+    for (i, &start) in starts.iter().enumerate() {
+        let section = &stdout[start..starts.get(i + 1).copied().unwrap_or(stdout.len())];
+        let header = || {
+            section
+                .split(|&b| b == b'\n')
+                .take_while(|l| !l.starts_with(b"@@"))
+        };
+        if header().any(|l| l.starts_with(b"rename from "))
+            && header().any(|l| l.starts_with(b"rename to "))
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(section);
+        }
+    }
+    let section = found?;
+    Some([&stdout[..starts[0]], section].concat())
+}
+
 #[tauri::command]
 pub async fn git_diff_file(
     repo_path: String,
@@ -357,7 +676,14 @@ pub async fn git_diff_file(
         // fails with "could not access" (measured), so this half stays raw.
         let out = run_git_raw(
             Some(&repo_path),
-            &["diff", "--no-index", "--", "/dev/null", &file_path],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                &file_path,
+            ],
             DEFAULT_TIMEOUT,
         )
         .await?;
@@ -367,23 +693,38 @@ pub async fn git_diff_file(
                 stderr: out.stderr,
             });
         }
-        out
+        PathDiff {
+            stdout: out.stdout,
+            old_path: None,
+        }
+    } else if staged {
+        // Only this arm pairs. An index↔worktree diff does pair an intent-to-add
+        // file with its deleted source (measured), but its hunks would then sit on
+        // the source, and staging one onto the empty intent-to-add entry fails.
+        diff_with_rename_pairing(
+            &repo_path,
+            &file_path,
+            &["diff", "--no-ext-diff", "--no-color", "--cached"],
+            &["diff", "--no-ext-diff", "--name-status", "-z", "--cached"],
+        )
+        .await?
     } else {
         // Literal pathspec: a `[slug]`-style path would otherwise splice its
         // glob-siblings' hunks into this file's diff.
         let spec = crate::git::pathspec::literal(&file_path);
-        let mut args = vec!["diff", "--no-color"];
-        if staged {
-            args.push("--cached");
+        let args = ["diff", "--no-ext-diff", "--no-color", "--", spec.as_str()];
+        PathDiff {
+            stdout: run_git(Some(&repo_path), &args, DEFAULT_TIMEOUT)
+                .await?
+                .stdout,
+            old_path: None,
         }
-        args.extend(["--", spec.as_str()]);
-        run_git(Some(&repo_path), &args, DEFAULT_TIMEOUT).await?
     };
 
     // Decided from the raw bytes before the lossy decode and the truncation cut:
     // a genuine U+FFFD is valid UTF-8, and a bad byte past the cut still counts.
     let undecodable = std::str::from_utf8(&out.stdout).is_err();
-    let text = out.stdout_lossy();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let is_binary = text.lines().any(|l| {
         l.starts_with("Binary files ") && l.ends_with(" differ")
     });
@@ -395,6 +736,7 @@ pub async fn git_diff_file(
         is_truncated,
         text,
         undecodable,
+        old_path: out.old_path,
     })
 }
 
@@ -412,19 +754,21 @@ pub async fn git_session_file_diff(
     base: String,
 ) -> AppResult<FileDiff> {
     // base → working tree: captures both committed-turn changes and uncommitted edits.
-    // Literal pathspec so a `[slug]`-style path can't pull in a glob-sibling's hunks.
-    let spec = crate::git::pathspec::literal(&file_path);
-    let out = run_git(
-        Some(&repo_path),
-        &["diff", "--no-color", &base, "--", &spec],
-        DEFAULT_TIMEOUT,
+    let out = diff_with_rename_pairing(
+        &repo_path,
+        &file_path,
+        &["diff", "--no-ext-diff", "--no-color", &base],
+        &["diff", "--no-ext-diff", "--name-status", "-z", &base],
     )
     .await?;
-    let mut text = out.stdout_lossy();
+    let old_path = out.old_path;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
 
     // Empty tracked diff + the file is untracked (a just-written new file) →
     // show it as a full add, the same way git_diff_file handles untracked.
     if text.trim().is_empty() {
+        // Literal pathspec: a `[slug]`-style path would match a glob-sibling's untracked file.
+        let spec = crate::git::pathspec::literal(&file_path);
         let others = run_git(
             Some(&repo_path),
             &["ls-files", "--others", "--exclude-standard", "--", &spec],
@@ -436,7 +780,14 @@ pub async fn git_session_file_diff(
             // git_diff_file); only the pathspec-taking probe above is literalized.
             let no_index = run_git_raw(
                 Some(&repo_path),
-                &["diff", "--no-index", "--", "/dev/null", &file_path],
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    &file_path,
+                ],
                 DEFAULT_TIMEOUT,
             )
             .await?;
@@ -462,6 +813,7 @@ pub async fn git_session_file_diff(
         is_truncated,
         text,
         undecodable: false,
+        old_path,
     })
 }
 
@@ -486,7 +838,7 @@ pub async fn git_staged_diff(
     // concurrent edit can change between the name pass and the content pass.
     let filtered = crate::git::ai_ignore::filtered_diff(
         &repo_path,
-        &["diff", base, "--no-color"],
+        &["diff", "--no-ext-diff", base, "--no-color"],
         &["diff", base, "--numstat", "-z"],
         &exclude.unwrap_or_default(),
         true,
@@ -548,11 +900,10 @@ enum DiffAttr {
 
 /// git's config-bool alphabet, case-insensitive: the named spellings, a VALUELESS key
 /// (`None`) as true, an empty value as false, and any DECIMAL integer, where non-zero
-/// is true (git also reads `0x` hex via strtoimax base 0; that spelling drops to the
-/// sniff here). A junk value is not a bool git can parse either — git FATALS the diff
-/// rather than choosing — so dropping the entry and letting the content sniff decide
-/// is strictly more graceful than what git itself does.
-fn git_config_bool(value: Option<&str>) -> Option<bool> {
+/// is true (git also reads `0x` hex via strtoimax base 0; that spelling reads as junk
+/// here). Junk is `None`, a bool git can't parse either (git fatals rather than
+/// choosing), so each caller's fallback for it is strictly more graceful than git's.
+pub(crate) fn git_config_bool(value: Option<&str>) -> Option<bool> {
     let Some(value) = value else {
         return Some(true);
     };
@@ -1326,6 +1677,113 @@ mod tests {
         std::fs::write(info.join("exclude"), "").unwrap();
         std::fs::write(info.join("attributes"), "").unwrap();
         (tmp, dir, repo)
+    }
+
+    async fn assert_ext_diff_preserves_patches(attribute_driver: bool) {
+        let (_tmp, dir, repo) = init_line_stats_repo("gd-ext-diff-").await;
+        std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+        if attribute_driver {
+            std::fs::write(dir.join(".gitattributes"), "*.txt diff=marker\n").unwrap();
+        }
+        run_git(Some(&repo), &["add", "-A"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        run_git(Some(&repo), &["commit", "-qm", "seed"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let config = if attribute_driver {
+            "diff.marker.command"
+        } else {
+            "diff.external"
+        };
+        run_git(
+            Some(&repo),
+            &["config", config, "echo EXTDIFF-RAN"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        std::fs::write(dir.join("tracked.txt"), "after\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "new\n").unwrap();
+
+        let control = run_git(Some(&repo), &["diff", "--no-color"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(control.stdout_lossy().contains("EXTDIFF-RAN"));
+        // diff.external fires for --no-index; attribute drivers do not
+        // (measured, git 2.51.1).
+        if !attribute_driver {
+            let untracked_control = run_git_raw(
+                Some(&repo),
+                &["diff", "--no-index", "--", "/dev/null", "untracked.txt"],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert!(untracked_control.stdout_lossy().contains("EXTDIFF-RAN"));
+        }
+        for (path, untracked) in [("tracked.txt", false), ("untracked.txt", true)] {
+            let diff = git_diff_file(repo.clone(), path.into(), false, untracked)
+                .await
+                .unwrap();
+            assert!(diff.text.contains("diff --git"), "{}", diff.text);
+            assert!(!diff.text.contains("EXTDIFF-RAN"), "{}", diff.text);
+        }
+
+        run_git(Some(&repo), &["add", "tracked.txt"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let staged_control = run_git(
+            Some(&repo),
+            &["diff", "--cached", "--no-color"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(staged_control.stdout_lossy().contains("EXTDIFF-RAN"));
+        let staged = git_staged_diff(repo.clone(), None, None, None)
+            .await
+            .unwrap();
+        assert!(staged.text.contains("diff --git"), "{}", staged.text);
+        assert!(!staged.text.contains("EXTDIFF-RAN"), "{}", staged.text);
+        assert_eq!(staged.files.len(), 1);
+        assert_eq!(staged.files[0].path, "tracked.txt");
+
+        if attribute_driver {
+            run_git(
+                Some(&repo),
+                &["config", "diff.marker.trustExitCode", "true"],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let control = run_git_raw(
+                Some(&repo),
+                &["diff", "--cached", "--quiet"],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(control.code, 0, "the driver reports equality");
+            let guarded = run_git_raw(
+                Some(&repo),
+                &["diff", "--no-ext-diff", "--cached", "--quiet"],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(guarded.code, 1, "the staged change must remain visible");
+        }
+    }
+
+    #[tokio::test]
+    async fn patches_ignore_repo_ext_diff_tool() {
+        assert_ext_diff_preserves_patches(false).await;
+    }
+
+    #[tokio::test]
+    async fn patches_ignore_attribute_ext_diff_driver() {
+        assert_ext_diff_preserves_patches(true).await;
     }
 
     /// The feature's real contract: an untracked row must already say what numstat
@@ -2691,7 +3149,7 @@ mod tests {
         // refused by the area cap alone.
         for name in ["bomb.png", "area.png"] {
             for rev in [None, Some("HEAD".to_string())] {
-                let got = git_file_base64(repo.clone(), rev.clone(), name.into())
+                let got = git_file_base64(repo.clone(), rev.clone(), name.into(), None)
                     .await
                     .unwrap()
                     .expect("the file exists on both paths");
@@ -2708,7 +3166,7 @@ mod tests {
     async fn the_sniffed_type_wins_over_the_file_extension() {
         let (_tmp, _dir, repo) = init_preview_repo().await;
         for rev in [None, Some("HEAD".to_string())] {
-            let ok = git_file_base64(repo.clone(), rev.clone(), "ok.png".into())
+            let ok = git_file_base64(repo.clone(), rev.clone(), "ok.png".into(), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2716,7 +3174,7 @@ mod tests {
             assert_eq!(ok.mime.as_deref(), Some("image/png"));
             assert!(ok.base64.is_some());
 
-            let lying = git_file_base64(repo.clone(), rev.clone(), "lying.png".into())
+            let lying = git_file_base64(repo.clone(), rev.clone(), "lying.png".into(), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2725,7 +3183,7 @@ mod tests {
 
             // SVG has no header raster to gate, so its declared 9000x9000 is not a
             // decode the caps can bound — it ships, byte-bound, and typeless.
-            let svg = git_file_base64(repo.clone(), rev.clone(), "icon.svg".into())
+            let svg = git_file_base64(repo.clone(), rev.clone(), "icon.svg".into(), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2749,7 +3207,7 @@ mod tests {
         assert_eq!(sniff_image(&bytes), None);
 
         for rev in [None, Some("HEAD".to_string())] {
-            let got = git_file_base64(repo.clone(), rev.clone(), "stuffed.jpg".into())
+            let got = git_file_base64(repo.clone(), rev.clone(), "stuffed.jpg".into(), None)
                 .await
                 .unwrap()
                 .expect("the file exists on both paths");
@@ -2759,7 +3217,7 @@ mod tests {
 
         // The control that keeps the refusal from swallowing everything typeless: bytes
         // with no raster magic still ship, bounded by the byte cap alone.
-        let svg = git_file_base64(repo.clone(), None, "icon.svg".into())
+        let svg = git_file_base64(repo.clone(), None, "icon.svg".into(), None)
             .await
             .unwrap()
             .unwrap();
@@ -2773,7 +3231,7 @@ mod tests {
     async fn the_byte_cap_refuses_and_a_missing_file_is_still_none() {
         let (_tmp, dir, repo) = init_preview_repo().await;
         std::fs::write(dir.join("huge.bin"), vec![0u8; IMAGE_MAX_BYTES + 1]).unwrap();
-        let huge = git_file_base64(repo.clone(), None, "huge.bin".into())
+        let huge = git_file_base64(repo.clone(), None, "huge.bin".into(), None)
             .await
             .unwrap()
             .expect("an over-cap file is a refusal, not an absence");
@@ -2782,7 +3240,7 @@ mod tests {
         assert_eq!(huge.mime, None);
 
         for rev in [None, Some("HEAD".to_string())] {
-            assert!(git_file_base64(repo.clone(), rev, "nope.png".into())
+            assert!(git_file_base64(repo.clone(), rev, "nope.png".into(), None)
                 .await
                 .unwrap()
                 .is_none());
@@ -2842,7 +3300,7 @@ mod tests {
         let outside = tmp.path().join("outside.png");
         std::fs::write(&outside, png_fixture(16, 16)).unwrap();
 
-        let inside = git_file_base64(repo.clone(), None, "inside.png".into())
+        let inside = git_file_base64(repo.clone(), None, "inside.png".into(), None)
             .await
             .unwrap()
             .expect("a file inside the repo reads");
@@ -2853,7 +3311,7 @@ mod tests {
             "sub/../../outside.png".to_string(),
             outside.to_string_lossy().into_owned(),
         ] {
-            let err = git_file_base64(repo.clone(), None, escape.clone())
+            let err = git_file_base64(repo.clone(), None, escape.clone(), None)
                 .await
                 .expect_err("an escaping path is refused, not read");
             assert!(
@@ -2861,6 +3319,440 @@ mod tests {
                 "{escape}: {err:?}"
             );
         }
+    }
+
+    fn reset_preview_spawns() {
+        PROBE_SPAWNS.with(|n| n.set(0));
+        SHOW_SPAWNS.with(|n| n.set(0));
+        VERIFY_SPAWNS.with(|n| n.set(0));
+    }
+
+    fn assert_preview_spawns(probe: usize, show: usize, verify: usize) {
+        assert_eq!(
+            (
+                PROBE_SPAWNS.with(|n| n.get()),
+                SHOW_SPAWNS.with(|n| n.get()),
+                VERIFY_SPAWNS.with(|n| n.get()),
+            ),
+            (probe, show, verify)
+        );
+    }
+
+    async fn assert_preview_bytes(repo: &str, path: &str, expected: &[u8]) {
+        use base64::Engine;
+        let got = git_file_base64(repo.into(), None, path.into(), None)
+            .await
+            .unwrap()
+            .expect("in-repo control exists");
+        assert!(!got.too_large);
+        assert_eq!(
+            got.base64,
+            Some(base64::engine::general_purpose::STANDARD.encode(expected))
+        );
+    }
+
+    async fn assert_preview_refused(repo: &str, path: &str, outside: &[u8], reason: &str) {
+        use base64::Engine;
+        let result = git_file_base64(repo.into(), None, path.into(), None).await;
+        if let Ok(Some(bytes)) = &result {
+            assert_ne!(
+                bytes.base64,
+                Some(base64::engine::general_purpose::STANDARD.encode(outside)),
+                "outside sentinel must never be returned"
+            );
+        }
+        let err = result.expect_err("the guard must refuse, not return absence or bytes");
+        assert!(
+            matches!(&err, AppError::InvalidArgument(message) if message.contains(reason)),
+            "{path}: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_size_probe_preserves_row_spawns_and_bounds_document_reads() {
+        use base64::Engine;
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        std::fs::File::create(dir.join("huge.bin"))
+            .unwrap()
+            .set_len(IMAGE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        git_ok(&repo, &["add", "--", "huge.bin"]).await;
+        git_ok(&repo, &["commit", "-qm", "large blob"]).await;
+
+        for probe_size in [None, Some(false), Some(true)] {
+            reset_preview_spawns();
+            let got = git_file_base64(
+                repo.clone(),
+                Some("HEAD".into()),
+                "huge.bin".into(),
+                probe_size,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(got.too_large);
+            assert_eq!(got.base64, None);
+            assert_eq!(got.mime, None);
+            let probe = usize::from(probe_size == Some(true));
+            assert_preview_spawns(probe, 1 - probe, 0);
+
+            reset_preview_spawns();
+            let got = git_file_base64(
+                repo.clone(),
+                Some("HEAD".into()),
+                "ok.png".into(),
+                probe_size,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!got.too_large);
+            assert_eq!(got.mime.as_deref(), Some("image/png"));
+            assert_eq!(
+                got.base64,
+                Some(base64::engine::general_purpose::STANDARD.encode(png_fixture(1200, 630)))
+            );
+            assert_preview_spawns(probe, 1, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_rev_failures_distinguish_absent_paths_and_ancestors_from_bad_revs() {
+        let (_tmp, _dir, repo) = init_preview_repo().await;
+        let root = git_ok(&repo, &["rev-parse", "HEAD"]).await;
+        for probe_size in [None, Some(true)] {
+            let probe = usize::from(probe_size == Some(true));
+            for (rev, path, verify) in [
+                ("HEAD".to_string(), "absent.png", 0),
+                (":0".to_string(), "absent.png", 0),
+                (format!("{}~1", root.trim()), "ok.png", 1),
+                (format!("{}^", root.trim()), "ok.png", 1),
+                ("HEAD~5".to_string(), "ok.png", 1),
+                ("HEAD~1^2~".to_string(), "ok.png", 1),
+            ] {
+                reset_preview_spawns();
+                assert!(
+                    git_file_base64(repo.clone(), Some(rev.clone()), path.into(), probe_size)
+                        .await
+                        .unwrap_or_else(|e| panic!("{rev}:{path}: {e:?}"))
+                        .is_none()
+                );
+                assert_preview_spawns(probe, 1 - probe, verify);
+            }
+            for (rev, verify) in [("bogus~1", 1), ("bogus", 0)] {
+                reset_preview_spawns();
+                let err =
+                    git_file_base64(repo.clone(), Some(rev.into()), "ok.png".into(), probe_size)
+                        .await
+                        .unwrap_err();
+                assert!(matches!(err, AppError::Git { .. }), "{err:?}");
+                assert_preview_spawns(probe, 1 - probe, verify);
+            }
+        }
+        git_ok(&repo, &["rm", "--cached", "--", "ok.png"]).await;
+        for probe_size in [None, Some(true)] {
+            reset_preview_spawns();
+            assert!(
+                git_file_base64(repo.clone(), Some(":0".into()), "ok.png".into(), probe_size)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let probe = usize::from(probe_size == Some(true));
+            assert_preview_spawns(probe, 1 - probe, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_on_disk_additions_are_absent_at_head_and_the_adding_commits_parent() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        std::fs::write(dir.join("newimg.png"), png_fixture(16, 16)).unwrap();
+        git_ok(&repo, &["add", "--", "newimg.png"]).await;
+        for committed in [false, true] {
+            let rev = if committed {
+                git_ok(&repo, &["commit", "-qm", "add image"]).await;
+                let added = git_ok(&repo, &["rev-parse", "HEAD"]).await;
+                format!("{}~1", added.trim())
+            } else {
+                "HEAD".to_string()
+            };
+            assert!(dir.join("newimg.png").is_file());
+            for probe_size in [None, Some(true)] {
+                reset_preview_spawns();
+                assert!(git_file_base64(
+                    repo.clone(),
+                    Some(rev.clone()),
+                    "newimg.png".into(),
+                    probe_size
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{rev}:newimg.png: {e:?}"))
+                .is_none());
+                let probe = usize::from(probe_size == Some(true));
+                assert_preview_spawns(probe, 1 - probe, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_unborn_head_is_absent_in_both_modes() {
+        let (_tmp, dir, repo) = init_line_stats_repo("gd-preview-unborn-").await;
+        std::fs::write(dir.join("ok.png"), png_fixture(16, 16)).unwrap();
+        git_ok(&repo, &["add", "--", "ok.png"]).await;
+        for probe_size in [None, Some(true)] {
+            reset_preview_spawns();
+            assert!(git_file_base64(
+                repo.clone(),
+                Some("HEAD".into()),
+                "ok.png".into(),
+                probe_size
+            )
+            .await
+            .unwrap()
+            .is_none());
+            let probe = usize::from(probe_size == Some(true));
+            assert_preview_spawns(probe, 1 - probe, 0);
+
+            reset_preview_spawns();
+            let staged =
+                git_file_base64(repo.clone(), Some(":0".into()), "ok.png".into(), probe_size)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(staged.base64.is_some());
+            assert_preview_spawns(probe, 1, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_orphan_head_absence_does_not_hide_unrelated_bad_revs() {
+        let (_tmp, _dir, repo) = init_preview_repo().await;
+        let existing = git_ok(&repo, &["rev-parse", "HEAD"]).await;
+        git_ok(&repo, &["switch", "--orphan", "preview-orphan"]).await;
+        for probe_size in [None, Some(true)] {
+            let probe = usize::from(probe_size == Some(true));
+            for (rev, path) in [
+                ("HEAD", "a.png"),
+                ("HEAD~1", "a.png"),
+                ("HEAD~", "a.png"),
+                ("HEAD^", "a.png"),
+                ("@", "a.png"),
+                ("@~1^", "a.png"),
+                (existing.trim(), "missing.png"),
+            ] {
+                reset_preview_spawns();
+                assert!(
+                    git_file_base64(repo.clone(), Some(rev.into()), path.into(), probe_size)
+                        .await
+                        .unwrap_or_else(|e| panic!("{rev}:{path}: {e:?}"))
+                        .is_none()
+                );
+                assert_preview_spawns(probe, 1 - probe, 0);
+            }
+            for (rev, verify) in [("bogus", 0), ("bogus~1", 1)] {
+                reset_preview_spawns();
+                let err =
+                    git_file_base64(repo.clone(), Some(rev.into()), "a.png".into(), probe_size)
+                        .await
+                        .unwrap_err();
+                assert!(matches!(err, AppError::Git { .. }), "{rev}: {err:?}");
+                assert_preview_spawns(probe, 1 - probe, verify);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_unmerged_stage_zero_is_absent_in_both_modes() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        git_ok(&repo, &["checkout", "-qb", "preview-left"]).await;
+        std::fs::write(dir.join("icon.svg"), "left\n").unwrap();
+        git_ok(&repo, &["commit", "-qam", "left"]).await;
+        git_ok(&repo, &["checkout", "-qb", "preview-right", "HEAD~1"]).await;
+        std::fs::write(dir.join("icon.svg"), "right\n").unwrap();
+        git_ok(&repo, &["commit", "-qam", "right"]).await;
+        let merged = run_git_raw(
+            Some(&repo),
+            &["merge", "--no-edit", "preview-left"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.code, 1);
+        assert!(merged.stdout_lossy().contains("CONFLICT"));
+        for probe_size in [None, Some(true)] {
+            reset_preview_spawns();
+            assert!(git_file_base64(
+                repo.clone(),
+                Some(":0".into()),
+                "icon.svg".into(),
+                probe_size
+            )
+            .await
+            .unwrap()
+            .is_none());
+            let probe = usize::from(probe_size == Some(true));
+            assert_preview_spawns(probe, 1 - probe, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_worktree_absence_directory_and_size_are_distinct() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = png_fixture(11, 13);
+        std::fs::write(outside.path().join("outside.png"), &sentinel).unwrap();
+        std::fs::create_dir(dir.join("folder.png")).unwrap();
+        std::fs::write(dir.join("folder.png/ok.png"), png_fixture(16, 16)).unwrap();
+        assert_preview_refused(&repo, "folder.png", &sentinel, "regular file").await;
+        assert_preview_bytes(&repo, "folder.png/ok.png", &png_fixture(16, 16)).await;
+        assert_preview_bytes(&repo, "ok.png", &png_fixture(1200, 630)).await;
+        for path in ["missing.png", "ok.png/x.png"] {
+            assert!(git_file_base64(repo.clone(), None, path.into(), None)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        std::fs::File::create(dir.join("huge.png"))
+            .unwrap()
+            .set_len(IMAGE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        for probe_size in [None, Some(true)] {
+            let got = git_file_base64(repo.clone(), None, "huge.png".into(), probe_size)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(got.too_large);
+            assert_eq!(got.base64, None);
+            assert_eq!(got.mime, None);
+        }
+        assert!(matches!(
+            read_preview_worktree(&repo, "huge.png", "huge.png").unwrap(),
+            PreviewRead::TooLarge
+        ));
+    }
+
+    #[cfg(any(windows, unix))]
+    fn preview_directory_link(link: &std::path::Path, target: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .expect("run mklink");
+            assert!(made.status.success(), "{made:?}");
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn preview_worktree_refuses_linked_ancestors_including_huge_targets() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = png_fixture(11, 13);
+        std::fs::write(outside.path().join("ok.png"), &sentinel).unwrap();
+        std::fs::write(outside.path().join("huge.png"), &sentinel).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(outside.path().join("huge.png"))
+            .unwrap()
+            .set_len(IMAGE_MAX_BYTES as u64 + 1)
+            .unwrap();
+        preview_directory_link(&dir.join("linked"), outside.path());
+        std::fs::create_dir(dir.join("local")).unwrap();
+        for name in ["ok.png", "huge.png"] {
+            std::fs::write(dir.join("local").join(name), png_fixture(16, 16)).unwrap();
+            assert_preview_refused(&repo, &format!("linked/{name}"), &sentinel, DISCARD_LINKED)
+                .await;
+            assert_preview_bytes(&repo, &format!("local/{name}"), &png_fixture(16, 16)).await;
+        }
+        #[cfg(windows)]
+        std::fs::remove_dir(dir.join("linked")).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(dir.join("linked")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_worktree_refuses_leaf_symlinks_before_target_size_checks() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = png_fixture(11, 13);
+        for (name, huge) in [("leaf.png", false), ("huge.png", true)] {
+            let target = outside.path().join(name);
+            std::fs::write(&target, &sentinel).unwrap();
+            if huge {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target)
+                    .unwrap()
+                    .set_len(IMAGE_MAX_BYTES as u64 + 1)
+                    .unwrap();
+            }
+            std::os::unix::fs::symlink(&target, dir.join(name)).unwrap();
+            assert_preview_refused(&repo, name, &sentinel, DISCARD_LINKED).await;
+            std::fs::remove_file(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name), png_fixture(16, 16)).unwrap();
+            assert_preview_bytes(&repo, name, &png_fixture(16, 16)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn preview_worktree_io_failure_is_an_error_and_reads_recover() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("ok.png"))
+            .unwrap();
+        let err = git_file_base64(repo.clone(), None, "ok.png".into(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Io(_)), "{err:?}");
+        drop(locked);
+        assert_preview_bytes(&repo, "ok.png", &png_fixture(1200, 630)).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn preview_windows_aliases_and_git_dir_are_refused_but_verbatim_files_read() {
+        let (_tmp, dir, repo) = init_preview_repo().await;
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = png_fixture(11, 13);
+        std::fs::write(outside.path().join("x.png"), &sentinel).unwrap();
+        preview_directory_link(&dir.join("a"), outside.path());
+        assert_preview_refused(&repo, "a./x.png", &sentinel, "dot or space").await;
+        std::fs::remove_dir(dir.join("a")).unwrap();
+        std::fs::create_dir(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/x.png"), png_fixture(16, 16)).unwrap();
+        assert_preview_bytes(&repo, "a/x.png", &png_fixture(16, 16)).await;
+
+        let shell = "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+        std::fs::create_dir(dir.join(shell)).unwrap();
+        std::fs::write(dir.join(shell).join("f.png"), &sentinel).unwrap();
+        assert_preview_refused(&repo, &format!("{shell}/f.png"), &sentinel, "shell link").await;
+        std::fs::create_dir(dir.join("x")).unwrap();
+        std::fs::write(dir.join("x/f.png"), png_fixture(16, 16)).unwrap();
+        assert_preview_bytes(&repo, "x/f.png", &png_fixture(16, 16)).await;
+
+        assert_preview_refused(&repo, ".git/config", &sentinel, ".git folder").await;
+        std::fs::create_dir(dir.join("git")).unwrap();
+        std::fs::write(dir.join("git/config"), png_fixture(16, 16)).unwrap();
+        assert_preview_bytes(&repo, "git/config", &png_fixture(16, 16)).await;
+
+        let reserved = crate::fsops::verbatim_path(&dir.join("nul.png")).unwrap();
+        std::fs::write(&reserved, png_fixture(16, 16)).unwrap();
+        assert_preview_bytes(&repo, "nul.png", &png_fixture(16, 16)).await;
+        std::fs::remove_file(reserved).unwrap();
     }
 
     /// The frontend reads `base64`/`mime`/`tooLarge` off this record — `rename_all` is a
@@ -3011,10 +3903,884 @@ mod tests {
             is_truncated: false,
             text: String::new(),
             undecodable: true,
+            old_path: None,
         })
         .unwrap();
         assert_eq!(json["undecodable"], serde_json::json!(true));
         assert!(json.get("filePath").is_some(), "{json}");
         assert!(json.get("file_path").is_none(), "{json}");
+        // An unpaired diff carries NO `oldPath` key; a paired one carries it camelCased.
+        assert!(json.get("oldPath").is_none(), "{json}");
+        assert!(json.get("old_path").is_none(), "{json}");
+        let paired = serde_json::to_value(FileDiff {
+            file_path: "b.txt".into(),
+            is_binary: false,
+            is_truncated: false,
+            text: String::new(),
+            undecodable: false,
+            old_path: Some("a.txt".into()),
+        })
+        .unwrap();
+        assert_eq!(paired["oldPath"], serde_json::json!("a.txt"));
+    }
+
+    // ---- Rename pairing ----------------------------------------------------------
+
+    /// Raw `--name-status -z` output per probe argv family, captured from git
+    /// 2.51.1.windows.1 (`R100 a.txt → b.txt` plus `M k.txt` committed; `a.txt →
+    /// c.txt` staged, then stashed). `log -z --name-status` leads a record's first
+    /// row with `\n` (same git); the probes here never emit it, the parser
+    /// tolerates it.
+    const PROBE_SHOW: &[u8] = b"R100\0a.txt\0b.txt\0M\0k.txt\0";
+    const PROBE_SHOW_MERGE: &[u8] = b"R100\0a.txt\0b.txt\0M\0k.txt\0";
+    const PROBE_THREE_DOT: &[u8] = b"R100\0a.txt\0b.txt\0M\0k.txt\0";
+    const PROBE_CACHED: &[u8] = b"R100\0a.txt\0c.txt\0";
+    const PROBE_HEAD: &[u8] = b"R100\0a.txt\0c.txt\0";
+    const PROBE_SESSION_BASE: &[u8] = b"R100\0a.txt\0c.txt\0";
+    const PROBE_STASH: &[u8] = b"R100\0a.txt\0c.txt\0";
+    const PROBE_ROOT: &[u8] = b"A\0a.txt\0A\0k.txt\0";
+    const PROBE_CACHED_QUOTED: &[u8] =
+        b"R077\0sp ace2.txt\0sp ace3.txt\0R077\0x y.txt\0x y\xc3\xa9.txt\0";
+    const PROBE_LOG_FAMILY: &[u8] = b"\0\nR100\0x\0z\0";
+
+    #[test]
+    fn rename_source_reads_every_probe_family() {
+        for z in [PROBE_SHOW, PROBE_SHOW_MERGE, PROBE_THREE_DOT] {
+            assert_eq!(rename_source(z, b"b.txt"), Some(&b"a.txt"[..]));
+            // A modify row and the rename's SOURCE side never pair.
+            assert_eq!(rename_source(z, b"k.txt"), None);
+            assert_eq!(rename_source(z, b"a.txt"), None);
+        }
+        for z in [PROBE_CACHED, PROBE_HEAD, PROBE_SESSION_BASE, PROBE_STASH] {
+            assert_eq!(rename_source(z, b"c.txt"), Some(&b"a.txt"[..]));
+        }
+        assert_eq!(rename_source(PROBE_ROOT, b"a.txt"), None);
+        assert_eq!(
+            rename_source(PROBE_CACHED_QUOTED, b"x y\xc3\xa9.txt"),
+            Some(&b"x y.txt"[..])
+        );
+        assert_eq!(
+            rename_source(PROBE_CACHED_QUOTED, b"sp ace3.txt"),
+            Some(&b"sp ace2.txt"[..])
+        );
+        assert_eq!(rename_source(PROBE_LOG_FAMILY, b"z"), Some(&b"x"[..]));
+        // Copies keep their two-name row aligned but never pair; a cut-off row is no row.
+        assert_eq!(rename_source(b"C075\0a\0b\0R100\0c\0d\0", b"b"), None);
+        assert_eq!(
+            rename_source(b"C075\0a\0b\0R100\0c\0d\0", b"d"),
+            Some(&b"c"[..])
+        );
+        assert_eq!(rename_source(b"R100\0a", b"a"), None);
+        assert_eq!(rename_source(b"", b"a"), None);
+    }
+
+    #[test]
+    fn the_new_file_gate_reads_header_lines_only() {
+        assert!(shows_new_file(
+            b"diff --git a/x b/x\nnew file mode 100644\n"
+        ));
+        assert!(!shows_new_file(
+            b"@@ -1 +1,2 @@\n x\n+new file mode 100644\n"
+        ));
+        assert!(!shows_new_file(b""));
+    }
+
+    /// The fallback arm: a re-run with zero or several rename sections yields `None`,
+    /// which keeps the single-path text; exactly one is kept with any preamble.
+    #[test]
+    fn only_a_sole_rename_section_is_kept() {
+        let add = b"diff --git a/a/x b/a/x\nnew file mode 100644\n--- /dev/null\n+++ b/a/x\n@@ -0,0 +1 @@\n+rename from a\n";
+        let ren = b"diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n";
+        let both = [&add[..], &ren[..]].concat();
+        assert_eq!(sole_rename_section(&both).as_deref(), Some(&ren[..]));
+        let with_preamble = [&b"commit 1\n\n    msg\n\n"[..], &ren[..], &add[..]].concat();
+        assert_eq!(
+            sole_rename_section(&with_preamble),
+            Some([&b"commit 1\n\n    msg\n\n"[..], &ren[..]].concat())
+        );
+        assert_eq!(sole_rename_section(add), None);
+        assert_eq!(sole_rename_section(&[&ren[..], &ren[..]].concat()), None);
+        assert_eq!(sole_rename_section(b""), None);
+    }
+
+    /// A staged rename+edit of a name with a space, exactly as `git diff --cached`
+    /// writes it (git 2.51.1): `---`/`+++` carry a trailing TAB, `diff --git` none.
+    const SPACE_RENAME_DIFF: &str = "diff --git a/sp ace2.txt b/sp ace3.txt\nsimilarity index 77%\nrename from sp ace2.txt\nrename to sp ace3.txt\nindex 01f84f8..2169c5f 100644\n--- a/sp ace2.txt\t\n+++ b/sp ace3.txt\t\n@@ -1,5 +1,5 @@\n l1\n-l2\n+l2 EDIT\n l3\n l4\n l5\n";
+    /// The hunk-unstage patch for it: a plain modification of the new path. The
+    /// frontend's `buildHunkPatch` test embeds this same literal (cross-builder pin).
+    const SPACE_RENAME_PATCH: &str = "diff --git a/sp ace3.txt b/sp ace3.txt\nindex 01f84f8..2169c5f 100644\n--- a/sp ace3.txt\t\n+++ b/sp ace3.txt\t\n@@ -1,5 +1,5 @@\n l1\n-l2\n+l2 EDIT\n l3\n l4\n l5\n";
+    /// A space + non-ASCII rename+edit captured from raw git with `core.quotePath=true`
+    /// (the app's runner pins it false): C-quoted names, the `+++` still TAB-ended.
+    const QUOTED_RENAME_DIFF: &str = "diff --git a/x y.txt \"b/x y\\303\\251.txt\"\nsimilarity index 77%\nrename from x y.txt\nrename to \"x y\\303\\251.txt\"\nindex 01f84f8..4a7bb98 100644\n--- a/x y.txt\t\n+++ \"b/x y\\303\\251.txt\"\t\n@@ -6,5 +6,5 @@ l5\n l6\n l7\n l8\n-l9\n+l9 EDIT\n l10\n";
+
+    #[test]
+    fn a_rename_header_normalizes_to_a_new_path_modification() {
+        let patch = build_partial_patch(
+            SPACE_RENAME_DIFF,
+            &[sel(Side::Old, 2), sel(Side::New, 2)],
+            true,
+        );
+        assert_eq!(patch, SPACE_RENAME_PATCH);
+        let quoted = build_partial_patch(
+            QUOTED_RENAME_DIFF,
+            &[sel(Side::Old, 9), sel(Side::New, 9)],
+            true,
+        );
+        let header: Vec<&str> = quoted.lines().take(4).collect();
+        assert_eq!(
+            header,
+            [
+                "diff --git \"a/x y\\303\\251.txt\" \"b/x y\\303\\251.txt\"",
+                "index 01f84f8..4a7bb98 100644",
+                "--- \"a/x y\\303\\251.txt\"\t",
+                "+++ \"b/x y\\303\\251.txt\"\t",
+            ]
+        );
+    }
+
+    /// Parity pin: a header without pairing lines is returned byte-identical, mode
+    /// lines included; a rename + mode change keeps its mode lines.
+    #[test]
+    fn non_rename_headers_pass_through_and_mode_lines_stay() {
+        let modified = "diff --git a/m.sh b/m.sh\nold mode 100644\nnew mode 100755\nindex 1..2\n--- a/m.sh\n+++ b/m.sh";
+        assert_eq!(plain_modification_header(modified), modified);
+        let plain = format!("{FILE_HEADER}@@ -1,1 +1,1 @@\n-a\n+b\n");
+        let out = build_partial_patch(&plain, &[sel(Side::Old, 1), sel(Side::New, 1)], true);
+        assert_eq!(out, plain);
+        let renamed = "diff --git a/m.sh b/n.sh\nold mode 100644\nnew mode 100755\nsimilarity index 90%\nrename from m.sh\nrename to n.sh\nindex 1..2\n--- a/m.sh\n+++ b/n.sh";
+        assert_eq!(
+            plain_modification_header(renamed),
+            "diff --git a/n.sh b/n.sh\nold mode 100644\nnew mode 100755\nindex 1..2\n--- a/n.sh\n+++ b/n.sh"
+        );
+    }
+
+    const TEN: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+
+    /// A repo pinned for rename tests: the test runner sets only GIT_CONFIG_NOSYSTEM,
+    /// so a global `diff.renames` would otherwise decide what pairs (quoting and diff
+    /// prefixes are pinned by the git runner itself).
+    async fn rename_repo(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let (tmp, dir, repo) = init_line_stats_repo(prefix).await;
+        for (key, value) in [("diff.renames", "true"), ("commit.gpgSign", "false")] {
+            git_ok(&repo, &["config", key, value]).await;
+        }
+        (tmp, dir, repo)
+    }
+
+    async fn git_ok(repo: &str, args: &[&str]) -> String {
+        run_git(Some(repo), args, DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout_lossy()
+    }
+
+    async fn commit_all(repo: &str, msg: &str) -> String {
+        git_ok(repo, &["add", "-A"]).await;
+        git_ok(repo, &["commit", "-qm", msg]).await;
+        git_ok(repo, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    async fn commit_diff(repo: &str, sha: &str, path: &str) -> FileDiff {
+        crate::git::history::git_commit_file_diff(repo.into(), sha.into(), path.into())
+            .await
+            .unwrap()
+    }
+
+    /// What the single-pathspec commit read returns: the unpaired baseline.
+    async fn single_commit_diff(repo: &str, sha: &str, path: &str) -> String {
+        let spec = crate::git::pathspec::literal(path);
+        let args = [
+            "show",
+            "-m",
+            "--first-parent",
+            "--no-color",
+            "--format=",
+            sha,
+            "--",
+            spec.as_str(),
+        ];
+        git_ok(repo, &args).await
+    }
+
+    fn assert_paired(d: &FileDiff, old: &str, new: &str) {
+        assert_eq!(d.file_path, new);
+        assert_eq!(d.old_path.as_deref(), Some(old), "{}", d.text);
+        assert!(d.text.contains("rename from "), "{}", d.text);
+        assert!(d.text.contains("rename to "), "{}", d.text);
+        assert!(d.text.contains("similarity index "), "{}", d.text);
+        assert!(!d.text.contains("new file mode"), "{}", d.text);
+        assert_eq!(d.text.matches("diff --git ").count(), 1, "{}", d.text);
+    }
+
+    fn assert_pure_rename(d: &FileDiff, old: &str, new: &str) {
+        assert_paired(d, old, new);
+        assert!(d.text.contains("similarity index 100%"), "{}", d.text);
+        assert!(!d.text.contains("@@"), "{}", d.text);
+        assert!(!d.is_binary);
+    }
+
+    #[tokio::test]
+    async fn commit_file_diff_pairs_a_pure_rename_and_leaves_adds_alone() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-commit-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        std::fs::write(dir.join("n.txt"), "brand new\n").unwrap();
+        let sha = commit_all(&repo, "rename").await;
+
+        let renamed = commit_diff(&repo, &sha, "b.txt").await;
+        assert_pure_rename(&renamed, "a.txt", "b.txt");
+        assert!(renamed.text.contains("rename from a.txt\nrename to b.txt"));
+        // A true addition in the same commit is byte-identical to the single run.
+        let added = commit_diff(&repo, &sha, "n.txt").await;
+        assert_eq!(added.text, single_commit_diff(&repo, &sha, "n.txt").await);
+        assert!(added.text.contains("new file mode"));
+        assert_eq!(added.old_path, None);
+    }
+
+    #[tokio::test]
+    async fn commit_file_diff_pairs_a_rename_with_edits_to_only_its_hunks() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-edit-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        std::fs::write(dir.join("b.txt"), TEN.replace("l5\n", "l5 EDIT\n")).unwrap();
+        let sha = commit_all(&repo, "rename+edit").await;
+
+        let d = commit_diff(&repo, &sha, "b.txt").await;
+        assert_paired(&d, "a.txt", "b.txt");
+        assert_eq!(
+            d.text.lines().filter(|l| l.starts_with("@@")).count(),
+            1,
+            "{}",
+            d.text
+        );
+        assert!(d.text.contains("\n-l5\n+l5 EDIT\n"), "{}", d.text);
+        assert!(!d.text.contains("+l1\n"), "{}", d.text);
+    }
+
+    #[tokio::test]
+    async fn commit_file_diff_pairs_mode_cross_dir_and_case_only_renames() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-shapes-").await;
+        std::fs::write(dir.join("m.sh"), TEN).unwrap();
+        std::fs::write(dir.join("a.txt"), TEN.replace("l1", "x1")).unwrap();
+        std::fs::write(dir.join("File.txt"), TEN.replace("l1", "c1")).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "m.sh", "n.sh"]).await;
+        git_ok(&repo, &["update-index", "--chmod=+x", "n.sh"]).await;
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        git_ok(&repo, &["mv", "a.txt", "sub/b.txt"]).await;
+        git_ok(&repo, &["mv", "File.txt", "file.txt"]).await;
+        git_ok(&repo, &["commit", "-qm", "shapes"]).await;
+        let sha = git_ok(&repo, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+
+        let mode = commit_diff(&repo, &sha, "n.sh").await;
+        assert_paired(&mode, "m.sh", "n.sh");
+        assert!(
+            mode.text.contains("old mode 100644\nnew mode 100755"),
+            "{}",
+            mode.text
+        );
+        assert_pure_rename(
+            &commit_diff(&repo, &sha, "sub/b.txt").await,
+            "a.txt",
+            "sub/b.txt",
+        );
+        assert_pure_rename(
+            &commit_diff(&repo, &sha, "file.txt").await,
+            "File.txt",
+            "file.txt",
+        );
+    }
+
+    /// A space + non-ASCII name: the probe and `old_path` carry the RAW `-z` spelling,
+    /// and the runner's `core.quotePath=false` names it raw in the headers too. A
+    /// literal `"` in a name (which git still C-quotes) is left out: NTFS refuses it.
+    #[tokio::test]
+    async fn commit_file_diff_pairs_a_c_quoted_rename_by_its_raw_name() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-quoted-").await;
+        let new = std::str::from_utf8(b"x y\xc3\xa9.txt").unwrap();
+        std::fs::write(dir.join("sp ace.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "sp ace.txt", new]).await;
+        let sha = commit_all(&repo, "rename").await;
+
+        let d = commit_diff(&repo, &sha, new).await;
+        assert_pure_rename(&d, "sp ace.txt", new);
+        let pair = format!("rename from sp ace.txt\nrename to {new}\n");
+        assert!(d.text.contains(&pair), "{}", d.text);
+    }
+
+    #[tokio::test]
+    async fn commit_file_diff_pairs_binary_renames() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-binary-").await;
+        let bin: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("a.bin"), &bin).unwrap();
+        std::fs::write(dir.join("c.bin"), &bin[..2048]).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.bin", "b.bin"]).await;
+        git_ok(&repo, &["mv", "c.bin", "d.bin"]).await;
+        let mut edited = bin[..2048].to_vec();
+        edited[2000] = 7;
+        std::fs::write(dir.join("d.bin"), &edited).unwrap();
+        let sha = commit_all(&repo, "binary renames").await;
+
+        // Pure: no `Binary files … differ` line, so not binary and header-only.
+        assert_pure_rename(&commit_diff(&repo, &sha, "b.bin").await, "a.bin", "b.bin");
+        let edit = commit_diff(&repo, &sha, "d.bin").await;
+        assert_paired(&edit, "c.bin", "d.bin");
+        assert!(edit.is_binary, "{}", edit.text);
+    }
+
+    /// The source's literal pathspec also matches a file under a directory now at
+    /// that path, so the re-run carries two sections and only the rename is kept.
+    #[tokio::test]
+    async fn commit_file_diff_keeps_the_rename_section_under_a_dir_shadow() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-dirshadow-").await;
+        std::fs::write(dir.join("a"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a", "b"]).await;
+        std::fs::create_dir(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a").join("x"), "shadow\n").unwrap();
+        let sha = commit_all(&repo, "shadow").await;
+        let both = git_ok(
+            &repo,
+            &[
+                "show",
+                "--no-color",
+                "--format=",
+                &sha,
+                "--",
+                ":(literal)b",
+                ":(literal)a",
+            ],
+        )
+        .await;
+        assert_eq!(
+            both.matches("diff --git ").count(),
+            2,
+            "fixture premise:\n{both}"
+        );
+
+        let d = commit_diff(&repo, &sha, "b").await;
+        assert_pure_rename(&d, "a", "b");
+        assert!(!d.text.contains("a/x"), "{}", d.text);
+    }
+
+    /// Negatives: a re-created source path, a rewrite below the similarity
+    /// threshold, and `diff.renames=false` pair in neither the commit's file list
+    /// nor its per-file diff.
+    #[tokio::test]
+    async fn commit_file_diff_leaves_unpaired_shapes_as_adds() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-negatives-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        std::fs::write(dir.join("r.txt"), TEN.replace('l', "r")).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        std::fs::write(dir.join("a.txt"), "re-created\n").unwrap();
+        git_ok(&repo, &["mv", "r.txt", "s.txt"]).await;
+        std::fs::write(
+            dir.join("s.txt"),
+            "w1\nw2\nw3\nw4\nw5\nw6\nw7\nw8\nr9\nr10\n",
+        )
+        .unwrap();
+        let sha = commit_all(&repo, "negatives").await;
+        let files = crate::git::history::git_commit_files(repo.clone(), sha.clone())
+            .await
+            .unwrap();
+        let added = |p: &str| {
+            files
+                .iter()
+                .find(|f| f.path == p)
+                .map(|f| (f.added, f.deleted))
+        };
+        assert_eq!(added("b.txt"), Some((10, 0)), "{files:?}");
+        assert_eq!(added("s.txt"), Some((10, 0)), "{files:?}");
+        for path in ["b.txt", "s.txt"] {
+            let d = commit_diff(&repo, &sha, path).await;
+            assert_eq!(d.old_path, None, "{}", d.text);
+            assert_eq!(d.text, single_commit_diff(&repo, &sha, path).await);
+        }
+
+        git_ok(&repo, &["config", "diff.renames", "false"]).await;
+        git_ok(&repo, &["mv", "b.txt", "c.txt"]).await;
+        let off = commit_all(&repo, "renames off").await;
+        let files = crate::git::history::git_commit_files(repo.clone(), off.clone())
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2, "add + delete in the list: {files:?}");
+        let d = commit_diff(&repo, &off, "c.txt").await;
+        assert_eq!(d.old_path, None, "{}", d.text);
+        assert!(d.text.contains("new file mode"), "{}", d.text);
+    }
+
+    #[tokio::test]
+    async fn commit_file_diff_pairs_a_merge_and_leaves_a_root_commit_alone() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-merge-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        let root = commit_all(&repo, "base").await;
+        git_ok(&repo, &["checkout", "-q", "-b", "trunk"]).await;
+        git_ok(&repo, &["checkout", "-q", "-b", "feat"]).await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        commit_all(&repo, "rename").await;
+        git_ok(&repo, &["checkout", "-q", "trunk"]).await;
+        std::fs::write(dir.join("s.txt"), "side\n").unwrap();
+        commit_all(&repo, "side").await;
+        git_ok(&repo, &["merge", "-q", "--no-ff", "--no-edit", "feat"]).await;
+        let merge = git_ok(&repo, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+
+        assert_pure_rename(&commit_diff(&repo, &merge, "b.txt").await, "a.txt", "b.txt");
+        let first = commit_diff(&repo, &root, "a.txt").await;
+        assert_eq!(first.old_path, None);
+        assert_eq!(first.text, single_commit_diff(&repo, &root, "a.txt").await);
+    }
+
+    #[tokio::test]
+    async fn branch_file_diff_pairs_a_three_dot_rename() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-branch-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["checkout", "-q", "-b", "trunk"]).await;
+        git_ok(&repo, &["checkout", "-q", "-b", "feat"]).await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        std::fs::write(dir.join("n.txt"), "new\n").unwrap();
+        commit_all(&repo, "rename").await;
+        let diff = |p: &'static str| {
+            crate::git::compare::git_branch_file_diff(
+                repo.clone(),
+                "trunk".into(),
+                "feat".into(),
+                p.into(),
+            )
+        };
+
+        assert_pure_rename(&diff("b.txt").await.unwrap(), "a.txt", "b.txt");
+        let added = diff("n.txt").await.unwrap();
+        let single = git_ok(
+            &repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "refs/heads/trunk...refs/heads/feat",
+                "--",
+                ":(literal)n.txt",
+            ],
+        )
+        .await;
+        assert_eq!(added.text, single);
+        assert_eq!(added.old_path, None);
+    }
+
+    /// Staged arm pairs; the unstaged arm for the new path is a plain modify and the
+    /// untracked arm is untouched.
+    #[tokio::test]
+    async fn staged_file_diff_pairs_and_the_other_arms_stay_unchanged() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-staged-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        std::fs::write(dir.join("n.txt"), "staged add\n").unwrap();
+        git_ok(&repo, &["add", "n.txt"]).await;
+        std::fs::write(dir.join("b.txt"), format!("{TEN}unstaged\n")).unwrap();
+        std::fs::write(dir.join("u.txt"), "untracked\n").unwrap();
+
+        let staged = git_diff_file(repo.clone(), "b.txt".into(), true, false)
+            .await
+            .unwrap();
+        assert_pure_rename(&staged, "a.txt", "b.txt");
+        assert!(!staged.undecodable);
+        let add = git_diff_file(repo.clone(), "n.txt".into(), true, false)
+            .await
+            .unwrap();
+        let single = git_ok(
+            &repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--cached",
+                "--",
+                ":(literal)n.txt",
+            ],
+        )
+        .await;
+        assert_eq!((add.text, add.old_path), (single, None));
+        let unstaged = git_diff_file(repo.clone(), "b.txt".into(), false, false)
+            .await
+            .unwrap();
+        let single = git_ok(
+            &repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--",
+                ":(literal)b.txt",
+            ],
+        )
+        .await;
+        assert!(unstaged.text.contains("+unstaged"), "{}", unstaged.text);
+        assert_eq!((unstaged.text, unstaged.old_path), (single, None));
+        let untracked = git_diff_file(repo.clone(), "u.txt".into(), false, true)
+            .await
+            .unwrap();
+        let raw = run_git_raw(
+            Some(&repo),
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                "u.txt",
+            ],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap()
+        .stdout_lossy();
+        assert_eq!((untracked.text, untracked.old_path), (raw, None));
+    }
+
+    /// A failed probe is an error, never a defaulted "it's an add" verdict.
+    #[tokio::test]
+    async fn a_failed_rename_probe_is_an_error() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-probe-err-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        std::fs::write(dir.join("n.txt"), "new\n").unwrap();
+        git_ok(&repo, &["add", "n.txt"]).await;
+        let res = diff_with_rename_pairing(
+            &repo,
+            "n.txt",
+            &["diff", "--no-ext-diff", "--no-color", "--cached"],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--name-status",
+                "-z",
+                "no-such-rev",
+            ],
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_file_diff_pairs_a_committed_rename() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-session-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        let base = commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "b.txt"]).await;
+        commit_all(&repo, "turn 1").await;
+        std::fs::write(dir.join("new.txt"), "agent wrote\n").unwrap();
+
+        let d = git_session_file_diff(repo.clone(), "b.txt".into(), base.clone())
+            .await
+            .unwrap();
+        assert_pure_rename(&d, "a.txt", "b.txt");
+        let untracked = git_session_file_diff(repo.clone(), "new.txt".into(), base)
+            .await
+            .unwrap();
+        let raw = run_git_raw(
+            Some(&repo),
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                "new.txt",
+            ],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap()
+        .stdout_lossy();
+        assert_eq!((untracked.text, untracked.old_path), (raw, None));
+    }
+
+    async fn stash_diff(repo: &str, path: &str) -> FileDiff {
+        crate::git::ops::git_stash_file_diff(repo.into(), 0, path.into())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stash_file_diff_pairs_a_stashed_rename_beside_its_untracked_parent() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-stash-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.txt", "c.txt"]).await;
+        std::fs::write(dir.join("u.txt"), "untracked\n").unwrap();
+        git_ok(&repo, &["stash", "push", "-q", "-u"]).await;
+
+        assert_pure_rename(&stash_diff(&repo, "c.txt").await, "a.txt", "c.txt");
+        let u = stash_diff(&repo, "u.txt").await;
+        let raw = git_ok(
+            &repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "stash@{0}^1",
+                "stash@{0}^3",
+                "--",
+                ":(literal)u.txt",
+            ],
+        )
+        .await;
+        assert!(raw.contains("new file mode"), "{raw}");
+        assert_eq!((u.text, u.old_path), (raw, None));
+    }
+
+    /// OUT OF REACH, pinned: a stashed deletion of tracked `x` plus an untracked twin
+    /// `y` pairs `x => y` in the stash's file list, but `y`'s tracked arm is empty, so
+    /// the pane stays the `^3` full add. A change here must be deliberate.
+    #[tokio::test]
+    async fn stash_file_diff_keeps_a_deleted_plus_untracked_twin_as_an_add() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-stash-twin-").await;
+        std::fs::write(dir.join("x.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        std::fs::remove_file(dir.join("x.txt")).unwrap();
+        std::fs::write(dir.join("y.txt"), TEN).unwrap();
+        git_ok(&repo, &["stash", "push", "-q", "-u"]).await;
+
+        let y = stash_diff(&repo, "y.txt").await;
+        let raw = git_ok(
+            &repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "stash@{0}^1",
+                "stash@{0}^3",
+                "--",
+                ":(literal)y.txt",
+            ],
+        )
+        .await;
+        assert!(y.text.contains("new file mode"), "{}", y.text);
+        assert_eq!((y.text, y.old_path), (raw, None));
+    }
+
+    /// Stages `old → new` with `edit` applied, returning the paired staged diff.
+    async fn staged_rename(
+        repo: &str,
+        dir: &std::path::Path,
+        old: &str,
+        new: &str,
+        edit: &str,
+    ) -> FileDiff {
+        git_ok(repo, &["mv", old, new]).await;
+        std::fs::write(dir.join(new), edit).unwrap();
+        git_ok(repo, &["add", "-A"]).await;
+        let d = git_diff_file(repo.into(), new.into(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(d.old_path.as_deref(), Some(old), "{}", d.text);
+        d
+    }
+
+    async fn apply_reverse_cached(repo: &str, patch: &str) {
+        crate::git::runner::run_git_input(
+            Some(repo),
+            &[
+                "apply",
+                "--whitespace=nowarn",
+                "--recount",
+                "--cached",
+                "--reverse",
+                "-",
+            ],
+            Some(patch),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The unnormalized form of a partial patch: the diff's own rename header.
+    fn with_raw_header(diff: &str, patch: &str) -> String {
+        let at = |s: &str| s.find("\n@@").unwrap() + 1;
+        format!("{}{}", &diff[..at(diff)], &patch[at(patch)..])
+    }
+
+    const TWO_HUNK_EDIT: &str =
+        "l1\nl2 EDIT\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13 EDIT\n";
+
+    /// git pairs an intent-to-add file with its deleted source in the index↔worktree
+    /// diff, yet the unstaged arm keeps the add: its hunks then apply onto the empty
+    /// intent-to-add entry, so staging a line still works.
+    #[tokio::test]
+    async fn an_intent_to_add_rename_stays_a_stageable_add() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-ita-").await;
+        std::fs::write(dir.join("a.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::write(dir.join("b.txt"), TEN.replace("l2\n", "l2 EDIT\n")).unwrap();
+        git_ok(&repo, &["add", "-N", "b.txt"]).await;
+        let names = git_ok(&repo, &["diff", "--no-ext-diff", "--name-status", "-z"]).await;
+        assert!(names.starts_with('R'), "premise: git pairs it\n{names:?}");
+
+        let d = git_diff_file(repo.clone(), "b.txt".into(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(d.old_path, None, "{}", d.text);
+        assert!(d.text.contains("new file mode"), "{}", d.text);
+        let patch = build_partial_patch(&d.text, &[sel(Side::New, 1)], false);
+        crate::git::runner::run_git_input(
+            Some(&repo),
+            &["apply", "--whitespace=nowarn", "--recount", "--cached", "-"],
+            Some(&patch),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(git_ok(&repo, &["show", ":b.txt"]).await, "l1\n");
+    }
+
+    #[tokio::test]
+    async fn unstaging_a_hunk_of_a_staged_rename_keeps_the_rename() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-unstage-hunk-").await;
+        std::fs::write(
+            dir.join("a.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\n",
+        )
+        .unwrap();
+        commit_all(&repo, "base").await;
+        let d = staged_rename(&repo, &dir, "a.txt", "b.txt", TWO_HUNK_EDIT).await;
+        assert_eq!(d.text.matches("\n@@ ").count(), 2, "two hunks:\n{}", d.text);
+
+        let patch = build_partial_patch(&d.text, &[sel(Side::Old, 2), sel(Side::New, 2)], true);
+        assert!(patch.starts_with("diff --git a/b.txt b/b.txt\n"), "{patch}");
+        apply_reverse_cached(&repo, &patch).await;
+        assert_eq!(git_ok(&repo, &["ls-files"]).await, "b.txt\n");
+        let index = git_ok(&repo, &["show", ":b.txt"]).await;
+        assert!(
+            index.contains("l2\n") && index.contains("l13 EDIT\n"),
+            "{index}"
+        );
+
+        // Negative control: the same reverse patch under the diff's own rename header
+        // undoes the rename itself.
+        git_ok(&repo, &["add", "-A"]).await;
+        let d = git_diff_file(repo.clone(), "b.txt".into(), true, false)
+            .await
+            .unwrap();
+        let patch = build_partial_patch(&d.text, &[sel(Side::Old, 2), sel(Side::New, 2)], true);
+        apply_reverse_cached(&repo, &with_raw_header(&d.text, &patch)).await;
+        assert!(git_ok(&repo, &["ls-files"]).await.contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn unstaging_a_line_of_a_staged_rename_keeps_the_rename() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-unstage-line-").await;
+        std::fs::write(
+            dir.join("a.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\n",
+        )
+        .unwrap();
+        commit_all(&repo, "base").await;
+        let d = staged_rename(&repo, &dir, "a.txt", "b.txt", TWO_HUNK_EDIT).await;
+
+        // Withdraw only the added `l13 EDIT`; its unselected `-l13` stays dropped.
+        let patch = build_partial_patch(&d.text, &[sel(Side::New, 13)], true);
+        apply_reverse_cached(&repo, &patch).await;
+        assert_eq!(git_ok(&repo, &["ls-files"]).await, "b.txt\n");
+        let index = git_ok(&repo, &["show", ":b.txt"]).await;
+        assert!(!index.contains("l13"), "{index}");
+        assert!(index.contains("l2 EDIT\n"), "{index}");
+    }
+
+    /// Parity with a modified file: a hunk unstage on a rename + mode change also
+    /// reverts the mode, exactly as the same patch does for a plain modification.
+    #[tokio::test]
+    async fn unstaging_a_hunk_of_a_renamed_mode_change_reverts_the_mode_too() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-unstage-mode-").await;
+        std::fs::write(dir.join("a.sh"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+        git_ok(&repo, &["mv", "a.sh", "b.sh"]).await;
+        std::fs::write(dir.join("b.sh"), TEN.replace("l5\n", "l5 EDIT\n")).unwrap();
+        git_ok(&repo, &["add", "-A"]).await;
+        git_ok(&repo, &["update-index", "--chmod=+x", "b.sh"]).await;
+        let d = git_diff_file(repo.clone(), "b.sh".into(), true, false)
+            .await
+            .unwrap();
+        assert_paired(&d, "a.sh", "b.sh");
+
+        let patch = build_partial_patch(&d.text, &[sel(Side::Old, 5), sel(Side::New, 5)], true);
+        assert!(
+            patch.contains("old mode 100644\nnew mode 100755\n"),
+            "{patch}"
+        );
+        apply_reverse_cached(&repo, &patch).await;
+        let staged = git_ok(&repo, &["ls-files", "-s"]).await;
+        assert!(
+            staged.starts_with("100644 ") && staged.ends_with("\tb.sh\n"),
+            "{staged}"
+        );
+        assert_eq!(git_ok(&repo, &["show", ":b.sh"]).await, TEN);
+    }
+
+    #[tokio::test]
+    async fn the_normalized_space_and_quoted_rename_patches_apply() {
+        let (_tmp, dir, repo) = rename_repo("gd-rename-unstage-names-").await;
+        let quoted = std::str::from_utf8(b"x y\xc3\xa9.txt").unwrap();
+        std::fs::write(dir.join("sp ace2.txt"), TEN).unwrap();
+        std::fs::write(dir.join("x y.txt"), TEN).unwrap();
+        commit_all(&repo, "base").await;
+
+        let d = staged_rename(
+            &repo,
+            &dir,
+            "sp ace2.txt",
+            "sp ace3.txt",
+            &TEN.replace("l2\n", "l2 EDIT\n"),
+        )
+        .await;
+        assert_eq!(d.text, SPACE_RENAME_DIFF);
+        let patch = build_partial_patch(&d.text, &[sel(Side::Old, 2), sel(Side::New, 2)], true);
+        assert_eq!(patch, SPACE_RENAME_PATCH);
+        apply_reverse_cached(&repo, &patch).await;
+        assert_eq!(git_ok(&repo, &["show", ":sp ace3.txt"]).await, TEN);
+
+        // The runner's `core.quotePath=false` names this file raw; the C-quoted capture
+        // is the same staged change, so its normalized patch must apply here too.
+        let d = staged_rename(
+            &repo,
+            &dir,
+            "x y.txt",
+            quoted,
+            &TEN.replace("l9\n", "l9 EDIT\n"),
+        )
+        .await;
+        let raw = build_partial_patch(&d.text, &[sel(Side::Old, 9), sel(Side::New, 9)], true);
+        assert!(
+            raw.starts_with(&format!("diff --git a/{quoted} b/{quoted}\n")),
+            "{raw}"
+        );
+        let patch = build_partial_patch(
+            QUOTED_RENAME_DIFF,
+            &[sel(Side::Old, 9), sel(Side::New, 9)],
+            true,
+        );
+        apply_reverse_cached(&repo, &patch).await;
+        let files = git_ok(&repo, &["ls-files", "-z"]).await;
+        assert!(
+            !files.contains("x y.txt") && !files.contains("sp ace2.txt"),
+            "{files:?}"
+        );
+        assert_eq!(git_ok(&repo, &["show", &format!(":{quoted}")]).await, TEN);
     }
 }

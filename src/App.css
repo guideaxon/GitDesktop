@@ -81,7 +81,7 @@
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
   --success: oklch(0.55 0.13 150);
-  --warning: oklch(0.62 0.13 65);
+  --warning: oklch(0.52 0.118 62);
   --info: oklch(0.52 0.16 250);
   --merged: oklch(0.53 0.2 300);
   --border: oklch(0.922 0 0);
@@ -246,6 +246,22 @@
   max-height: 10rem;
   overflow-y: auto;
   overflow-wrap: anywhere;
+}
+
+/* Toasts lift above a docked action bar (src/lib/toast-clearance.ts) by moving
+   the toaster's bottom offset; easing it moves every toast together. The
+   shorthand restates sonner's own toaster transform transition, which it would
+   otherwise replace; sonner's reduced-motion block skips the toaster itself. */
+[data-sonner-toaster][data-y-position="bottom"] {
+  transition:
+    transform 400ms ease,
+    bottom 200ms var(--ease-out-quart);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-sonner-toaster][data-y-position="bottom"] {
+    transition: transform 400ms ease;
+  }
 }
 
 :root {

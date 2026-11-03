@@ -6,6 +6,8 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { shouldRetryQuery } from "@/lib/forge-backoff";
+import { filterPlaceholderRows } from "@/lib/remote-state-filter";
 import { useMutation } from "@/lib/started-mutation";
 import { isAppError } from "@/lib/tauri/invoke";
 import * as api from "../api";
@@ -84,16 +86,25 @@ export function usePrList(
     queryFn: () => api.forgePrList(repo, state, limit, lens, filter),
     enabled,
     staleTime: 30_000,
-    // invalidArgument marks a refusal that is deterministic for this scope — the filter
-    // caps, the magic values, and GitLab's walk horizon — so a retry only re-spends the
-    // walk (up to 30 `glab` calls) to reach the same answer.
+    // invalidArgument is deterministic per scope (filter caps, magic values, GitLab's
+    // walk horizon), so a retry re-spends the walk (up to 30 `glab` calls) for the same
+    // answer; the rest takes the default, which never retries rate limits or 401s.
     retry: (failureCount, err) =>
-      !(isAppError(err) && err.kind === "invalidArgument") && failureCount < 1,
+      !(isAppError(err) && err.kind === "invalidArgument") &&
+      shouldRetryQuery(failureCount, err),
     // State, limit and filter stay free so a tab switch, "Load more" or a filter
     // change keeps the current rows instead of flashing skeletons, but lens must
     // match: a fork numbers PRs independently of its parent, so another lens's rows
     // misdescribe the list and a click on one navigates by number to a different PR.
-    placeholderData: keepPreviousDataForKeyAxes(repo, [[3, lens]]),
+    // A page kept on this tab's own state (index 4) is filed by row state; another
+    // tab's page passes whole.
+    placeholderData: (prev, prevQuery) => {
+      const rows = keepPreviousDataForKeyAxes(repo, [[3, lens]])(
+        prev,
+        prevQuery,
+      );
+      return rows && filterPlaceholderRows(rows, state, prevQuery?.queryKey[4]);
+    },
     refetchInterval: refetchIntervalMs,
     refetchIntervalInBackground: false,
   });
@@ -219,8 +230,8 @@ export function usePrListMergeability(
  * implemented.reviewGrouping && state === "open" && !list.isPlaceholderData` — the
  * grouping is open-PRs-only; idling this hook while the list serves placeholder rows
  * keeps an intermediate fetch from caching under the incoming key; and the tab gate
- * is load-bearing: a `<TabPanel>`-hidden panel still fetches, and this is a 3-page
- * walk that a repo invalidation would otherwise re-run off-screen.
+ * is a backstop for a 3-page walk: a `<TabPanel>`-hidden panel already connects no
+ * observers and fetches nothing (measured), and the gate holds even outside one.
  *
  * CO-INVALIDATION CONTRACT for mutation authors: any mutation that refreshes the PR
  * list NARROWLY (`[...repoKeys.prList(repo), lens]` rather than the whole
@@ -230,6 +241,8 @@ export function usePrListMergeability(
  * A mutation that changes CI STATE (approve, re-run, cancel, dispatch) owes
  * {@link usePrListCi}'s `repoKeys.prCi(repo)` the same: it hydrates the list's check
  * badges from its own key, and neither the PR-detail nor the PR-list prefix matches it.
+ * A mutation that moves a PR head (a push, an update-branch) owes
+ * `repoKeys.prMergeability(repo)` too: neither prefix matches it either.
  */
 export function usePrReviewState(
   repo: string,
@@ -261,9 +274,9 @@ export function usePrReviewState(
 
 /** The teams the viewer belongs to, for the team-review filter's picker. Membership
  *  changes rarely, so it caches for five minutes and doesn't retry — a token without
- *  the team scope answers `missingScope` rather than failing. `enabled` must carry
- *  the active-tab gate (a `<TabPanel>`-hidden panel still fetches, and this is a
- *  paginated `user/teams` walk); `useRemoteListFilter`'s `tabActive` opt does. */
+ *  the team scope answers `missingScope` rather than failing. `enabled` carries the
+ *  active-tab gate (`useRemoteListFilter`'s `tabActive` opt) as a backstop for a
+ *  paginated walk: a hidden `<TabPanel>` already fetches nothing (measured). */
 export function useMyTeams(repo: string, lens: RemoteLens, enabled: boolean) {
   return useQuery({
     queryKey: ["repo", repo, "my-teams", lens] as const,
@@ -619,8 +632,7 @@ export function usePrCommitDiff(
   });
 }
 
-/** Shared by {@link useCommitComments} and the commit prefetch so the two can't
- *  drift. */
+/** The commit-comments read {@link useCommitComments} spreads. */
 export const commitCommentsOptions = (
   repo: string,
   sha: string,
@@ -673,13 +685,14 @@ export function useCommitOnRemote(repo: string, sha: string | null) {
 /** The forge's own unified diff for a commit, PR-independent. GitHub commit-comment
  *  `position` mapping must walk GitHub's own patch rather than local git's (rename
  *  detection etc. can differ), so this fetches the provider's diff. Pass `sha: null`
- *  to keep it cold when no commit is selected. */
+ *  to keep it cold until the diff is needed. Never stale: a commit's diff is fixed
+ *  by its SHA. */
 export function useRemoteCommitDiff(repo: string, sha: string | null) {
   return useQuery({
     queryKey: ["repo", repo, "commit", sha, "remote-diff"] as const,
     queryFn: () => api.forgeCommitDiff(repo, sha ?? ""),
     enabled: sha !== null,
-    staleTime: 30_000,
+    staleTime: Number.POSITIVE_INFINITY,
   });
 }
 

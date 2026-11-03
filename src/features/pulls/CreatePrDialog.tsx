@@ -39,6 +39,7 @@ import {
   useFinishAndSurface,
 } from "@/features/conversations/useAiStream";
 import { AssigneesPopover } from "@/features/issues/IssueMetaPickers";
+import { refuseWhilePublishing } from "@/features/repository/PublishPendingBanner";
 import { REVIEWER_NOTES_MARKER } from "@/lib/ai/notes-context";
 import { track } from "@/lib/analytics";
 import { triggerAutomations } from "@/lib/automations/runner";
@@ -310,6 +311,7 @@ export function CreatePrDialog({
   const creatingHintId = useId();
   const reviewersGroupId = useId();
   const assigneesGroupId = useId();
+  const titleId = useId();
   // Labels come from whichever repo the PR targets (parent's own labels when
   // creating upstream). The picker is hidden on the parent path anyway, but the
   // AI-description prompt still reads this list, so keep it lens-correct.
@@ -476,6 +478,8 @@ export function CreatePrDialog({
       // Again below the duplicate re-check, which is an await the connection can
       // drop during; ahead of the lane claim, so a refusal owns nothing.
       if (refuseWhileOffline()) return;
+      // The create pushes its head, which a running repository publish holds.
+      if (refuseWhilePublishing(queryClient, repoPath)) return;
       // Fire-time admission, claimed before the create's first await: the push
       // plus the forge call runs for minutes and the user can dismiss the dialog
       // the moment it starts, so a second attempt on the same head would queue
@@ -707,6 +711,30 @@ export function CreatePrDialog({
     },
   });
 
+  // Each open lands on Title only while it is empty, since Enter there submits
+  // the whole create: a kept draft (an AI draft still streaming or settled, a
+  // create in flight, a failed create) whose Title is filled keeps the dialog's
+  // default first focus, and one still empty lands on Title. The seed decides
+  // once it knows what the title holds; the popup usually mounts after it, so
+  // the Title input takes a pending focus as it attaches, ahead of Base UI's
+  // initial focus, which defers to a focus already inside the popup. A close
+  // drops a pending focus the input never took.
+  const titleFocusPending = useRef(false);
+  useEffect(() => {
+    if (!open) titleFocusPending.current = false;
+  }, [open]);
+  const focusTitleIfEmpty = () => {
+    const input =
+      form.state.values.title === "" ? document.getElementById(titleId) : null;
+    titleFocusPending.current = form.state.values.title === "" && !input;
+    input?.focus();
+  };
+  const attachTitle = (node: HTMLDivElement | null) => {
+    if (node === null || !titleFocusPending.current) return;
+    titleFocusPending.current = false;
+    node.querySelector("input")?.focus();
+  };
+
   // Seed branches each time the dialog opens: head = current branch, base =
   // the default branch (or, when you're already on it, the first other branch).
   // keepDefaultValues: otherwise the per-render options sync clobbers the
@@ -737,8 +765,10 @@ export function CreatePrDialog({
         (draftRepoRef.current === repoPath &&
           (prCreatePhase(repoPath, retained) === "creating" ||
             consumeLastFailed(repoPath, retained)))
-      )
+      ) {
+        focusTitleIfEmpty();
         return;
+      }
     }
     // The reset below destroys the draft this mount was holding, so the latch
     // waiting on it goes with it — keyed to that draft's OWN repo, which is how
@@ -789,6 +819,7 @@ export function CreatePrDialog({
       },
       { keepDefaultValues: true },
     );
+    focusTitleIfEmpty();
   });
   useSeedOnOpen(open, seedOnOpen);
 
@@ -1118,7 +1149,7 @@ export function CreatePrDialog({
           }}
         >
           <DialogHeader>
-            <DialogTitle>Create {prNoun}</DialogTitle>
+            <DialogTitle className="pr-8">Create {prNoun}</DialogTitle>
             <DialogDescription>
               Pushes <span className="font-mono">{head || "…"}</span> and opens
               a {prNoun} into <span className="font-mono">{base || "…"}</span>{" "}
@@ -1419,10 +1450,13 @@ export function CreatePrDialog({
               validators={{ onChange: ({ value }) => required(value) }}
             >
               {(field) => (
-                <field.TextField
-                  label="Title"
-                  placeholder="Summarize the change"
-                />
+                <div ref={attachTitle}>
+                  <field.TextField
+                    id={titleId}
+                    label="Title"
+                    placeholder="Summarize the change"
+                  />
+                </div>
               )}
             </form.AppField>
             <form.AppField name="body">

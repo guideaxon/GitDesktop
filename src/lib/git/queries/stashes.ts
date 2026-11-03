@@ -1,5 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import * as api from "../api";
 import { keepPreviousDataForRepo } from "./core";
 import { useRepoMutation } from "./internal";
@@ -11,6 +14,7 @@ export function stashCountOptions(repo: string) {
     // Local reads must not park on react-query's default "online" mode offline;
     // the same holds for every `networkMode` in this file.
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -23,6 +27,7 @@ export function useDiscardAll(repo: string) {
   return useRepoMutation(repo, () => api.gitDiscardAll(repo), {
     // Local working-tree write — never park it offline.
     networkMode: "always",
+    localOnly: true,
   });
 }
 
@@ -34,6 +39,7 @@ export function useDiscardPaths(repo: string) {
     {
       // Local working-tree write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -42,6 +48,7 @@ export function useStashAll(repo: string) {
   return useRepoMutation(repo, () => api.gitStashAll(repo), {
     // Local stash write — never park it offline.
     networkMode: "always",
+    localOnly: true,
   });
 }
 
@@ -52,6 +59,7 @@ export function useStashPaths(repo: string) {
     {
       // Local stash write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -60,6 +68,7 @@ export function useStashPop(repo: string) {
   return useRepoMutation(repo, () => api.gitStashPop(repo), {
     // Local stash write — never park it offline.
     networkMode: "always",
+    localOnly: true,
   });
 }
 
@@ -72,36 +81,6 @@ export function useStashList(repo: string, enabled = false) {
   });
 }
 
-export function useStashFiles(repo: string, index: number | null) {
-  return useQuery({
-    queryKey: ["repo", repo, "stash-files", index ?? -1] as const,
-    queryFn: () => api.gitStashFiles(repo, index ?? 0),
-    enabled: index !== null,
-    placeholderData: keepPreviousDataForRepo(repo),
-    networkMode: "always",
-  });
-}
-
-export function useStashFileDiff(
-  repo: string,
-  index: number | null,
-  filePath: string | null,
-) {
-  return useQuery({
-    queryKey: [
-      "repo",
-      repo,
-      "stash-diff",
-      index ?? -1,
-      filePath ?? "",
-    ] as const,
-    queryFn: () => api.gitStashFileDiff(repo, index ?? 0, filePath ?? ""),
-    enabled: index !== null && filePath !== null,
-    placeholderData: keepPreviousDataForRepo(repo),
-    networkMode: "always",
-  });
-}
-
 export function useStashApply(repo: string) {
   return useRepoMutation(
     repo,
@@ -110,22 +89,12 @@ export function useStashApply(repo: string) {
     {
       // Local stash write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }
 
-export function useStashDrop(repo: string) {
-  return useRepoMutation(
-    repo,
-    (index: number) => api.gitStashDrop(repo, index),
-    {
-      // Local stash write — never park it offline.
-      networkMode: "always",
-    },
-  );
-}
-
-/** SHA-verified drop of the autostash backup. Default whole-repo invalidation
+/** SHA-verified drop of the autostash backup. The local-only invalidation
  *  refreshes status and stash-count, which the banner's freshness gate reads. */
 export function useDropStashBySha(repo: string) {
   return useRepoMutation(
@@ -134,6 +103,24 @@ export function useDropStashBySha(repo: string) {
     {
       // Local stash write — never park it offline.
       networkMode: "always",
+      localOnly: true,
+    },
+  );
+}
+
+/** SHA-verified drop of a listed stash wherever it sits in the stack. No
+ *  `identity` on purpose: View stashes' busy state and in-flight ref are
+ *  per-instance re-entry guards, and without a mutation key the observer keeps
+ *  the pending drop, so the dialog stays busy until it settles, across a repo
+ *  switch too. */
+export function useDropStashAtAnyDepth(repo: string) {
+  return useRepoMutation(
+    repo,
+    (sha: string) => api.gitDropStashBySha(repo, sha, true),
+    {
+      // Local stash write — never park it offline.
+      networkMode: "always",
+      localOnly: true,
     },
   );
 }
@@ -155,6 +142,9 @@ export function useOrphanedStashes(repo: string, enabled = false) {
   });
 }
 
+/** A stash's files, keyed AND fetched by its commit sha, never its slot: a
+ *  slot-keyed read would serve one stash's files under another once the stack
+ *  shifts. Works on any stash commit, live (View stashes) or dangling. */
 export function useOrphanedStashFiles(repo: string, sha: string | null) {
   return useQuery({
     queryKey: ["repo", repo, "orphaned-stash-files", sha ?? ""] as const,
@@ -165,6 +155,8 @@ export function useOrphanedStashFiles(repo: string, sha: string | null) {
   });
 }
 
+/** One file's diff from a stash, keyed and fetched by sha (see
+ *  {@link useOrphanedStashFiles}). */
 export function useOrphanedStashFileDiff(
   repo: string,
   sha: string | null,
@@ -187,7 +179,7 @@ export function useOrphanedStashFileDiff(
 }
 
 /** Restore an orphaned stash to the working tree (`git stash apply <sha>` — never
- *  drops). Default whole-repo invalidation refreshes the status and stash lists. */
+ *  drops). The local-only invalidation refreshes the status and stash lists. */
 export function useRestoreOrphaned(repo: string) {
   return useRepoMutation(
     repo,
@@ -195,6 +187,7 @@ export function useRestoreOrphaned(repo: string) {
     {
       // Local stash write — never park it offline.
       networkMode: "always",
+      localOnly: true,
     },
   );
 }

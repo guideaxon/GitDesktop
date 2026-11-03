@@ -10,6 +10,7 @@ import {
   memoizedStoreLoader,
   reloadToleratingEmptyStore,
 } from "@/lib/plugin-store";
+import { writeWithRollback } from "@/lib/plugin-store-rollback";
 import { useMutation } from "@/lib/started-mutation";
 import { toastError } from "@/lib/toast";
 
@@ -45,9 +46,8 @@ const STORE_FILE = "pr-review-drafts.json";
 const getStore = memoizedStoreLoader(STORE_FILE);
 
 // Serialize every read-modify-write on this store through one in-process queue.
-// Without it, two overlapping mutations each reload the SAME pre-flush disk
-// snapshot — autoSave persists on a ~100ms debounce, so the first write isn't on
-// disk yet — and the later write drops the earlier one's change (a lost update).
+// Without it, two overlapping mutations each reload the SAME disk snapshot before
+// either saves, and the later write drops the earlier one's change (a lost update).
 // The queue plus writeRepo's force-save keep each reload current within this
 // process; each mutation reloads under the cross-instance store lock, so another
 // app instance's saved drafts are read back rather than overwritten.
@@ -106,8 +106,8 @@ async function readByKey(key: string): Promise<PrDrafts> {
 async function writeRepo(key: string, drafts: PrDrafts): Promise<void> {
   const store = await getStore();
   await store.set(key, drafts);
-  // Flush now instead of on autoSave's debounce, so the next serialized read can't
-  // re-read a pre-write disk snapshot and drop this change.
+  // Autosave is off for this store, so only this save persists the change;
+  // the next serialized reload reads it back, not a pre-write snapshot.
   await store.save();
 }
 
@@ -149,10 +149,13 @@ export async function addDraft(
     const identity = await repoIdentity(repo);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const repoKey = await keyFor(repo, identity);
-      const all = foldLegacyKey(await readByKey(repoKey), lens, number);
-      const k = draftKey(lens, number);
-      await writeRepo(repoKey, { ...all, [k]: [...(all[k] ?? []), draft] });
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const repoKey = await keyFor(repo, identity);
+        const all = foldLegacyKey(await readByKey(repoKey), lens, number);
+        const k = draftKey(lens, number);
+        await writeRepo(repoKey, { ...all, [k]: [...(all[k] ?? []), draft] });
+      });
     });
   });
 }
@@ -168,13 +171,16 @@ export async function updateDraft(
     const identity = await repoIdentity(repo);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const repoKey = await keyFor(repo, identity);
-      const all = foldLegacyKey(await readByKey(repoKey), lens, number);
-      const k = draftKey(lens, number);
-      const next = (all[k] ?? []).map((d) =>
-        d.id === id ? { ...d, body } : d,
-      );
-      await writeRepo(repoKey, { ...all, [k]: next });
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const repoKey = await keyFor(repo, identity);
+        const all = foldLegacyKey(await readByKey(repoKey), lens, number);
+        const k = draftKey(lens, number);
+        const next = (all[k] ?? []).map((d) =>
+          d.id === id ? { ...d, body } : d,
+        );
+        await writeRepo(repoKey, { ...all, [k]: next });
+      });
     });
   });
 }
@@ -189,12 +195,15 @@ export async function removeDraft(
     const identity = await repoIdentity(repo);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const repoKey = await keyFor(repo, identity);
-      const all = foldLegacyKey(await readByKey(repoKey), lens, number);
-      const k = draftKey(lens, number);
-      await writeRepo(repoKey, {
-        ...all,
-        [k]: (all[k] ?? []).filter((d) => d.id !== id),
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const repoKey = await keyFor(repo, identity);
+        const all = foldLegacyKey(await readByKey(repoKey), lens, number);
+        const k = draftKey(lens, number);
+        await writeRepo(repoKey, {
+          ...all,
+          [k]: (all[k] ?? []).filter((d) => d.id !== id),
+        });
       });
     });
   });
@@ -209,14 +218,19 @@ export async function clearDrafts(
     const identity = await repoIdentity(repo);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const repoKey = await keyFor(repo, identity);
-      // Fold first: a discard must take the pre-lens entry with it, or `listDrafts`
-      // would read the legacy drafts straight back after the clear. Copied before the
-      // delete — the fold passes the store's own object through when there's nothing
-      // to fold, and that must not be mutated in place.
-      const next = { ...foldLegacyKey(await readByKey(repoKey), lens, number) };
-      delete next[draftKey(lens, number)];
-      await writeRepo(repoKey, next);
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const repoKey = await keyFor(repo, identity);
+        // Fold first: a discard must take the pre-lens entry with it, or `listDrafts`
+        // would read the legacy drafts straight back after the clear. Copied before the
+        // delete — the fold passes the store's own object through when there's nothing
+        // to fold, and that must not be mutated in place.
+        const next = {
+          ...foldLegacyKey(await readByKey(repoKey), lens, number),
+        };
+        delete next[draftKey(lens, number)];
+        await writeRepo(repoKey, next);
+      });
     });
   });
 }

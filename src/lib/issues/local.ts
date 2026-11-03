@@ -8,6 +8,7 @@ import {
   memoizedStoreLoader,
   reloadToleratingEmptyStore,
 } from "@/lib/plugin-store";
+import { writeWithRollback } from "@/lib/plugin-store-rollback";
 
 export interface LocalIssueComment {
   id: string;
@@ -39,8 +40,8 @@ const getStore = memoizedStoreLoader(STORE_FILE);
 
 // Serialize every read-modify-write on this store (and the reload) through one in-process
 // queue — mirrors the local-PR store. Without it two overlapping mutations each reload the
-// SAME pre-flush disk snapshot (autoSave persists on a ~100ms debounce) and the later write
-// drops the earlier one's change. writeAll force-saves so each reload sees a current one.
+// SAME disk snapshot before either saves, and the later write drops the earlier one's change.
+// writeAll force-saves (autosave is off for this store) so each reload sees a current one.
 // Each mutation also takes the cross-instance store lock against out-of-process writers.
 let opChain: Promise<unknown> = Promise.resolve();
 function serialize<T>(op: () => Promise<T>): Promise<T> {
@@ -95,13 +96,13 @@ async function readByKey(key: string): Promise<LocalIssue[]> {
 async function writeAll(key: string, issues: LocalIssue[]): Promise<void> {
   const store = await getStore();
   await store.set(key, issues);
-  // Flush now (not on autoSave's debounce) so the next serialized reload can't drop this.
+  // Autosave is off for this store: only this save persists, before the next reload.
   await store.save();
 }
 
 /** Re-read `local-issues.json` from disk into the in-memory store. The MCP server
  *  (`--allow-write`) writes it out of process (create/comment/status); without a
- *  reload the autoSave store would clobber those writes on the next GUI mutation.
+ *  reload the next GUI mutation's save would clobber those writes.
  *  `ignoreDefaults` fully matches the store to disk (so external deletes drop).
  *  Registered in `@/lib/mcp-writable-stores` so the focus sweep makes external
  *  writes visible without a relaunch. */
@@ -117,19 +118,22 @@ export async function createLocalIssue(
     const identity = await repoIdentity(repo);
     return withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const issue: LocalIssue = {
-        id: crypto.randomUUID(),
-        title: input.title,
-        body: input.body,
-        status: "open",
-        labels: [],
-        comments: [],
-        createdAt: new Date().toISOString(),
-      };
-      const all = await readByKey(key);
-      await writeAll(key, [issue, ...all]);
-      return issue;
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const issue: LocalIssue = {
+          id: crypto.randomUUID(),
+          title: input.title,
+          body: input.body,
+          status: "open",
+          labels: [],
+          comments: [],
+          createdAt: new Date().toISOString(),
+        };
+        const all = await readByKey(key);
+        await writeAll(key, [issue, ...all]);
+        return issue;
+      });
     });
   });
 }
@@ -146,17 +150,20 @@ export async function updateLocalIssue(
     const identity = await repoIdentity(repo);
     return withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const all = await readByKey(key);
-      const idx = all.findIndex((i) => i.id === id);
-      if (idx === -1)
-        throw new Error(
-          `no local issue with id ${id} — it may have been deleted or belong to a different repository`,
-        );
-      const next = [...all];
-      next[idx] = mutate(all[idx]);
-      await writeAll(key, next);
-      return next[idx];
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const all = await readByKey(key);
+        const idx = all.findIndex((i) => i.id === id);
+        if (idx === -1)
+          throw new Error(
+            `no local issue with id ${id} — it may have been deleted or belong to a different repository`,
+          );
+        const next = [...all];
+        next[idx] = mutate(all[idx]);
+        await writeAll(key, next);
+        return next[idx];
+      });
     });
   });
 }
@@ -169,12 +176,15 @@ export async function deleteLocalIssue(
     const identity = await repoIdentity(repo);
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const all = await readByKey(key);
-      await writeAll(
-        key,
-        all.filter((i) => i.id !== id),
-      );
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const all = await readByKey(key);
+        await writeAll(
+          key,
+          all.filter((i) => i.id !== id),
+        );
+      });
     });
   });
 }

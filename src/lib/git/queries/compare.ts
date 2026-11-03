@@ -1,5 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import {
+  REPO_SHELL_GC_TIME,
+  REPO_SHELL_WARM_STALE_MS,
+} from "@/lib/query-cache-times";
 import * as api from "../api";
 import { keepPreviousDataForRepo, repoKeys } from "./core";
 
@@ -40,6 +43,7 @@ export function branchAheadCountOptions(
     queryKey: repoKeys.branchAheadCount(repo, base, compare),
     queryFn: () => api.gitBranchAheadCount(repo, base, compare),
     networkMode: "always" as const,
+    staleTime: REPO_SHELL_WARM_STALE_MS,
     gcTime: REPO_SHELL_GC_TIME,
   };
 }
@@ -122,9 +126,9 @@ export function useMergeBase(
 /** Whether every SHA is a local commit object. Deliberately no
  *  `keepPreviousData`: a verdict belongs to the exact set it was measured on, and
  *  one PR's "present" must never stand in for the next one's. The key sits under
- *  the repo subtree so checkout/fetch's whole-repo invalidation re-measures it,
- *  and `refetchOnMount: "always"` covers any narrower writer — the probe is a
- *  millisecond-class `git rev-parse`. */
+ *  the repo subtree so checkout/fetch's local-only invalidation (this read is
+ *  local) re-measures it, and `refetchOnMount: "always"` covers any narrower
+ *  writer — the probe is a millisecond-class `git rev-parse`. */
 export function useObjectsPresent(repo: string | null, oids: string[]) {
   const joined = oids.join(",");
   return useQuery({

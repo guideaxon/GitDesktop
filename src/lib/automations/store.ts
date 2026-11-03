@@ -6,6 +6,7 @@ import {
   memoizedStoreLoader,
   reloadToleratingEmptyStore,
 } from "@/lib/plugin-store";
+import { writeWithRollback } from "@/lib/plugin-store-rollback";
 import {
   type ActionConfig,
   type ActionId,
@@ -28,8 +29,8 @@ const STORE_FILE = "automations.json";
 const getStore = memoizedStoreLoader(STORE_FILE);
 
 // Serialize every read-modify-write on this store through one in-process queue:
-// autoSave persists on a ~100ms debounce, so two overlapping saves would both read
-// the same pre-flush disk snapshot and the later would drop the earlier's change
+// two overlapping saves would both read the same disk snapshot before either
+// saves, and the later would drop the earlier's change
 // (e.g. a per-repo override save clobbering a concurrent global-lifecycles save).
 // Mirrors pulls/local.ts and settings/api.ts. Writers also take the cross-instance
 // store lock around their reload→save against another app instance's writes.
@@ -43,9 +44,9 @@ function serialize<T>(op: () => Promise<T>): Promise<T> {
 
 /**
  * Serialized read-modify-write against fresh disk state: reload, read the current
- * normalized config, apply `mutate`, persist. The force-save (`store.save()`)
- * flushes past the autoSave debounce so the next queued op's reload sees a current
- * snapshot.
+ * normalized config, apply `mutate`, persist. Autosave is off for this store, so
+ * the force-save (`store.save()`) is what persists it for the next queued op's
+ * reload.
  */
 function mutateConfig(
   mutate: (current: AutomationsConfigV2) => AutomationsConfigV2,
@@ -54,10 +55,14 @@ function mutateConfig(
     const store = await getStore();
     await withAppStoreLock(STORE_FILE, async () => {
       await reloadToleratingEmptyStore(store);
-      const current = normalizeAutomations(await store.get<unknown>("config"));
-      const next = mutate(current);
-      await store.set("config", next);
-      await store.save();
+      return writeWithRollback(store, async () => {
+        const current = normalizeAutomations(
+          await store.get<unknown>("config"),
+        );
+        const next = mutate(current);
+        await store.set("config", next);
+        await store.save();
+      });
     });
   });
 }
@@ -326,10 +331,12 @@ export async function loadAutomations(): Promise<AutomationsConfigV2> {
     await serialize(() =>
       withAppStoreLock(STORE_FILE, async () => {
         await reloadToleratingEmptyStore(store);
-        const fresh = await store.get<unknown>("config");
-        if (!isV1(fresh)) return;
-        await store.set("config", config);
-        await store.save();
+        return writeWithRollback(store, async () => {
+          const fresh = await store.get<unknown>("config");
+          if (!isV1(fresh)) return;
+          await store.set("config", config);
+          await store.save();
+        });
       }),
     );
     if (collapsed > 0) {

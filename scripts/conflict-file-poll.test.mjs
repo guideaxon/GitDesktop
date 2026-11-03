@@ -1,13 +1,13 @@
 // Pins the conflict editor's disk poll and its flicker-free busy hold. The open
 // conflict file re-reads every CONFLICT_FILE_POLL_MS while its panel shows and
-// the window is visible, except while the read sits in `invalidArgument` (binary
-// or oversized: it can't heal, and each tick re-reads the whole file). The
-// three conflict mutations await only the conflict-file re-read before their
-// isPending drops, with the working tree refreshing behind it, so the view's
-// `busy` needs no fetch state, and a poll tick never toggles the buttons. A
-// mount or panel show holds `busy` until a read joined or started then lands,
-// since a cached entry can be as old as the time off-screen. Only an `io` read
-// failure retries, once, so a transient io failure never flashes the
+// the window is visible, except while the read sits in `invalidArgument` (binary,
+// oversized, or refused by the path gate: it can't heal, and each tick re-reads
+// the whole file). The three conflict mutations await only the conflict-file
+// re-read before their isPending drops, with the working tree refreshing behind
+// it, so the view's `busy` needs no fetch state, and a poll tick never toggles
+// the buttons. A mount or panel show holds `busy` until a read joined or started
+// then lands, since a cached entry can be as old as the time off-screen. Only an
+// `io` read failure retries, once, so a transient io failure never flashes the
 // read-error pane. Each write handler holds a synchronous in-flight ref, since
 // a second click before the disabling render would write from stale segments,
 // and re-reads the file when its write fails. Mark resolved asks its marker
@@ -183,7 +183,7 @@ test("the conflict file polls on an interval gated on the panel and the error ki
   );
   assert.ok(
     hasStringLiteral(src, interval, "invalidArgument"),
-    'refetchInterval lost its "invalidArgument" arm: a binary or oversized read would re-read every tick',
+    'refetchInterval lost its "invalidArgument" arm: binary, oversized, or path-gate refusals would re-read every tick',
   );
   assert.match(
     interval.masked,
@@ -495,7 +495,7 @@ test("a read with no index stages never reaches the region view", () => {
   );
 });
 
-test("the header's whole-file actions hold, with a reason, on a path no longer conflicted", () => {
+test("the header's whole-file actions explain their notConflicted and path-gate holds", () => {
   const src = load(VIEW);
   assert.match(
     src.masked,
@@ -558,6 +558,15 @@ test("the header's whole-file actions hold, with a reason, on a path no longer c
         /(?<![\w$.])workingUndecodable(?![\w$])/,
         `"${label}" must be disabled while the working file isn't UTF-8 text`,
       );
+    } else {
+      // `sideRefusal` is every path refusal but a leaf link, which git's side
+      // checkout replaces or removes itself (pinned below and in
+      // conflict-path-refusal).
+      assert.match(
+        prop("disabled"),
+        /(?<![\w$.])sideRefusal\s*!==\s*null/,
+        `"${label}" must be disabled on a path-gate refusal other than a leaf link`,
+      );
     }
     // The AI button holds for a second cause too (a non-UTF-8 working file), so
     // its reason comes from `aiHeldReason`, pinned below.
@@ -565,10 +574,17 @@ test("the header's whole-file actions hold, with a reason, on a path no longer c
       prop("reason"),
       label === "Resolve with AI"
         ? /^\s*aiHeldReason\s*$/
-        : /^\s*notConflicted\s*\?\s*NOT_CONFLICTED_COPY\s*:\s*null\s*$/,
-      `"${label}" must explain its notConflicted hold`,
+        : /^\s*notConflicted\s*\?\s*NOT_CONFLICTED_COPY\s*:\s*sideRefusal\s*$/,
+      label === "Resolve with AI"
+        ? `"${label}" must explain its notConflicted hold`
+        : `"${label}" must explain its notConflicted and path-refusal holds`,
     );
   }
+  assert.match(
+    src.masked,
+    /\bconst\s+sideRefusal\s*=\s*linkedLeaf\s*\?\s*null\s*:\s*pathRefusal\s*;/,
+    "sideRefusal must be pathRefusal with only the leaf-link refusal lifted",
+  );
   // The AI reason's first case is the no-longer-conflicted one, so that reason
   // wins and stays the shared copy; the non-UTF-8 hold has its own arm.
   const held =

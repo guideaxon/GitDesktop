@@ -7,6 +7,11 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useCallback } from "react";
+import { shouldRetryQuery } from "@/lib/forge-backoff";
+import {
+  filterPlaceholderRows,
+  patchRowState,
+} from "@/lib/remote-state-filter";
 import { useMutation } from "@/lib/started-mutation";
 import { isAppError } from "@/lib/tauri/invoke";
 import { toastError } from "@/lib/toast";
@@ -40,6 +45,7 @@ import {
   pendingMutationEntries,
   pendingWritesFor,
 } from "./pr-writes";
+import { recheckListsLater, recheckRunsAfterPush } from "./push-writes";
 
 /** The issue-rail writes whose pending state a row reads back from the cache, so it
  *  survives the row's remount on an issue switch. */
@@ -220,19 +226,27 @@ export function useIssueList(
     queryFn: () => api.forgeIssueList(repo, state, limit, lens, filter),
     enabled,
     staleTime: 30_000,
-    // issuesDisabled is a permanent repo condition — retrying only delays the notice.
-    // invalidArgument is the same story per scope (filter caps, magic values, GitLab's
-    // walk horizon): the second walk reaches the same refusal at the same cost.
+    // issuesDisabled is permanent and invalidArgument deterministic per scope (filter
+    // caps, magic values, GitLab's walk horizon), so a retry reaches the same refusal;
+    // the rest takes the default, which never retries rate limits or 401s.
     retry: (failureCount, err) =>
       !(
         isAppError(err) &&
         (err.kind === "issuesDisabled" || err.kind === "invalidArgument")
-      ) && failureCount < 1,
+      ) && shouldRetryQuery(failureCount, err),
     // State, limit and filter stay free so a tab switch, "Load more" or a filter
     // change keeps the current rows instead of flashing skeletons, but lens must
     // match: a fork numbers issues independently of its parent, so another lens's
     // rows misdescribe the list and a click on one navigates to a different issue.
-    placeholderData: keepPreviousDataForKeyAxes(repo, [[3, lens]]),
+    // A page kept on this tab's own state (index 4) is filed by row state; another
+    // tab's page passes whole.
+    placeholderData: (prev, prevQuery) => {
+      const rows = keepPreviousDataForKeyAxes(repo, [[3, lens]])(
+        prev,
+        prevQuery,
+      );
+      return rows && filterPlaceholderRows(rows, state, prevQuery?.queryKey[4]);
+    },
   });
 }
 
@@ -774,13 +788,46 @@ export function useSetIssueType(repo: string, lens: RemoteLens) {
   );
 }
 
+/** Re-files issue `number`'s row under `state` in every cached list page of the
+ *  repo's `lens` (a fork numbers issues independently). Untouched pages return
+ *  undefined so setQueriesData bails: no write, no notify. Twin of the PR side's
+ *  `patchPrListState` (pr-actions.ts). */
+function patchIssueListState(
+  queryClient: QueryClient,
+  repo: string,
+  lens: RemoteLens,
+  number: number,
+  state: string,
+) {
+  queryClient.setQueriesData<IssueInfo[]>(
+    {
+      queryKey: repoKeys.issueList(repo),
+      predicate: (q) => q.queryKey[3] === lens,
+    },
+    (page) => {
+      const next = patchRowState(page, number, state);
+      return next === page ? undefined : next;
+    },
+  );
+}
+
+/** What a close or reopen re-files on success, fixed when the write starts. */
+type IssueRefile = {
+  repo: string;
+  lens: RemoteLens;
+  number: number;
+  state: "CLOSED" | "OPEN";
+};
+
 /**
  * An issue-lifecycle write (close/reopen/edit/pin/lock/transfer/delete) that reconciles
  * NARROWLY instead of whole-repo: the one issue's detail subtree (prefix-matched, so its
  * reactions/relations/dependencies/development sub-queries refresh too) plus every
  * issue-list state variant (row fields change, and transfer/delete change list
  * membership). `numberOf` extracts the number because the arg shapes differ. No
- * optimistic patch — these change fields the details view re-reads wholesale.
+ * optimistic (mutate-time) patch — these change fields the details view re-reads
+ * wholesale; close/reopen re-file the issue's cached list rows only on success
+ * (`patchStateTo`), once the forge has answered.
  */
 function useIssueLifecycleMutation<TArgs, TData>(
   repo: string,
@@ -795,11 +842,38 @@ function useIssueLifecycleMutation<TArgs, TData>(
   /** Files the write under {@link issueWriteKey} for a menu that reads its
    *  pending state back from the cache, per issue. */
   mutationKey?: ReturnType<typeof issueWriteKey>,
+  /** A state change (close/reopen): the forge's open-list membership can lag the
+   *  row's own state, so a success re-reads the lens's lists once more later. */
+  recheckListLater = false,
+  /** The state a success re-files the issue's row under in every cached list
+   *  page, so a preset switched to before its refetch lands files it right. */
+  patchStateTo?: "CLOSED" | "OPEN",
 ) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationKey,
     mutationFn,
+    // The re-file target is fixed HERE, at mutate time, and onSuccess reads it
+    // back from the context, so the cache write names the repo, lens and issue
+    // the write fired on. Writes with no state to re-file return nothing.
+    onMutate: (args: TArgs): IssueRefile | undefined =>
+      patchStateTo
+        ? { repo, lens, number: numberOf(args), state: patchStateTo }
+        : undefined,
+    onSuccess: (_d, _args, refile) => {
+      if (recheckListLater)
+        recheckListsLater(queryClient, repo, [
+          [...repoKeys.issueList(repo), lens],
+        ]);
+      if (refile)
+        patchIssueListState(
+          queryClient,
+          refile.repo,
+          refile.lens,
+          refile.number,
+          refile.state,
+        );
+    },
     onSettled: (_d, _e, args) => {
       if (boardCards) invalidateProjectBoards(queryClient, repo);
       return void Promise.all([
@@ -989,6 +1063,8 @@ export function useCloseIssue(repo: string, lens: RemoteLens) {
     // State + close reason are the card glyph and its screen-reader word.
     true,
     issueWriteKey("close", repo),
+    true,
+    "CLOSED",
   );
 }
 
@@ -1002,6 +1078,8 @@ export function useReopenIssue(repo: string, lens: RemoteLens) {
     // Back to the open glyph, and REOPENED lands as the state reason.
     true,
     issueWriteKey("reopen", repo),
+    true,
+    "OPEN",
   );
 }
 
@@ -1123,7 +1201,11 @@ export function useIssueDevelopment(
   });
 }
 
+/** The new branch is a server-side ref at an existing commit, but the forge may
+ *  still start create or push workflows for it after the call returns, so it arms
+ *  the delayed run recheck; only in origin, since the run lists read origin. */
 export function useCreateLinkedBranch(repo: string, lens: RemoteLens) {
+  const queryClient = useQueryClient();
   return useRepoMutation(
     repo,
     (args: { issueId: string; name: string }) =>
@@ -1133,6 +1215,9 @@ export function useCreateLinkedBranch(repo: string, lens: RemoteLens) {
       // `repo`, and the issue panel survives a repo switch — without the key the
       // newly-live repo's controls would read the pending create as busy.
       identity: ["create-linked-branch", repo, lens],
+      onSuccess: () => {
+        if (lens === "origin") recheckRunsAfterPush(queryClient, repo);
+      },
     },
   );
 }

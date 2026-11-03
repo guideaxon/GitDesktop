@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Static gate for nine Rust invariants that have each cost this repo a fix
+// Static gate for eleven Rust invariants that have each cost this repo a fix
 // round. Text-level checks over `src-tauri/src/**/*.rs` — no compiler, no deps,
 // Node built-ins only — so they run anywhere `node` does:
 //
@@ -35,13 +35,48 @@
 //      --no-overwrite-ignore on 3-way merges, so checkout merges check first.
 //   I. test-held update-marker branch names — process-wide root overrides
 //      require holder names no other test uses.
+//   J. gh exit read as absence — a GitHub read in github/ or forge/github.rs
+//      that turns a non-zero gh exit into "none" (false, an empty list, a
+//      default) answers a rate limit or a network failure with a false claim.
+//      `forge::session::classify_gh_failure` only buckets the failure; the
+//      read's own outcome fn decides absence (RateLimited/Transport are an Err,
+//      and star status and the Explore README reject every failure but
+//      NotFound). In the read outcome fns, an exit-0 body that won't parse is
+//      an Err as well, which J doesn't scan: it reads exits only. Exempt:
+//      `classify_repo_view` (github/pr.rs) keeps an unreadable repo view as
+//      Unresolved, forge-status's answered "no repository" probe.
+//   K. external diff drivers — diff argv carry --no-ext-diff so external tools
+//      cannot replace patches or forge verdicts. An exemption requires
+//      --numstat/--name-only/--name-status and every literal option after the
+//      verb and before -- on KNOWN_NO_PATCH, or one of the =/attached value
+//      forms the matcher accepts (bare --diff-filter M is not exempt). Each
+//      member was measured beside every exempt mode, worktree and
+//      --cached/--staged, under a trusted driver, git 2.51.1. Other options
+//      require --no-ext-diff. --quiet can trust a driver via diff.trustExitCode,
+//      diff.<driver>.trustExitCode or GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE, per
+//      git's diff-options docs. --ext-diff is refused before -- in any
+//      argv-shaped group; textconv remains enabled.
+//      Not seen: builder chains (Command::new("git").arg("diff")...), argv
+//      assembled across functions, a verb held in a variable, or an opaque
+//      option beside an exempt flag (["diff", "--numstat", flag]); a leading
+//      "git" program-name element, array-repeat ["diff"; N], alias verbs via
+//      -c alias.x=…, and a same-named REQUESTED_ATTRS item nested inside a fn
+//      (item rows match file+name). difftool is out of scope by design; a driver
+//      set through GIT_EXTERNAL_DIFF in a command's env is not an argv site.
+//      Only four bare owned-string forms resolve: .to_string(), .into(),
+//      .to_owned() and String::from(...). Other conversions (.as_str() chains,
+//      &*...to_owned(), format!, Cow::from, OsString::from, into::<String>())
+//      are opaque, so a patch flag in one beside an exempt flag passes.
+//      In-function growth of a literal vec via .push/.extend/.insert is not
+//      tracked: let mut a = vec!["diff", "--numstat"]; a.push("-p"); passes K.
 //
 // Each check carries an ALLOWLIST of `{ file, fn, rationale }` records; check
 // H's rows may add `builder: true` (the function's own argv sites are allowed,
-// and every caller or reference of it must guard instead), `item: true` (`fn`
-// names a const/static whose argv-shaped value is not a git command) or
+// and every caller or reference of it must guard instead) or
 // `guard: true` (`fn` wraps the guard: its calls count as guard calls, and the
 // check fails unless that function's own body calls ignored_files_in_the_way).
+// Checks H and K may add `item: true` (`fn` names a const/static whose
+// argv-shaped value is not a git command).
 // RATCHET RULE: the lists only shrink by default. Adding an entry is a
 // reviewed change — it needs a rationale naming the guard that makes the
 // site safe (a validator call, a trusted producer), and it lands in review
@@ -109,6 +144,12 @@ const REFSPEC_ALLOWLIST = [
     fn: "update_branch_from",
     rationale:
       "the fast-forward's local `fetch .` destination; validates branch and base with validate_branch_name at fn entry",
+  },
+  {
+    file: "git/branches.rs",
+    fn: "git_delete_remote_branch_core",
+    rationale:
+      "validates remote and name with validate_ref_name at fn entry; the full ref is the push --delete destination",
   },
   {
     file: "git/commit.rs",
@@ -375,6 +416,12 @@ const BARE_REV_ALLOWLIST = [
     rationale: "`base` is the fixed literal `HEAD` or `--cached`, never a name",
   },
   {
+    file: "git/diff.rs",
+    fn: "preview_rev_failure",
+    rationale:
+      "classifies a failed `git show <rev>:<path>`: `base` is that same rev minus its trailing `~`/`^` navigation suffixes, so it must resolve exactly as the read did",
+  },
+  {
     file: "git/ops.rs",
     fn: "refuse_untracked_reset_collisions",
     rationale:
@@ -406,7 +453,7 @@ const BARE_REV_ALLOWLIST = [
   },
   {
     file: "git/ops.rs",
-    fn: "git_rebase_edit_with_timeout",
+    fn: "rebase_edit_with_timeout",
     rationale:
       "`base` is a commit sha, validated with validate_hash at fn entry",
   },
@@ -1030,7 +1077,7 @@ const WORD = /[\p{ID_Continue}]/u;
  *  it — and a lifetime read as an open quote revives the comment after it.
  *  `unterminated` is the offset of a literal or comment that runs off the end
  *  (everything after it is unreadable), or -1. Callers only read the views,
- *  so checks D, F, G, H and I share one lexing of each file. */
+ *  so checks D, F, G, H, I, J and K share one lexing of each file. */
 let lexed = { text: null, views: null };
 export function lexRust(text) {
   if (lexed.text === text) return lexed.views;
@@ -2434,6 +2481,315 @@ export function checkTestMarkerBranches(file, src, _lines, hits, corpus) {
   }
 }
 
+// ------------------------------------------------------------------- check J
+
+// Function-level: a function that calls classify_gh_failure anywhere passes,
+// since its outcome arms are what decide absence. Shapes outside the three
+// below (a match on the exit code, an absence built through a helper, an
+// `is_ok_and` over the exit, and an `Err(_)` arm over `run_gh`, which turns
+// a non-zero exit into that Err) remain review concerns.
+export const GH_EXIT_ABSENCE_ALLOWLIST = [
+  {
+    file: "github/avatar.rs",
+    fn: "gh_bot_avatar",
+    rationale:
+      'decoration by contract: an empty URL draws initials, and Ok("") keeps virtualized rows from re-spawning gh per render',
+  },
+  {
+    file: "github/insights.rs",
+    fn: "parse_items",
+    rationale:
+      "parses a fan-out read that traffic_details_outcome already classified; only its NotFound/Answered responses reach the empty tolerance",
+  },
+  {
+    file: "github/pr.rs",
+    fn: "graphql_reset_at",
+    rationale:
+      "advisory reset hint: None omits the notice's time clause, never claims an absence",
+  },
+  {
+    file: "github/pr.rs",
+    fn: "gh_pr_is_stacked",
+    rationale:
+      "fail-safe by contract: false runs the legacy merge, which surfaces GitHub's own error for a stacked PR",
+  },
+  {
+    file: "github/pr.rs",
+    fn: "detect_fork_pr_for_branch",
+    rationale:
+      "the matched exit is a local git rev-parse (no such branch); the gh lookups are fail-safe by contract, so publish proceeds",
+  },
+  {
+    file: "github/pr.rs",
+    fn: "gh_open_stack_memberships",
+    rationale:
+      "None is the unknown verdict (a failed probe), which callers keep apart from a known-empty stack map",
+  },
+  {
+    file: "github/pr.rs",
+    fn: "stack_members_from_output",
+    rationale:
+      "None is a shape failure the caller reads as unknown; hop 1 already proved membership",
+  },
+];
+
+/** Values a failed read must not answer with: no star, no rows, a default. */
+const GH_ABSENCE = String.raw`(?:false|None|vec!\s*\[\s*\]|(?:Vec|String|HashMap|HashSet|BTreeMap|BTreeSet)::new\(\s*\)|(?:[A-Z]\w*(?:::<[^>]*>)?::)?(?:Default::)?default\(\s*\))`;
+const GH_ABSENCE_ARM = new RegExp(
+  String.raw`\bOk\s*\(\s*${GH_ABSENCE}\s*\)|\breturn\s+${GH_ABSENCE}\s*;`,
+);
+const GH_OK_EXIT_RE = /\bOk\s*\(\s*[\w.]+\.code\s*==\s*0\s*\)/g;
+const GH_MAP_EXIT_RE =
+  /\|\s*(\w+)\s*\|\s*\1\.code\s*==\s*0\s*\)\s*\.unwrap_or(?:\(\s*false\s*\)|_default\(\s*\))/g;
+const GH_IF_FAILED_RE = /\bif\s+[\w.]+\.code\s*!=\s*0\s*\{/g;
+const GH_EXIT_ABSENCE_FIX =
+  "check J: a non-zero gh exit is not an absence — route it through " +
+  "forge::session::classify_gh_failure, which only buckets the failure, and " +
+  "let a pure *_outcome fn decide absence (RateLimited/Transport → Err; " +
+  "NotFound/Answered → the read's absence, except star status and the Explore " +
+  "README, which reject every failure but NotFound), or allowlist a fail-safe " +
+  "or decoration read with rationale";
+
+/** Check J reads only the GitHub files, so none in scope means it read
+ *  nothing: that fails J itself, found by its `run`, whatever its position. */
+export function reportEmptyGhScope(checks, relFiles) {
+  if (relFiles.some(ghExitAbsenceScope)) return;
+  const j = checks.find((c) => c.run === checkGhExitAbsence);
+  if (j === undefined) throw new Error("check J is missing from CHECKS");
+  j.hits.push({
+    file: "github/",
+    line: 0,
+    fn: "<empty scope>",
+    allowlisted: false,
+    fix: "check J found no src-tauri/src/github/*.rs or forge/github.rs to scan — update ghExitAbsenceScope",
+  });
+}
+
+/** Whether `file` is in check J's scope: the GitHub reads. */
+export function ghExitAbsenceScope(file) {
+  return file.startsWith("github/") || file === "forge/github.rs";
+}
+
+export function checkGhExitAbsence(
+  file,
+  _src,
+  lines,
+  hits,
+  allowlist = GH_EXIT_ABSENCE_ALLOWLIST,
+) {
+  if (!ghExitAbsenceScope(file)) return;
+  const { code, masked, unterminated } = lexRust(lines.join("\n"));
+  const lineOf = (at) => code.slice(0, at).split("\n").length;
+  if (unterminated >= 0) {
+    hits.push({
+      file,
+      line: lineOf(unterminated),
+      fn: "<unreadable>",
+      allowlisted: false,
+      fix: "check J: a literal or comment opening here never closes, so the rest of the file is unreadable to this check — fix the source, or the lexer in scripts/check-rust-invariants.mjs",
+    });
+  }
+  const tests = testModuleSpans(masked);
+  const functions = rustFunctions(masked);
+  const report = (at) => {
+    if (tests.some(([s, e]) => at > s && at < e)) return;
+    const fn = functions.filter((f) => at > f.open && at < f.close).at(-1);
+    if (fn && /\bclassify_gh_failure\b/.test(masked.slice(fn.open, fn.close)))
+      return;
+    const name = fn?.name ?? "<top level>";
+    if (hits.some((h) => h.file === file && h.line === lineOf(at))) return;
+    hits.push({
+      file,
+      line: lineOf(at),
+      fn: name,
+      allowlisted: allowlist.some((e) => e.file === file && e.fn === name),
+      fix: GH_EXIT_ABSENCE_FIX,
+    });
+  };
+  for (const m of masked.matchAll(GH_OK_EXIT_RE)) report(m.index);
+  for (const m of masked.matchAll(GH_MAP_EXIT_RE)) report(m.index);
+  for (const m of masked.matchAll(GH_IF_FAILED_RE)) {
+    const body = braceBody(masked, m.index + m[0].length - 1);
+    if (GH_ABSENCE_ARM.test(body)) report(m.index);
+  }
+}
+
+// ---------------------------------------------------- K. external diff tools
+
+const DIFF_DRIVER_ALLOWLIST = [
+  {
+    file: "git/diff.rs",
+    fn: "REQUESTED_ATTRS",
+    item: true,
+    rationale:
+      "Attribute names passed to check-attr, never a git argv; diff selects the attribute to read",
+  },
+];
+const DIFF_DRIVER_FLAGS = new Set([
+  "--numstat",
+  "--name-only",
+  "--name-status",
+]);
+const KNOWN_NO_PATCH = new Set([
+  ...DIFF_DRIVER_FLAGS,
+  "-z",
+  "--no-color",
+  "--cached",
+  "--staged",
+  "--no-renames",
+  "--no-relative",
+  "--find-renames",
+  "-M",
+  "--relative",
+  "--ignore-submodules",
+]);
+const knownNoPatch = (value) =>
+  KNOWN_NO_PATCH.has(value) ||
+  /^(?:--(?:find-renames|diff-filter|relative|ignore-submodules)=[\s\S]*|-M\d+(?:\.\d+)?%?)$/.test(value);
+const DIFF_DRIVER_FIX =
+  "check K: add --no-ext-diff immediately after diff; --numstat, --name-only " +
+  "and --name-status are the only exempt output modes, and only with no " +
+  "literal option after the verb and before -- outside the known-no-patch list";
+
+function diffArgLiteral(text) {
+  const value = literalValue(text.trim());
+  if (value !== undefined) return value;
+  const owned = /^([\s\S]*)\.\s*(?:to_string|into|to_owned)\s*\(\s*\)$/.exec(text.trim());
+  const from = /^String\s*::\s*from\s*\(([\s\S]*)\)$/.exec(text.trim());
+  const inner = owned?.[1] ?? from?.[1];
+  return inner === undefined ? undefined : literalValue(inner.trim());
+}
+
+export function checkDiffExternalDrivers(
+  file,
+  _src,
+  lines,
+  hits,
+  allowlist = DIFF_DRIVER_ALLOWLIST,
+) {
+  const { code, masked, unterminated } = lexRust(lines.join("\n"));
+  const report = (at, fn, item, fix, readable = true) =>
+    hits.push({
+      file,
+      line: code.slice(0, at).split("\n").length,
+      fn,
+      item,
+      allowlisted:
+        readable &&
+        allowlist.some(
+          (e) => e.file === file && e.fn === fn && Boolean(e.item) === item,
+        ),
+      fix,
+    });
+  if (unterminated >= 0) {
+    report(
+      unterminated,
+      "<unreadable>",
+      false,
+      "check K: a literal or comment opening here never closes — fix the source, or the lexer in scripts/check-rust-invariants.mjs",
+      false,
+    );
+  }
+  const tests = testModuleSpans(masked);
+  const functions = rustFunctions(masked);
+  const items = [];
+  const itemRe = /\b(?:const|static)\s+(?:mut\s+|ref\s+)?(\w+)\s*:(?!:)/g;
+  for (const m of masked.matchAll(itemRe)) {
+    let depth = 0;
+    let eq = -1;
+    for (let k = m.index + m[0].length; k < masked.length; k++) {
+      const ch = masked[k];
+      if ("([{".includes(ch)) depth++;
+      else if (")]}".includes(ch)) {
+        if (--depth < 0) break;
+      } else if (depth === 0 && ch === "=" && eq < 0) eq = k;
+      else if (depth === 0 && ch === ";") {
+        if (eq >= 0) items.push({ name: m[1], eq, end: k });
+        break;
+      }
+    }
+  }
+  const opens = new Set([...masked.matchAll(/\[/g)].map((m) => m.index));
+  for (const m of masked.matchAll(/\bvec\s*!\s*[({]/g)) {
+    opens.add(m.index + m[0].length - 1);
+  }
+  for (const at of opens) {
+    if (tests.some(([s, e]) => at > s && at < e)) continue;
+    const body = bracketBody(code, at);
+    const end = at + body.length + 1;
+    const values = argvElements(body).map((e) => diffArgLiteral(e.text));
+    const globalValues = new Set();
+    let verb;
+    for (let k = 0; k < values.length; k++) {
+      const value = values[k];
+      if (value === undefined) break;
+      if (!value.startsWith("-")) {
+        verb = k;
+        break;
+      }
+      if (GIT_VALUE_OPTIONS.has(value)) globalValues.add(++k);
+    }
+    const args = verb === undefined ? values : values.slice(verb + 1);
+    const separator = args.indexOf("--");
+    const options = separator < 0 ? args : args.slice(0, separator);
+    const pathStart = separator < 0 ? values.length : (verb === undefined ? 0 : verb + 1) + separator;
+    const enablesDriver = values.slice(0, pathStart).some(
+      (value, k) => value === "--ext-diff" && !globalValues.has(k),
+    );
+    if (!values.includes("diff") && !enablesDriver) continue;
+    const item = items.filter((i) => at > i.eq && at < i.end).at(-1);
+    const fn = functions.filter((f) => at > f.open && at < f.close).at(-1);
+    const isItem = Boolean(item && (!fn || item.eq > fn.open));
+    const name = isItem ? item.name : (fn?.name ?? "<top level>");
+    // Balanced delimiters are required even when a flag would otherwise exempt.
+    const stack = [];
+    let bounded = code[end] === ")]}"["([{".indexOf(masked[at])];
+    for (let k = at; k <= end && bounded; k++) {
+      const ch = masked[k];
+      if ("([{".includes(ch)) stack.push(ch);
+      else if (")]}".includes(ch)) {
+        if (stack.pop() !== "([{"[")]}".indexOf(ch)]) bounded = false;
+      }
+    }
+    if (!bounded || stack.length) {
+      report(
+        at,
+        name,
+        isItem,
+        "check K: cannot bound this git argv group — fix its delimiters or extend the parser",
+        false,
+      );
+      continue;
+    }
+    if (enablesDriver) {
+      report(
+        at,
+        name,
+        isItem,
+        "check K: drop --ext-diff; external drivers are refused before -- in any argv-shaped group",
+        false,
+      );
+      continue;
+    }
+    if (verb === undefined) {
+      report(
+        at,
+        name,
+        isItem,
+        "check K: cannot resolve the verb of this group containing diff — use a literal git verb or extend the parser",
+        false,
+      );
+    } else if (values[verb] === "diff") {
+      const exempt = options.some((value) => DIFF_DRIVER_FLAGS.has(value)) &&
+        options.every(
+          (value) => value === undefined || !value.startsWith("-") || knownNoPatch(value),
+      );
+      if (!options.includes("--no-ext-diff") && !exempt)
+        report(at, name, isItem, DIFF_DRIVER_FIX);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------- main
 
 function main() {
@@ -2493,9 +2849,25 @@ function main() {
       allowlist: TEST_MARKER_ALLOWLIST,
       hits: [],
     },
+    {
+      name: "J. gh exit read as absence",
+      run: checkGhExitAbsence,
+      allowlist: GH_EXIT_ABSENCE_ALLOWLIST,
+      hits: [],
+    },
+    {
+      name: "K. diff argv bypass external drivers",
+      run: checkDiffExternalDrivers,
+      allowlist: DIFF_DRIVER_ALLOWLIST,
+      hits: [],
+    },
   ];
 
   const files = rustFiles(SRC);
+  reportEmptyGhScope(
+    CHECKS,
+    files.map((path) => relative(SRC, path).replace(/\\/g, "/")),
+  );
   for (const path of files) {
     // Normalise CRLF: on Windows a git checkout materialises these files with
     // CRLF, and a trailing `\r` would leak into every reported line.

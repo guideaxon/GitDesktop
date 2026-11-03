@@ -1,3 +1,9 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
@@ -6,9 +12,15 @@ use crate::forge::model::{ForgeTimelineEventOut, ForgeUserRef};
 use crate::forge::session::{classify_gh_failure, GhFailure};
 use crate::forge::{c_quote_label, c_quote_path, validate_compare_branch};
 use crate::git::runner::{run_git_raw, run_git_raw_input, DEFAULT_TIMEOUT, NETWORK_TIMEOUT};
-use crate::github::gh_unreadable;
 use crate::github::issue::{map_reaction_groups, repo_owner_name, IssueReactions};
-use crate::github::runner::{run_gh, run_gh_input, run_gh_raw, GH_NETWORK_TIMEOUT, GH_TIMEOUT};
+use crate::github::pr_search::viewer_login_core;
+use crate::github::repo_meta::{
+    invalidate_all_repo_meta_after, invalidate_repo_meta_after, write_was_attempted,
+};
+use crate::github::runner::{
+    gh_auth_epoch_counter, run_gh, run_gh_input, run_gh_raw, GH_NETWORK_TIMEOUT, GH_TIMEOUT,
+};
+use crate::github::{gh_failure_reason, gh_unreadable};
 use crate::state::AppState;
 
 fn validate_branch(name: &str) -> AppResult<()> {
@@ -35,6 +47,10 @@ pub struct GhStatus {
     /// Set when the repo lookup failed on a positively-identified class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_error: Option<crate::forge::model::ProbeError>,
+    /// The GraphQL bucket's reset in Unix epoch seconds, present only beside
+    /// `probeError: rateLimited` when the probe supplies a bounded future reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +86,7 @@ pub async fn gh_status(repo_path: String) -> AppResult<GhStatus> {
                 host: None,
                 login: None,
                 probe_error: None,
+                reset_at: None,
             });
         }
         Err(e) => return Err(e),
@@ -125,6 +142,14 @@ pub async fn gh_status(repo_path: String) -> AppResult<GhStatus> {
         }
     };
 
+    let reset_at = if let Some(args) = graphql_reset_probe_args(probe_error, &host_hint) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let probe = run_gh_raw(Some(&repo_path), &args, GH_TIMEOUT).await;
+        graphql_reset_at(probe, chrono::Utc::now().timestamp())
+    } else {
+        None
+    };
+
     // The active login on the repo's host (each host has its own active
     // account); the text fallback takes any active account when the host is unknown.
     // The JSON arm keys on `host_hint`, not the view-URL `host`, so under a
@@ -145,7 +170,46 @@ pub async fn gh_status(repo_path: String) -> AppResult<GhStatus> {
         host,
         login,
         probe_error,
+        reset_at,
     })
+}
+
+fn graphql_reset_probe_args(
+    probe_error: Option<crate::forge::model::ProbeError>,
+    host_hint: &str,
+) -> Option<[String; 4]> {
+    if !matches!(
+        probe_error,
+        Some(crate::forge::model::ProbeError::RateLimited)
+    ) || !crate::forge::is_safe_authority(host_hint)
+        || host_hint.starts_with('-')
+    {
+        return None;
+    }
+    // The host comes from the origin URL, so it is gated above (host charset,
+    // no leading `-`) and rides as ONE `--hostname=` argv, so its meaning never
+    // depends on how a CLI parses a dash-led value in a separate argv.
+    Some([
+        "api".into(),
+        "-i".into(),
+        "rate_limit".into(),
+        format!("--hostname={host_hint}"),
+    ])
+}
+
+fn graphql_reset_at(result: AppResult<crate::github::runner::GhOutput>, now: i64) -> Option<i64> {
+    let out = result.ok()?;
+    if out.code != 0 {
+        return None;
+    }
+    let response = out.stdout_lossy();
+    let (_, body) = crate::github::runner::split_response(&response);
+    let (remaining, reset) =
+        crate::github::runner::probe_reading(body, crate::github::runner::Bucket::Graphql)?;
+    (remaining == 0
+        && reset > now
+        && reset <= now.saturating_add(crate::github::runner::MAX_HOLD_SECS))
+    .then_some(reset)
 }
 
 /// The `(owner/repo, host)` a remote URL names, read without gh or the network — only
@@ -249,11 +313,16 @@ pub struct GhRepoList {
     pub repos: Vec<GhRepo>,
 }
 
-/// The signed-in user's login. The one source of the ambient (default-host) probe: the
-/// repo list and the forge layer's owned-namespace read must resolve the viewer
-/// identically, or their namespace answers drift. Errors when `gh` can't answer; an
-/// empty-but-successful answer passes through — callers decide the fallout.
+/// Memoized 60s per auth epoch and shared by the repo list and the owned-namespace read;
+/// fork lookup reads fresh through `gh_viewer_login_fresh`.
+/// Errors when `gh` can't answer; an empty-but-successful answer passes through uncached,
+/// so callers decide the fallout.
 pub async fn gh_viewer_login() -> AppResult<String> {
+    viewer_login_core(None, GH_TIMEOUT).await
+}
+
+/// A just-created fork must be located under the currently active account.
+pub(crate) async fn gh_viewer_login_fresh() -> AppResult<String> {
     Ok(run_gh(None, &["api", "user", "-q", ".login"], GH_TIMEOUT)
         .await?
         .stdout_lossy()
@@ -446,10 +515,12 @@ pub async fn gh_repo_credential_username(repo_path: String) -> AppResult<Option<
         DEFAULT_TIMEOUT,
     )
     .await?;
-    if out.code != 0 {
-        return Ok(None);
-    }
-    let username = out.stdout_lossy().trim().to_string();
+    // Exit 1 from `git config` means the key is unset: a local read, not a gh failure.
+    let username = if out.code == 0 {
+        out.stdout_lossy().trim().to_string()
+    } else {
+        String::new()
+    };
     let plausible = !username.is_empty()
         && username.len() <= 39
         && username
@@ -762,7 +833,22 @@ pub async fn gh_repo_star_status(repo_path: String) -> AppResult<bool> {
         GH_TIMEOUT,
     )
     .await?;
-    Ok(out.code == 0)
+    repo_star_status_outcome(Ok(out))
+}
+
+pub(crate) fn repo_star_status_outcome(
+    result: AppResult<crate::github::runner::GhOutput>,
+) -> AppResult<bool> {
+    let out = result?;
+    if out.code == 0 {
+        return Ok(true);
+    }
+    match classify_gh_failure(&out.stderr) {
+        GhFailure::NotFound => Ok(false),
+        GhFailure::RateLimited | GhFailure::Transport | GhFailure::Answered => {
+            Err(AppError::Gh(gh_failure_reason(&out)))
+        }
+    }
 }
 
 /// Stars (PUT) or unstars (DELETE) this repo for the signed-in user via
@@ -772,12 +858,14 @@ pub async fn gh_repo_set_star(repo_path: String, starred: bool) -> AppResult<()>
     let slug = crate::github::gh_origin_slug(&repo_path).await?;
     let endpoint = format!("user/starred/{slug}");
     let method = if starred { "PUT" } else { "DELETE" };
-    run_gh(
+    let result = run_gh(
         Some(&repo_path),
         &["api", "--method", method, &endpoint],
         GH_NETWORK_TIMEOUT,
     )
-    .await?;
+    .await;
+    invalidate_repo_meta_after(&slug, &result);
+    result?;
     Ok(())
 }
 
@@ -1053,53 +1141,63 @@ pub async fn gh_pr_merge(
         }
     };
     let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
-    // A stack member rejects BOTH `gh pr merge` and the plain REST merge endpoint;
-    // GitHub requires its asynchronous merge API there. The probe is best-effort —
-    // when it can't tell, the legacy path runs and GitHub's own refusal is the
-    // backstop. Merging a member also merges every unmerged layer below it.
-    let queued = if gh_pr_is_stacked(&repo_path, &slug, number).await {
-        gh_pr_merge_async(&repo_path, &slug, number, &strategy).await? == StackedMergeResult::Queued
-    } else {
-        let out = run_gh_raw(
-            Some(&repo_path),
-            &["pr", "merge", &n, method, "--repo", &slug],
-            GH_NETWORK_TIMEOUT,
-        )
-        .await?;
-        if out.code != 0 {
-            // Raw rather than `run_gh` only so the refusal can be reworded: gh's own
-            // blob advises `--auto`/`--admin`/`gh pr checkout`, none of which this app
-            // offers. Every unrecognized failure keeps `run_gh`'s exact fallback.
-            let raw = out.stderr.trim();
-            return Err(AppError::Gh(match classify_gh_merge_refusal(&out.stderr) {
-                Some(message) => message,
-                None if raw.is_empty() => format!("gh exited with code {}", out.code),
-                None => raw.to_string(),
-            }));
-        }
-        false
-    };
-    // Merge accepted: from here a cleanup failure is a warning on success, never an error.
-    let cleanup_warning = if queued {
-        // A queued merge has NOT landed — deleting the head branch now would break
-        // the merge the queue is still holding. Skip cleanup and disclose it.
-        Some(if delete_branch {
-            format!("Merging #{number} was queued on GitHub and will land when the queue completes. The remote branch was left in place for the queue.")
+    let outcome = async {
+        // A stack member rejects BOTH `gh pr merge` and the plain REST merge endpoint;
+        // GitHub requires its asynchronous merge API there. The probe is best-effort —
+        // when it can't tell, the legacy path runs and GitHub's own refusal is the
+        // backstop. Merging a member also merges every unmerged layer below it.
+        let queued = if gh_pr_is_stacked(&repo_path, &slug, number).await {
+            gh_pr_merge_async(&repo_path, &slug, number, &strategy).await?
+                == StackedMergeResult::Queued
         } else {
-            format!("Merging #{number} was queued on GitHub and will land when the queue completes.")
+            let result = run_gh_raw(
+                Some(&repo_path),
+                &["pr", "merge", &n, method, "--repo", &slug],
+                GH_NETWORK_TIMEOUT,
+            )
+            .await;
+            invalidate_repo_meta_after(&slug, &result);
+            invalidate_stack_memo_after(&slug, &result);
+            let out = result?;
+            if out.code != 0 {
+                // Raw rather than `run_gh` only so the refusal can be reworded: gh's own
+                // blob advises `--auto`/`--admin`/`gh pr checkout`, none of which this app
+                // offers. Every unrecognized failure keeps `run_gh`'s exact fallback.
+                let raw = out.stderr.trim();
+                return Err(AppError::Gh(match classify_gh_merge_refusal(&out.stderr) {
+                    Some(message) => message,
+                    None if raw.is_empty() => format!("gh exited with code {}", out.code),
+                    None => raw.to_string(),
+                }));
+            }
+            false
+        };
+        // Merge accepted: from here a cleanup failure is a warning on success, never an error.
+        let cleanup_warning = if queued {
+            // A queued merge has NOT landed — deleting the head branch now would break
+            // the merge the queue is still holding. Skip cleanup and disclose it.
+            Some(if delete_branch {
+                format!("Merging #{number} was queued on GitHub and will land when the queue completes. The remote branch was left in place for the queue.")
+            } else {
+                format!("Merging #{number} was queued on GitHub and will land when the queue completes.")
+            })
+        } else if delete_branch {
+            gh_delete_remote_head_branch(&repo_path, number, lens.as_deref())
+                .await
+                .err()
+                .map(|e| e.to_string())
+        } else {
+            None
+        };
+        Ok(PrMergeOutcome {
+            cleanup_warning,
+            queued,
         })
-    } else if delete_branch {
-        gh_delete_remote_head_branch(&repo_path, number, lens.as_deref())
-            .await
-            .err()
-            .map(|e| e.to_string())
-    } else {
-        None
-    };
-    Ok(PrMergeOutcome {
-        cleanup_warning,
-        queued,
-    })
+    }
+    .await;
+    invalidate_repo_meta_after(&slug, &outcome);
+    invalidate_stack_memo_after(&slug, &outcome);
+    outcome
 }
 
 /// Whether the PR is a stack member — the same `pull_stack_ref` reading the detail
@@ -1189,12 +1287,15 @@ async fn gh_pr_merge_async(
 ) -> AppResult<StackedMergeResult> {
     let endpoint = format!("repos/{slug}/pulls/{number}/merge-async");
     let method_arg = format!("merge_method={strategy}");
-    let out = run_gh(
+    let result = run_gh(
         Some(repo_path),
         &["api", "--method", "PUT", &endpoint, "-f", &method_arg],
         GH_NETWORK_TIMEOUT,
     )
-    .await?;
+    .await;
+    invalidate_repo_meta_after(slug, &result);
+    invalidate_stack_memo_after(slug, &result);
+    let out = result?;
     // The PUT already succeeded, so the merge may be running — an unreadable
     // acknowledgement is uncertainty, not a failed merge, and must read that way.
     let mut current: MergeAsyncStatus =
@@ -1269,6 +1370,18 @@ struct RawMergeHead {
 struct RawRepoName {
     #[serde(default)]
     name: String,
+}
+
+/// Braces are refused because gh expands `{...}` in an endpoint; `%` then `#`
+/// are escaped because gh parses the endpoint as a URL. `/` stays raw because
+/// the endpoint reads the rest of the path as the ref. Twin of
+/// `escape_branch_path` / `refuse_braced` in rulesets.rs.
+fn escape_head_branch_path(branch: &str) -> Option<String> {
+    if branch.contains('{') || branch.contains('}') {
+        return None;
+    }
+    // `%` first: escaping it second would rewrite the `%` of the `%23` just written.
+    Some(branch.replace('%', "%25").replace('#', "%23"))
 }
 
 /// Deletes only the *remote* head branch of a just-merged PR (see `gh_pr_merge`).
@@ -1346,11 +1459,17 @@ async fn gh_delete_remote_head_branch(
         }
     };
 
+    let Some(branch_path) = escape_head_branch_path(&branch) else {
+        return Err(AppError::Gh(format!(
+            "Merged #{number}, but the remote branch \"{branch}\" contains a brace. GitDesktop didn't delete it; remove it on GitHub if it's still there."
+        )));
+    };
+
     // INVARIANT — do NOT origin-pin this DELETE. `owner`/`repo` come from the PR's
     // OWN `headRepository[Owner]` (the fork side of a cross-repo PR), which is
     // exactly where the branch to delete lives. Substituting the origin slug here
     // would delete refs on the wrong repo for a cross-repository PR.
-    let endpoint = format!("repos/{owner}/{repo}/git/refs/heads/{branch}");
+    let endpoint = format!("repos/{owner}/{repo}/git/refs/heads/{branch_path}");
     match run_gh(
         Some(repo_path),
         &["api", "--method", "DELETE", &endpoint],
@@ -1388,12 +1507,15 @@ async fn gh_delete_remote_head_branch(
 pub async fn gh_pr_close(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
     let n = number.to_string();
     let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
-    run_gh(
+    let result = run_gh(
         Some(&repo_path),
         &["pr", "close", &n, "--repo", &slug],
         GH_NETWORK_TIMEOUT,
     )
-    .await?;
+    .await;
+    invalidate_repo_meta_after(&slug, &result);
+    invalidate_stack_memo_after(&slug, &result);
+    result?;
     Ok(())
 }
 
@@ -1835,12 +1957,15 @@ pub(crate) async fn detect_fork_pr_for_branch(
 pub async fn gh_pr_reopen(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
     let n = number.to_string();
     let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
-    run_gh(
+    let result = run_gh(
         Some(&repo_path),
         &["pr", "reopen", &n, "--repo", &slug],
         GH_NETWORK_TIMEOUT,
     )
-    .await?;
+    .await;
+    invalidate_repo_meta_after(&slug, &result);
+    invalidate_stack_memo_after(&slug, &result);
+    result?;
     Ok(())
 }
 
@@ -2107,12 +2232,14 @@ pub async fn gh_repo_fork(repo_path: String, contribute_to_parent: bool) -> AppR
     .trim()
     .to_string();
 
-    let out = run_gh(
+    let result = run_gh(
         Some(&repo_path),
         &["repo", "fork", "--remote"],
         GH_NETWORK_TIMEOUT,
     )
-    .await?;
+    .await;
+    invalidate_all_repo_meta_after(&result);
+    let out = result?;
     // gh prints progress to stderr; stdout carries the fork's URL when
     // creation succeeds (empty if the fork already existed).
     let fork_url = out.stdout_lossy().trim().to_string();
@@ -2298,6 +2425,142 @@ fn flatten_slurped_pages(pages: Vec<Vec<serde_json::Value>>) -> Vec<serde_json::
     pages.into_iter().flatten().collect()
 }
 
+// 30s matches usePrList's staleTime, so a refetch inside that window reuses the
+// last answer; an off-app stack change shows within 30s.
+const STACK_MEMO_TTL: Duration = Duration::from_secs(30);
+const STACK_MEMO_CAP: usize = 64;
+type StackMemoKey = (String, String);
+type StackMemberships = HashMap<u64, PrStackInfo>;
+
+struct CachedStackMemberships {
+    memberships: StackMemberships,
+    epoch: u64,
+    fetched: Instant,
+}
+
+#[derive(Default)]
+struct StackState {
+    entries: HashMap<StackMemoKey, CachedStackMemberships>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct StackMemo {
+    inner: Mutex<StackState>,
+}
+
+#[derive(Clone, Copy)]
+struct StackFetchStamp {
+    epoch: u64,
+    generation: u64,
+}
+
+fn stack_memo() -> &'static StackMemo {
+    static MEMO: OnceLock<StackMemo> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+fn stack_memo_key(repo_path: &str, slug: &str) -> StackMemoKey {
+    (repo_path.to_string(), slug.to_lowercase())
+}
+
+fn stack_memo_get(
+    state: &StackState,
+    key: &StackMemoKey,
+    epoch: u64,
+    ttl: Duration,
+    now: Instant,
+) -> Option<StackMemberships> {
+    state
+        .entries
+        .get(key)
+        .filter(|entry| entry.epoch == epoch && now.duration_since(entry.fetched) < ttl)
+        .map(|entry| entry.memberships.clone())
+}
+
+fn stack_memo_put(
+    state: &mut StackState,
+    key: StackMemoKey,
+    memberships: Option<&StackMemberships>,
+    before: StackFetchStamp,
+    current_epoch: u64,
+    now: Instant,
+) {
+    let Some(memberships) = memberships else {
+        return;
+    };
+    if state.generation != before.generation || current_epoch != before.epoch {
+        return;
+    }
+    if !state.entries.contains_key(&key) && state.entries.len() >= STACK_MEMO_CAP {
+        if let Some(oldest) = state
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.fetched)
+            .map(|(key, _)| key.clone())
+        {
+            state.entries.remove(&oldest);
+        }
+    }
+    state.entries.insert(
+        key,
+        CachedStackMemberships {
+            memberships: memberships.clone(),
+            epoch: before.epoch,
+            fetched: now,
+        },
+    );
+}
+
+fn stack_memo_invalidate(state: &mut StackState, slug: &str) {
+    state.generation += 1;
+    let slug = slug.to_lowercase();
+    state.entries.retain(|(_, key_slug), _| *key_slug != slug);
+}
+
+fn invalidate_stack_memo(slug: &str) {
+    stack_memo_invalidate(
+        &mut stack_memo().inner.lock().unwrap_or_else(|p| p.into_inner()),
+        slug,
+    );
+}
+
+fn invalidate_stack_memo_after<T>(slug: &str, result: &AppResult<T>) {
+    if write_was_attempted(result) {
+        invalidate_stack_memo(slug);
+    }
+}
+
+async fn stack_memberships_with(
+    memo: &StackMemo,
+    key: StackMemoKey,
+    epoch: &AtomicU64,
+    ttl: Duration,
+    fetch: impl Future<Output = Option<StackMemberships>>,
+) -> Option<StackMemberships> {
+    let before = {
+        let state = memo.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let epoch = epoch.load(Ordering::SeqCst);
+        if let Some(memberships) = stack_memo_get(&state, &key, epoch, ttl, Instant::now()) {
+            return Some(memberships);
+        }
+        StackFetchStamp {
+            epoch,
+            generation: state.generation,
+        }
+    };
+    let memberships = fetch.await;
+    stack_memo_put(
+        &mut memo.inner.lock().unwrap_or_else(|p| p.into_inner()),
+        key,
+        memberships.as_ref(),
+        before,
+        epoch.load(Ordering::SeqCst),
+        Instant::now(),
+    );
+    memberships
+}
+
 /// The repo's OPEN stacks as a PR-number → membership map, for the list join.
 /// `None` is the tri-state the list needs: the probe FAILED (no such endpoint on
 /// GHES, spawn error, non-zero exit, unparseable body — a caller-side
@@ -2307,24 +2570,36 @@ fn flatten_slurped_pages(pages: Vec<Vec<serde_json::Value>>) -> Vec<serde_json::
 /// Paginated because merge-dissolved stacks PERSIST in this list as `open: false`:
 /// on a long-lived repo the residue fills the early pages and the live stacks the
 /// join actually needs sit past them.
+///
+/// Answered maps, empty included, are memoized 30s per (repo_path, folded slug);
+/// a failed probe never is.
 async fn gh_open_stack_memberships(
     repo_path: &str,
     slug: &str,
 ) -> Option<std::collections::HashMap<u64, PrStackInfo>> {
-    let endpoint = format!("repos/{slug}/stacks?per_page=100");
-    let out = run_gh_raw(
-        Some(repo_path),
-        &["api", "--paginate", "--slurp", &endpoint],
-        GH_TIMEOUT,
+    stack_memberships_with(
+        stack_memo(),
+        stack_memo_key(repo_path, slug),
+        gh_auth_epoch_counter(),
+        STACK_MEMO_TTL,
+        async {
+            let endpoint = format!("repos/{slug}/stacks?per_page=100");
+            let out = run_gh_raw(
+                Some(repo_path),
+                &["api", "--paginate", "--slurp", &endpoint],
+                GH_TIMEOUT,
+            )
+            .await
+            .ok()?;
+            if out.code != 0 {
+                return None;
+            }
+            let pages =
+                serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&out.stdout_lossy()).ok()?;
+            Some(stack_memberships_from(flatten_slurped_pages(pages)))
+        },
     )
     .await
-    .ok()?;
-    if out.code != 0 {
-        return None;
-    }
-    let pages =
-        serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&out.stdout_lossy()).ok()?;
-    Some(stack_memberships_from(flatten_slurped_pages(pages)))
 }
 
 /// Decorate list rows with their stack membership. `stacks` is `None` when the
@@ -2519,7 +2794,9 @@ pub async fn gh_stack_create(
     let endpoint = format!("repos/{slug}/stacks");
     let args = stack_write_args(&endpoint, &pull_requests);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let body = run_gh_api_write(&repo_path, &arg_refs).await?;
+    let result = run_gh_api_write(&repo_path, &arg_refs).await;
+    invalidate_stack_memo_after(&slug, &result);
+    let body = result?;
     stack_write_outcome_from(&body, "stack create")
 }
 
@@ -2536,7 +2813,9 @@ pub async fn gh_stack_add(
     let endpoint = format!("repos/{slug}/stacks/{stack_number}/add");
     let args = stack_write_args(&endpoint, &pull_requests);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let body = run_gh_api_write(&repo_path, &arg_refs).await?;
+    let result = run_gh_api_write(&repo_path, &arg_refs).await;
+    invalidate_stack_memo_after(&slug, &result);
+    let body = result?;
     stack_write_outcome_from(&body, "stack add")
 }
 
@@ -2551,7 +2830,9 @@ pub async fn gh_stack_dissolve(
 ) -> AppResult<()> {
     let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
     let endpoint = format!("repos/{slug}/stacks/{stack_number}/unstack");
-    run_gh_api_write(&repo_path, &["api", "--method", "POST", &endpoint]).await?;
+    let result = run_gh_api_write(&repo_path, &["api", "--method", "POST", &endpoint]).await;
+    invalidate_stack_memo_after(&slug, &result);
+    result?;
     Ok(())
 }
 
@@ -3284,7 +3565,9 @@ pub async fn gh_pr_edit(
     let endpoint = format!("repos/{slug}/pulls/{number}");
     let args = pr_edit_args(&endpoint, title, &body, base.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_gh_api_write(&repo_path, &arg_refs).await?;
+    let result = run_gh_api_write(&repo_path, &arg_refs).await;
+    invalidate_stack_memo_after(&slug, &result);
+    result?;
     Ok(())
 }
 
@@ -4818,6 +5101,197 @@ fn map_gh_checks(rollup: Vec<RawCheck>, runs: Option<&[CheckRunEvent]>) -> Vec<P
         .collect()
 }
 
+fn graphql_reviews_to_out(raw: Vec<RawReview>) -> Vec<PrThreadOut> {
+    raw.into_iter()
+        .map(|r| PrThreadOut {
+            author: r.author.map(|a| a.login).unwrap_or_default(),
+            author_avatar_url: String::new(),
+            state: r.state,
+            body: r.body,
+            date: real_time_or_empty(r.submitted_at.unwrap_or_default()),
+            id: r.id,
+            url: String::new(),
+            viewer_did_author: false,
+            is_minimized: false,
+            minimized_reason: String::new(),
+            // Reviews carry their own id in `id` (see `PrThreadOut::review_id`).
+            review_id: String::new(),
+        })
+        .collect()
+}
+
+fn graphql_comments_to_out(raw: Vec<RawComment>) -> Vec<PrThreadOut> {
+    raw.into_iter()
+        .map(|c| PrThreadOut {
+            author: c.author.map(|a| a.login).unwrap_or_default(),
+            author_avatar_url: String::new(),
+            state: String::new(),
+            body: c.body,
+            date: real_time_or_empty(c.created_at),
+            id: c.id,
+            url: c.url,
+            viewer_did_author: c.viewer_did_author,
+            is_minimized: c.is_minimized,
+            minimized_reason: c.minimized_reason,
+            // Conversation comments belong to no review.
+            review_id: String::new(),
+        })
+        .collect()
+}
+
+async fn reviews_with_top_up(
+    repo_path: &str,
+    number: u64,
+    lens: Option<&str>,
+    raw: Vec<RawReview>,
+) -> (Vec<PrThreadOut>, bool, bool) {
+    let top_up = if raw.len() >= 100 {
+        Some(gh_pr_reviews_paginated(repo_path, number, lens).await)
+    } else {
+        None
+    };
+    gh_top_up_or_unknown(graphql_reviews_to_out(raw), top_up, None)
+}
+
+async fn comments_with_top_up(
+    repo_path: &str,
+    number: u64,
+    lens: Option<&str>,
+    raw: Vec<RawComment>,
+) -> (Vec<PrThreadOut>, bool, bool) {
+    let top_up = if raw.len() >= 100 {
+        Some(gh_pr_comments_paginated(repo_path, number, lens).await)
+    } else {
+        None
+    };
+    gh_top_up_or_unknown(graphql_comments_to_out(raw), top_up, None)
+}
+
+/// A PR's conversation (comments and review summaries) with their completeness flags.
+pub struct PrConversation {
+    pub comments: Vec<PrThreadOut>,
+    pub comments_unknown: bool,
+    pub comments_truncated: bool,
+    pub reviews: Vec<PrThreadOut>,
+    pub reviewers_unknown: bool,
+}
+
+#[derive(Deserialize)]
+struct RawPrConversation {
+    #[serde(default)]
+    comments: Vec<RawComment>,
+    #[serde(default)]
+    reviews: Vec<RawReview>,
+}
+
+/// The MCP comments read shares gh_pr_view's mapping and top-ups so the
+/// conversation has the same shape and completeness on both read paths.
+pub async fn gh_pr_comments_view(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<PrConversation> {
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let n = number.to_string();
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "pr",
+            "view",
+            &n,
+            "--repo",
+            &slug,
+            "--json",
+            "comments,reviews",
+        ],
+        GH_TIMEOUT,
+    )
+    .await?;
+    let raw: RawPrConversation = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the pull request",
+            format!("could not parse gh pr view conversation: {e}"),
+        )
+    })?;
+    let (reviews, reviewers_unknown, _) =
+        reviews_with_top_up(&repo_path, number, lens.as_deref(), raw.reviews).await;
+    let (comments, comments_unknown, comments_truncated) =
+        comments_with_top_up(&repo_path, number, lens.as_deref(), raw.comments).await;
+    Ok(PrConversation {
+        comments,
+        comments_unknown,
+        comments_truncated,
+        reviews,
+        reviewers_unknown,
+    })
+}
+
+/// Narrow fields avoid the full view's stack, check-run and merge-settings reads.
+fn lean_pr_view_args<'a>(n: &'a str, slug: &'a str, fields: &'a str) -> [&'a str; 7] {
+    ["pr", "view", n, "--repo", slug, "--json", fields]
+}
+
+const PR_NODE_ID_FIELDS: &str = "id";
+const PR_TITLE_BODY_FIELDS: &str = "title,body";
+
+#[derive(Deserialize)]
+struct RawPrNodeId {
+    #[serde(default)]
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RawPrTitleBody {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn gh_pr_view_lean<T: serde::de::DeserializeOwned>(
+    repo_path: &str,
+    number: u64,
+    lens: Option<&str>,
+    fields: &str,
+) -> AppResult<T> {
+    let slug = crate::github::gh_lens_slug(repo_path, lens).await?;
+    let n = number.to_string();
+    let out = run_gh(
+        Some(repo_path),
+        &lean_pr_view_args(&n, &slug, fields),
+        GH_TIMEOUT,
+    )
+    .await?;
+    serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the pull request",
+            format!("could not parse gh pr view {fields}: {e}"),
+        )
+    })
+}
+
+/// The PR's GraphQL node id, used by label mutations.
+pub async fn gh_pr_node_id(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<String> {
+    let raw: RawPrNodeId =
+        gh_pr_view_lean(&repo_path, number, lens.as_deref(), PR_NODE_ID_FIELDS).await?;
+    Ok(raw.id)
+}
+
+/// The current title and body an edit must preserve when either is omitted.
+pub async fn gh_pr_title_body(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<(String, String)> {
+    let raw: RawPrTitleBody =
+        gh_pr_view_lean(&repo_path, number, lens.as_deref(), PR_TITLE_BODY_FIELDS).await?;
+    Ok((raw.title, raw.body))
+}
+
 /// Full details for one PR's read view.
 pub async fn gh_pr_view(
     repo_path: String,
@@ -4921,57 +5395,10 @@ pub async fn gh_pr_view(
         Some(GH_REST_PR_COMMITS_CEILING),
     );
 
-    let reviews_top_up = if raw.reviews.len() >= 100 {
-        Some(gh_pr_reviews_paginated(&repo_path, number, lens.as_deref()).await)
-    } else {
-        None
-    };
-    let graphql_reviews: Vec<PrThreadOut> = raw
-        .reviews
-        .into_iter()
-        .map(|r| PrThreadOut {
-            author: login(r.author),
-            author_avatar_url: String::new(),
-            state: r.state,
-            body: r.body,
-            date: real_time_or_empty(r.submitted_at.unwrap_or_default()),
-            id: r.id,
-            url: String::new(),
-            viewer_did_author: false,
-            is_minimized: false,
-            minimized_reason: String::new(),
-            // Reviews carry their own id in `id` (see `PrThreadOut::review_id`).
-            review_id: String::new(),
-        })
-        .collect();
     let (reviews, reviewers_unknown, _reviews_truncated) =
-        gh_top_up_or_unknown(graphql_reviews, reviews_top_up, None);
-
-    let comments_top_up = if raw.comments.len() >= 100 {
-        Some(gh_pr_comments_paginated(&repo_path, number, lens.as_deref()).await)
-    } else {
-        None
-    };
-    let graphql_comments: Vec<PrThreadOut> = raw
-        .comments
-        .into_iter()
-        .map(|c| PrThreadOut {
-            author: login(c.author),
-            author_avatar_url: String::new(),
-            state: String::new(),
-            body: c.body,
-            date: real_time_or_empty(c.created_at),
-            id: c.id,
-            url: c.url,
-            viewer_did_author: c.viewer_did_author,
-            is_minimized: c.is_minimized,
-            minimized_reason: c.minimized_reason,
-            // Conversation comments belong to no review.
-            review_id: String::new(),
-        })
-        .collect();
+        reviews_with_top_up(&repo_path, number, lens.as_deref(), raw.reviews).await;
     let (comments, comments_unknown, comments_truncated) =
-        gh_top_up_or_unknown(graphql_comments, comments_top_up, None);
+        comments_with_top_up(&repo_path, number, lens.as_deref(), raw.comments).await;
 
     // Repo-level merge-method settings — one extra `gh api graphql` call the
     // `gh pr view --json` surface can't supply. Best-effort: on failure all three
@@ -5573,16 +6000,19 @@ pub async fn commit_diff(repo_path: &str, oid: &str) -> AppResult<String> {
     Ok(text)
 }
 
+fn optional_viewer_login(result: AppResult<String>) -> Option<String> {
+    result
+        .ok()
+        .map(|login| login.trim().to_string())
+        .filter(|login| !login.is_empty())
+}
+
 /// The signed-in user's login, resolved TOLERANTLY (`gh api user -q .login`) — any
 /// failure yields `None`, so a commit comment's `viewer_did_author` falls back to
 /// `false` (edit/delete hidden) rather than wrongly claiming authorship. Never
 /// returns an empty string. Mirrors gitlab.rs's `current_user_login`.
 async fn current_login(repo_path: &str) -> Option<String> {
-    run_gh(Some(repo_path), &["api", "user", "-q", ".login"], GH_NETWORK_TIMEOUT)
-        .await
-        .ok()
-        .map(|o| o.stdout_lossy().trim().to_string())
-        .filter(|s| !s.is_empty())
+    optional_viewer_login(viewer_login_core(Some(repo_path), GH_NETWORK_TIMEOUT).await)
 }
 
 /// One commit comment as the REST list returns it. Every field tolerant/defaulted
@@ -5914,22 +6344,29 @@ fn is_diff_too_large(msg: &str) -> bool {
 /// sink the whole reconstruction.
 #[derive(Deserialize, Default)]
 struct GhPrFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     filename: String,
     #[serde(default)]
     previous_filename: Option<String>,
     /// added / removed / modified / renamed / changed / copied / unchanged.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     status: String,
     /// The `@@` hunks only — GitHub omits this for binary or individually-huge
     /// files. We synthesize the `---`/`+++` header lines ourselves.
     #[serde(default)]
     patch: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     additions: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     deletions: u32,
+    /// The file's blob id (the pre-image's on a removal). The one field that tells
+    /// an empty file from a binary: both arrive as 0/0 with no `patch`.
+    #[serde(default, deserialize_with = "null_to_default")]
+    sha: String,
 }
+
+/// git's id for the empty blob.
+const EMPTY_BLOB_SHA: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 /// Fetches changed files past the GraphQL 100-item cap via the paginated REST API.
 /// REST stops at [`GH_REST_PR_FILES_CEILING`]; the view fold reports that ceiling.
@@ -6239,15 +6676,7 @@ async fn gh_pr_comments_paginated(
         })?;
     // Resolve the viewer login once, only now that this top-up fired. Best-effort:
     // a failed probe leaves `viewer_did_author` false (no edit affordance).
-    let viewer_login = run_gh(
-        Some(repo_path),
-        &["api", "user", "-q", ".login"],
-        GH_TIMEOUT,
-    )
-    .await
-    .ok()
-    .map(|o| o.stdout_lossy().trim().to_string())
-    .filter(|s| !s.is_empty());
+    let viewer_login = optional_viewer_login(viewer_login_core(Some(repo_path), GH_TIMEOUT).await);
     Ok(pages
         .into_iter()
         .flatten()
@@ -6283,26 +6712,30 @@ fn reconstruct_pr_diff(files: &[GhPrFile]) -> String {
         let new_path = f.filename.as_str();
         let is_added = f.status == "added";
         let is_removed = f.status == "removed";
-        let is_renamed = f.status == "renamed";
-        // a/ side = pre-change path (previous filename on a rename).
-        let old_path = if is_renamed {
+        let pair_kind = match f.status.as_str() {
+            "renamed" => Some("rename"),
+            "copied" => Some("copy"),
+            _ => None,
+        };
+        // a/ side = pre-change path (previous filename on a rename or copy).
+        let old_path = if pair_kind.is_some() {
             f.previous_filename.as_deref().unwrap_or(new_path)
         } else {
             new_path
         };
+        let pair_kind = pair_kind.filter(|_| old_path != new_path);
 
         // Every name rides git's C-quoting, so a control byte in a path can't
         // break a line and forge a header the splitter would key on.
         let a_label = c_quote_label("a/", old_path);
         let b_label = c_quote_label("b/", new_path);
         out.push_str(&format!("diff --git {a_label} {b_label}\n"));
-        if is_renamed && old_path != new_path {
-            out.push_str("rename from ");
-            out.push_str(&c_quote_path(old_path));
-            out.push('\n');
-            out.push_str("rename to ");
-            out.push_str(&c_quote_path(new_path));
-            out.push('\n');
+        if let Some(kind) = pair_kind {
+            out.push_str(&format!(
+                "{kind} from {}\n{kind} to {}\n",
+                c_quote_path(old_path),
+                c_quote_path(new_path)
+            ));
         }
         if is_added {
             out.push_str("new file mode 100644\n");
@@ -6310,29 +6743,39 @@ fn reconstruct_pr_diff(files: &[GhPrFile]) -> String {
             out.push_str("deleted file mode 100644\n");
         }
 
+        // git names a missing side `/dev/null` in both the hunk header and the binary marker.
+        let minus = if is_added {
+            "/dev/null"
+        } else {
+            a_label.as_str()
+        };
+        let plus = if is_removed {
+            "/dev/null"
+        } else {
+            b_label.as_str()
+        };
         match &f.patch {
             Some(patch) if !patch.is_empty() => {
-                let minus = if is_added {
-                    "/dev/null"
-                } else {
-                    a_label.as_str()
-                };
-                let plus = if is_removed {
-                    "/dev/null"
-                } else {
-                    b_label.as_str()
-                };
                 out.push_str(&format!("--- {minus}\n+++ {plus}\n"));
                 out.push_str(patch);
                 if !patch.ends_with('\n') {
                     out.push('\n');
                 }
             }
-            // No hunks: binary or an individually-huge file GitHub dropped the
-            // patch for. Emit git's binary placeholder (the frontend recognizes
-            // the `Binary files ` marker and renders it as an undisplayable file).
+            // No hunks: a header-only change, a binary, or an individually-huge
+            // file GitHub dropped the patch for. A 0/0 rename/copy and a provably
+            // empty added/removed file stay header-only, as git writes them (a
+            // renamed binary whose content also changed reads as a pure rename:
+            // the API gives no pre-image sha to tell). Everything else, mode-only
+            // changes included (the API carries no modes), keeps git's marker.
             _ => {
-                out.push_str(&format!("Binary files {a_label} and {b_label} differ\n"));
+                let empty_blob = f.sha == EMPTY_BLOB_SHA;
+                let header_only = (pair_kind.is_some() && f.additions == 0 && f.deletions == 0)
+                    || (is_added && f.additions == 0 && empty_blob)
+                    || (is_removed && f.deletions == 0 && empty_blob);
+                if !header_only {
+                    out.push_str(&format!("Binary files {minus} and {plus} differ\n"));
+                }
             }
         }
     }
@@ -7135,7 +7578,9 @@ pub(crate) async fn gh_pr_create_core(
         if draft {
             args.push("--draft");
         }
-        let out = run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await?;
+        let result = run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await;
+        invalidate_repo_meta_after(&parent_slug, &result);
+        let out = result?;
         let (number, url) = scrape_pr_ref(&out.stdout_lossy());
         return Ok(PrRef { number, url });
     }
@@ -7176,7 +7621,9 @@ pub(crate) async fn gh_pr_create_core(
     // --label/--assignee`: gh 2.94 records each value TWICE on the activity timeline
     // when passed at create time (create mutation + follow-up re-apply), so the feed
     // shows doubled "added the X label" rows. `gh pr edit --add-*` applies once.
-    let out = run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await?;
+    let result = run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await;
+    invalidate_repo_meta_after(&origin_slug, &result);
+    let out = result?;
 
     let (number, url) = scrape_pr_ref(&out.stdout_lossy());
 
@@ -7252,7 +7699,7 @@ fn scrape_pr_ref(stdout: &str) -> (u64, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_stack_join, classify_gh_merge_refusal, classify_merge_async,
+        apply_stack_join, classify_gh_merge_refusal, classify_merge_async, escape_head_branch_path,
         external_items_from_thread_nodes, external_reviews_truncated, fallback_auth_outcome,
         flatten_slurped_pages, fork_head_identity, gh_api_error_message,
         gh_pr_discard_pending_review, gh_repo_url, host_from_url, is_canonical_github_remote,
@@ -7267,6 +7714,7 @@ mod tests {
         stack_members_from_output, PrStackProbe,
         map_gh_mergeability, stack_memberships_from, stack_write_args, stack_write_outcome_from,
         PR_LIST_FIELDS, PR_VIEW_FIELDS, PRS_FOR_BRANCH_FIELDS, upstream_pulls_endpoint, GhPrFile,
+        EMPTY_BLOB_SHA,
         GhPrRestComment,
         GhPrRestCommit, GhPrRestCommitGitAuthor, GhPrRestCommitInner, GhPrRestPull, GhPrRestReview,
         GhStackEntry, MergeAsyncOutcome, MergeAsyncStatus, PrDetails, PrInfo, PrMergeOutcome,
@@ -7278,6 +7726,196 @@ mod tests {
     };
     use crate::error::AppError;
     use crate::git::runner::{run_git, DEFAULT_TIMEOUT};
+    use crate::github::test_support::{
+        gh_output, ANSWERED_STDERR, HELD_REST_STDERR, NOT_FOUND_STDERR,
+    };
+    #[test]
+    fn graphql_reset_requires_current_bounded_exhaustion() {
+        let now = 1_800_000_000;
+        for (remaining, reset, expected) in [
+            (0, now + 60, Some(now + 60)),
+            (1, now + 60, None),
+            (0, now - 1, None),
+            (0, now, None),
+            (0, now + 3660, Some(now + 3660)),
+            (0, now + 3661, None),
+        ] {
+            let body = serde_json::to_string_pretty(&serde_json::json!({
+                "resources": {"graphql": {"remaining": remaining, "reset": reset}}
+            }))
+            .unwrap();
+            let response =
+                format!("HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n{body}");
+            assert_eq!(
+                super::graphql_reset_at(gh_output(0, &response, ""), now),
+                expected
+            );
+        }
+        for body in [
+            "",
+            "garbage",
+            "{}",
+            r#"{"resources":{"core":{"remaining":0,"reset":1800000060}}}"#,
+            r#"{"resources":{"graphql":{"remaining":"0","reset":1800000060}}}"#,
+            r#"{"resources":{"graphql":{"remaining":0,"reset":"1800000060"}}}"#,
+        ] {
+            assert_eq!(super::graphql_reset_at(gh_output(0, body, ""), now), None);
+        }
+        let body = r#"{"resources":{"graphql":{"remaining":0,"reset":1800000060}}}"#;
+        assert_eq!(
+            super::graphql_reset_at(gh_output(1, body, HELD_REST_STDERR), now),
+            None
+        );
+        assert_eq!(
+            super::graphql_reset_at(Err(crate::error::AppError::Timeout(30)), now),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_probe_is_only_rate_limited_and_host_pinned() {
+        use crate::forge::model::ProbeError;
+        assert_eq!(super::graphql_reset_probe_args(None, "ghe.example"), None);
+        for host in ["-x", "a b", "x;y", "", "host=evil"] {
+            assert!(
+                super::graphql_reset_probe_args(Some(ProbeError::RateLimited), host).is_none(),
+                "{host}"
+            );
+        }
+        for host in ["ghe.example", "ghe.acme.com:8443"] {
+            let args =
+                super::graphql_reset_probe_args(Some(ProbeError::RateLimited), host).unwrap();
+            assert_eq!(
+                args.as_slice(),
+                ["api", "-i", "rate_limit", &format!("--hostname={host}")]
+            );
+        }
+    }
+
+    #[test]
+    fn repo_star_status_treats_only_not_found_as_unstarred() {
+        let absent = super::repo_star_status_outcome(gh_output(1, "", NOT_FOUND_STDERR)).unwrap();
+        assert!(!absent);
+        let loaded = super::repo_star_status_outcome(gh_output(0, "", "")).unwrap();
+        assert!(loaded);
+        for stderr in [
+            "HTTP 403: API rate limit exceeded for user ID 4041234 (https://api.github.com/)",
+            "gh: Not Found",
+            HELD_REST_STDERR,
+            "connection failed",
+            "gh: API rate limit exceeded for user ID 12345 (HTTP 403)",
+            ANSWERED_STDERR,
+            "",
+        ] {
+            let error = super::repo_star_status_outcome(gh_output(1, "", stderr))
+                .expect_err("failed read must reject");
+            assert!(
+                matches!(&error, crate::error::AppError::Gh(message) if message == &crate::github::gh_failure_reason(&gh_output(1, "", stderr).unwrap())),
+                "{error}"
+            );
+            if stderr == HELD_REST_STDERR {
+                assert!(error.to_string().contains("rate limit"));
+            }
+        }
+        assert!(super::repo_star_status_outcome(Err(crate::error::AppError::Timeout(30))).is_err());
+    }
+
+    #[test]
+    fn lean_pr_args_request_only_their_fields() {
+        for (fields, expected) in [
+            (super::PR_NODE_ID_FIELDS, "id"),
+            (super::PR_TITLE_BODY_FIELDS, "title,body"),
+        ] {
+            assert_eq!(
+                super::lean_pr_view_args("67", "o/r", fields),
+                ["pr", "view", "67", "--repo", "o/r", "--json", expected]
+            );
+        }
+    }
+
+    #[test]
+    fn lean_pr_twins_parse_and_default() {
+        let id: super::RawPrNodeId = serde_json::from_str(r#"{"id":"PR_x"}"#).unwrap();
+        assert_eq!(id.id, "PR_x");
+        let id: super::RawPrNodeId = serde_json::from_str("{}").unwrap();
+        assert_eq!(id.id, "");
+        let text: super::RawPrTitleBody =
+            serde_json::from_str(r#"{"title":"t","body":"b"}"#).unwrap();
+        assert_eq!((text.title.as_str(), text.body.as_str()), ("t", "b"));
+        let text: super::RawPrTitleBody = serde_json::from_str(r#"{"title":"t"}"#).unwrap();
+        assert_eq!((text.title.as_str(), text.body.as_str()), ("t", ""));
+    }
+
+    #[test]
+    fn graphql_review_mapping_preserves_exact_fields_and_null_defaults() {
+        let raw = serde_json::from_value(serde_json::json!([
+            {"id": "R1", "author": {"login": "reviewer"}, "state": "APPROVED",
+             "body": "Looks good", "submittedAt": "2026-10-24T12:00:00Z"},
+            {"state": "PENDING", "submittedAt": null},
+            {}
+        ]))
+        .unwrap();
+        let rows = super::graphql_reviews_to_out(raw);
+        let expected = [
+            (
+                "reviewer",
+                "APPROVED",
+                "Looks good",
+                "2026-10-24T12:00:00Z",
+                "R1",
+            ),
+            ("", "PENDING", "", "", ""),
+            ("", "", "", "", ""),
+        ];
+        assert_eq!(rows.len(), expected.len());
+        for (row, (author, state, body, date, id)) in rows.iter().zip(expected) {
+            assert_eq!(row.author, author);
+            assert_eq!(row.author_avatar_url, "");
+            assert_eq!(row.state, state);
+            assert_eq!(row.body, body);
+            assert_eq!(row.date, date);
+            assert_eq!(row.id, id);
+            assert_eq!(row.url, "");
+            assert!(!row.viewer_did_author);
+            assert!(!row.is_minimized);
+            assert_eq!(row.minimized_reason, "");
+            assert_eq!(row.review_id, "");
+        }
+    }
+
+    #[test]
+    fn graphql_comment_mapping_preserves_exact_fields_and_minimized_defaults() {
+        let raw = serde_json::from_value(serde_json::json!([
+            {"id": "C1", "author": {"login": "commenter"}, "body": "A comment",
+             "createdAt": "2026-10-24T12:00:00Z", "url": "https://github.com/o/r/pull/1#C1",
+             "viewerDidAuthor": true, "isMinimized": true, "minimizedReason": "OUTDATED"},
+            {},
+            {"author": null, "createdAt": "0001-01-01T00:00:00Z"}
+        ]))
+        .unwrap();
+        let rows = super::graphql_comments_to_out(raw);
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.author, if i == 0 { "commenter" } else { "" });
+            assert_eq!(row.author_avatar_url, "");
+            assert_eq!(row.state, "");
+            assert_eq!(row.body, if i == 0 { "A comment" } else { "" });
+            assert_eq!(row.date, if i == 0 { "2026-10-24T12:00:00Z" } else { "" });
+            assert_eq!(row.id, if i == 0 { "C1" } else { "" });
+            assert_eq!(
+                row.url,
+                if i == 0 {
+                    "https://github.com/o/r/pull/1#C1"
+                } else {
+                    ""
+                }
+            );
+            assert_eq!(row.viewer_did_author, i == 0);
+            assert_eq!(row.is_minimized, i == 0);
+            assert_eq!(row.minimized_reason, if i == 0 { "OUTDATED" } else { "" });
+            assert_eq!(row.review_id, "");
+        }
+    }
 
     fn repo_view_fixture(code: i32, stdout: &str, stderr: &str) -> crate::github::runner::GhOutput {
         crate::github::runner::GhOutput {
@@ -7285,6 +7923,238 @@ mod tests {
             stderr: stderr.to_string(),
             code,
         }
+    }
+
+    #[test]
+    fn viewer_login_callers_preserve_optional_verdicts() {
+        assert_eq!(super::optional_viewer_login(Ok(String::new())), None);
+        assert_eq!(super::optional_viewer_login(Ok("  ".into())), None);
+        assert_eq!(
+            super::optional_viewer_login(Ok(" octocat\n".into())),
+            Some("octocat".into())
+        );
+        assert_eq!(
+            super::optional_viewer_login(Err(AppError::Timeout(1))),
+            None
+        );
+        assert_eq!(
+            super::optional_viewer_login(Err(AppError::Gh("failed".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn viewer_login_routes_keep_timeouts_and_fork_freshness() {
+        use crate::github::repo_meta::tests::wiring_body;
+        let source = include_str!("pr.rs");
+        let body = |name: &str| wiring_body(source, name);
+        assert!(body("gh_viewer_login").contains("viewer_login_core(None, GH_TIMEOUT)"));
+        assert!(body("current_login")
+            .contains("viewer_login_core(Some(repo_path), GH_NETWORK_TIMEOUT)"));
+        assert!(body("gh_pr_comments_paginated")
+            .contains("viewer_login_core(Some(repo_path), GH_TIMEOUT)"));
+        let fresh = body("gh_viewer_login_fresh");
+        assert!(fresh.contains("run_gh(None,"));
+        assert!(!fresh.contains("viewer_login_core"));
+        let fork = wiring_body(include_str!("../forge/github.rs"), "fork_repo");
+        assert!(fork.contains("gh_viewer_login_fresh().await?"));
+    }
+
+    #[test]
+    fn stack_evictions_follow_every_write_attempt() {
+        crate::github::repo_meta::tests::assert_stack_eviction_wiring();
+    }
+
+    fn stack_fixture() -> super::StackMemberships {
+        std::collections::HashMap::from([(
+            21,
+            PrStackInfo {
+                id: "22".into(),
+                position: 1,
+                size: 2,
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn stack_memo_caches_answered_empty_but_never_failed_probes() {
+        use super::{stack_memberships_with, stack_memo_key, StackMemo, STACK_MEMO_TTL};
+        let memo = StackMemo::default();
+        let epoch = std::sync::atomic::AtomicU64::new(7);
+        let key = stack_memo_key("repo", "Owner/Repo");
+        assert!(
+            stack_memberships_with(&memo, key.clone(), &epoch, STACK_MEMO_TTL, async { None })
+                .await
+                .is_none()
+        );
+        assert!(
+            memo.inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .is_empty(),
+            "a failed probe must not become Some(empty)"
+        );
+        assert!(
+            stack_memberships_with(&memo, key.clone(), &epoch, STACK_MEMO_TTL, async {
+                Some(std::collections::HashMap::new())
+            })
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            stack_memberships_with(&memo, key, &epoch, STACK_MEMO_TTL, async {
+                panic!("an answered empty map must be cached")
+            })
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stack_memo_keys_ttl_and_epoch_gate_memberships() {
+        use super::{
+            stack_memo_get, stack_memo_key, stack_memo_put, StackFetchStamp, StackMemo,
+            STACK_MEMO_TTL,
+        };
+        let memo = StackMemo::default();
+        let mut state = memo.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        let key = stack_memo_key("repo", "Owner/Repo");
+        let before = StackFetchStamp {
+            epoch: 7,
+            generation: 0,
+        };
+        stack_memo_put(
+            &mut state,
+            key.clone(),
+            Some(&stack_fixture()),
+            before,
+            7,
+            now,
+        );
+        let folded = stack_memo_key("repo", "OWNER/REPO");
+        let hit = stack_memo_get(&state, &folded, 7, STACK_MEMO_TTL, now).unwrap();
+        assert_eq!(hit[&21].id, "22");
+        assert!(
+            stack_memo_get(&state, &key, 8, STACK_MEMO_TTL, now).is_none(),
+            "a moved epoch must miss"
+        );
+        assert!(
+            stack_memo_get(&state, &key, 7, STACK_MEMO_TTL, now + STACK_MEMO_TTL).is_none(),
+            "the TTL boundary must miss"
+        );
+        for key in [
+            stack_memo_key("other", "owner/repo"),
+            stack_memo_key("repo", "owner/other"),
+        ] {
+            assert!(stack_memo_get(&state, &key, 7, STACK_MEMO_TTL, now).is_none());
+        }
+    }
+
+    #[test]
+    fn stack_memo_cap_keeps_all_but_the_oldest_entry() {
+        use super::{
+            stack_memo_get, stack_memo_key, stack_memo_put, StackFetchStamp, StackMemo,
+            STACK_MEMO_TTL,
+        };
+        let memo = StackMemo::default();
+        let mut state = memo.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        let before = StackFetchStamp {
+            epoch: 7,
+            generation: 0,
+        };
+        for n in 0..65 {
+            let key = stack_memo_key("repo", &format!("owner/repo{n}"));
+            let fetched = now + std::time::Duration::from_millis(n);
+            stack_memo_put(&mut state, key, Some(&stack_fixture()), before, 7, fetched);
+        }
+        let read_at = now + std::time::Duration::from_millis(65);
+        let oldest = stack_memo_key("repo", "owner/repo0");
+        assert!(stack_memo_get(&state, &oldest, 7, STACK_MEMO_TTL, read_at).is_none());
+        for n in 1..65 {
+            let key = stack_memo_key("repo", &format!("owner/repo{n}"));
+            assert!(
+                stack_memo_get(&state, &key, 7, STACK_MEMO_TTL, read_at).is_some(),
+                "remaining key {n} must serve"
+            );
+        }
+        let key = stack_memo_key("repo", "owner/repo1");
+        let before = StackFetchStamp {
+            epoch: 8,
+            generation: 0,
+        };
+        stack_memo_put(
+            &mut state,
+            key.clone(),
+            Some(&stack_fixture()),
+            before,
+            8,
+            read_at,
+        );
+        assert_eq!(state.entries.len(), 64);
+        assert!(stack_memo_get(&state, &key, 8, STACK_MEMO_TTL, read_at).is_some());
+        assert!(state
+            .entries
+            .contains_key(&stack_memo_key("repo", "owner/repo2")));
+    }
+
+    #[tokio::test]
+    async fn stack_memo_eviction_beats_an_in_flight_fill() {
+        use super::{
+            stack_memberships_with, stack_memo_invalidate, stack_memo_key, StackMemo,
+            STACK_MEMO_TTL,
+        };
+        let memo = StackMemo::default();
+        let epoch = std::sync::atomic::AtomicU64::new(7);
+        let result = stack_memberships_with(
+            &memo,
+            stack_memo_key("repo", "owner/repo"),
+            &epoch,
+            STACK_MEMO_TTL,
+            async {
+                stack_memo_invalidate(
+                    &mut memo.inner.lock().unwrap_or_else(|p| p.into_inner()),
+                    "OWNER/REPO",
+                );
+                Some(stack_fixture())
+            },
+        )
+        .await;
+        assert!(result.is_some());
+        let state = memo.inner.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(state.entries.is_empty(), "eviction must beat the late fill");
+        assert_eq!(state.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn stack_memo_account_change_drops_the_old_epoch_fill() {
+        use super::{stack_memberships_with, stack_memo_key, StackMemo, STACK_MEMO_TTL};
+        let memo = StackMemo::default();
+        let epoch = std::sync::atomic::AtomicU64::new(7);
+        let result = stack_memberships_with(
+            &memo,
+            stack_memo_key("repo", "owner/repo"),
+            &epoch,
+            STACK_MEMO_TTL,
+            async {
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(stack_fixture())
+            },
+        )
+        .await;
+        assert!(result.is_some());
+        assert!(
+            memo.inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .is_empty(),
+            "an account change must discard the fill"
+        );
     }
 
     #[test]
@@ -7551,6 +8421,7 @@ mod tests {
             patch: patch.map(str::to_string),
             additions: 0,
             deletions: 0,
+            sha: String::new(),
         }
     }
 
@@ -8353,8 +9224,8 @@ mod tests {
     /// The list join's tri-state. A FAILED probe must mark every row unknown: an
     /// absent badge would otherwise read as a firm "not stacked" and let a caller
     /// stack rows that already are.
-    #[test]
-    fn stack_join_marks_every_row_unknown_only_when_the_probe_failed() {
+    #[tokio::test]
+    async fn stack_join_marks_every_row_unknown_only_when_the_probe_failed() {
         fn rows() -> Vec<PrInfo> {
             vec![pr_row(21), pr_row(23)]
         }
@@ -8387,6 +9258,26 @@ mod tests {
         assert_eq!(joined[0].stack.as_ref().unwrap().id, "22");
         assert!(joined[1].stack.is_none());
         assert!(joined.iter().all(|p| !p.stack_unknown));
+
+        let memo = super::StackMemo::default();
+        let epoch = std::sync::atomic::AtomicU64::new(7);
+        let key = super::stack_memo_key("repo", "owner/repo");
+        super::stack_memberships_with(&memo, key.clone(), &epoch, super::STACK_MEMO_TTL, async {
+            Some(stack_fixture())
+        })
+        .await
+        .unwrap();
+        let failed_refresh =
+            super::stack_memberships_with(&memo, key, &epoch, std::time::Duration::ZERO, async {
+                None
+            })
+            .await;
+        let mut expired = rows();
+        apply_stack_join(&mut expired, failed_refresh.as_ref());
+        assert!(
+            expired.iter().all(|pr| pr.stack_unknown),
+            "an expired entry followed by failure stays unknown"
+        );
     }
 
     /// The detail probe's hop-2 tri-state. A FAILED member fetch must flag the
@@ -9555,6 +10446,19 @@ mod tests {
     }
 
     #[test]
+    fn gh_pr_file_tolerates_explicit_nulls() {
+        let page: Vec<GhPrFile> = serde_json::from_str(
+            r#"[{"filename":"a","status":"added","sha":null,"additions":null,"deletions":null},{"filename":"b","status":"modified","sha":"abc","additions":2,"deletions":1}]"#,
+        )
+        .expect("a page with null fields still parses");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].sha, "");
+        assert_eq!((page[0].additions, page[0].deletions), (0, 0));
+        assert_eq!(page[1].filename, "b");
+        assert_eq!(page[1].sha, "abc");
+    }
+
+    #[test]
     fn reconstructs_modified_file() {
         let out = reconstruct_pr_diff(&[file(
             "modified",
@@ -9632,7 +10536,138 @@ mod tests {
         assert!(out.contains("diff --git a/old3.txt \"b/\\\"escaped\\\".txt\"\n"));
         assert!(out.contains("rename from old3.txt\n"));
         assert!(out.contains("rename to \"\\\"escaped\\\".txt\"\n"));
+        // A patch-less 0/0 rename is header-only, as git writes it.
+        assert!(!out.contains("Binary files"));
+    }
+
+    #[test]
+    fn quotes_the_marker_of_a_renamed_file_with_counts() {
+        let mut f = file("renamed", "\"escaped\".txt", None);
+        f.previous_filename = Some("old3.txt".to_string());
+        f.additions = 1;
+        let out = reconstruct_pr_diff(&[f]);
+        assert!(out.contains("rename to \"\\\"escaped\\\".txt\"\n"));
         assert!(out.contains("Binary files a/old3.txt and \"b/\\\"escaped\\\".txt\" differ\n"));
+    }
+
+    // The fallback literals below are shared verbatim with
+    // scripts/forge-diff-headers.test.mjs, which classifies them; keep both in step.
+
+    #[test]
+    fn a_patchless_pure_rename_is_header_only() {
+        let mut f = file("renamed", "docs/new-name.md", Some(""));
+        f.previous_filename = Some("docs/old.md".to_string());
+        let out = reconstruct_pr_diff(&[f]);
+        assert_eq!(
+            out,
+            "diff --git a/docs/old.md b/docs/new-name.md\n\
+             rename from docs/old.md\n\
+             rename to docs/new-name.md\n",
+        );
+        assert!(!out.contains("Binary files"));
+    }
+
+    #[test]
+    fn a_patchless_copy_names_its_source() {
+        let mut f = file("copied", "lib/copy.rs", None);
+        f.previous_filename = Some("lib/orig.rs".to_string());
+        let out = reconstruct_pr_diff(&[f]);
+        assert_eq!(
+            out,
+            "diff --git a/lib/orig.rs b/lib/copy.rs\n\
+             copy from lib/orig.rs\n\
+             copy to lib/copy.rs\n",
+        );
+        // A copy with a patch keeps the source on its a/ side too.
+        let mut f = file("copied", "lib/copy.rs", Some("@@ -1 +1 @@\n-a\n+b\n"));
+        f.previous_filename = Some("lib/orig.rs".to_string());
+        f.additions = 1;
+        f.deletions = 1;
+        let out = reconstruct_pr_diff(&[f]);
+        assert!(out.contains("copy from lib/orig.rs\ncopy to lib/copy.rs\n--- a/lib/orig.rs\n"));
+    }
+
+    #[test]
+    fn a_rename_or_copy_without_a_usable_pair_keeps_the_marker() {
+        for status in ["renamed", "copied"] {
+            let out = reconstruct_pr_diff(&[file(status, "same.txt", None)]);
+            assert_eq!(
+                out,
+                "diff --git a/same.txt b/same.txt\n\
+                 Binary files a/same.txt and b/same.txt differ\n",
+                "{status}",
+            );
+            let mut f = file(status, "same.txt", None);
+            f.previous_filename = Some("same.txt".to_string());
+            assert!(
+                reconstruct_pr_diff(&[f]).contains("Binary files "),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_added_or_removed_file_is_header_only() {
+        let mut added = file("added", ".gitkeep", None);
+        added.sha = EMPTY_BLOB_SHA.to_string();
+        let mut removed = file("removed", "old/.gitkeep", Some(""));
+        removed.sha = EMPTY_BLOB_SHA.to_string();
+        let out = reconstruct_pr_diff(&[added, removed]);
+        assert_eq!(
+            out,
+            "diff --git a/.gitkeep b/.gitkeep\n\
+             new file mode 100644\n\
+             diff --git a/old/.gitkeep b/old/.gitkeep\n\
+             deleted file mode 100644\n",
+        );
+        assert!(!out.contains("Binary files"));
+    }
+
+    #[test]
+    fn a_patchless_file_without_the_empty_blob_keeps_the_marker() {
+        // A real blob id or a missing sha: binary or too large, never claimed empty.
+        for sha in ["", "4b763df1c9b6ec2a0d31a0fbbf8a1fa1e7f9a2b3"] {
+            let mut added = file("added", "logo.png", None);
+            added.sha = sha.to_string();
+            let mut removed = file("removed", "old.png", None);
+            removed.sha = sha.to_string();
+            let out = reconstruct_pr_diff(&[added, removed]);
+            assert!(out.contains("Binary files /dev/null and b/logo.png differ\n"));
+            assert!(out.contains("Binary files a/old.png and /dev/null differ\n"));
+        }
+        // Counts with the empty blob's id are contradictory: keep the marker.
+        let mut big = file("added", "big.txt", None);
+        big.sha = EMPTY_BLOB_SHA.to_string();
+        big.additions = 5;
+        assert!(reconstruct_pr_diff(&[big]).contains("Binary files "));
+        // A type change or mode-only change carries no evidence either way.
+        let mut changed = file("changed", "link", None);
+        changed.sha = EMPTY_BLOB_SHA.to_string();
+        assert!(reconstruct_pr_diff(&[changed]).contains("Binary files a/link and b/link differ\n"));
+    }
+
+    #[test]
+    fn header_only_sections_keep_hostile_names_quoted() {
+        let forged = "evil\n+++ b/ok.txt\ndiff --git a/ok.txt b/ok.txt";
+        let quoted = "evil\\n+++ b/ok.txt\\ndiff --git a/ok.txt b/ok.txt";
+        let mut renamed = file("renamed", forged, None);
+        renamed.previous_filename = Some("src/mixed\rname.txt".to_string());
+        let mut added = file("added", forged, None);
+        added.sha = EMPTY_BLOB_SHA.to_string();
+        let out = reconstruct_pr_diff(&[renamed, added]);
+        assert!(out.starts_with(&format!(
+            "diff --git \"a/src/mixed\\rname.txt\" \"b/{quoted}\"\n\
+             rename from \"src/mixed\\rname.txt\"\n\
+             rename to \"{quoted}\"\n\
+             diff --git \"a/{quoted}\" \"b/{quoted}\"\n\
+             new file mode 100644\n"
+        )));
+        assert!(!out.contains('\r'));
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("diff --git ")).count(),
+            2
+        );
+        assert_eq!(out.lines().filter(|l| l.starts_with("+++ ")).count(), 0);
     }
 
     #[test]
@@ -9678,7 +10713,7 @@ mod tests {
         assert!(out.contains(&format!("diff --git \"a/{quoted}\" \"b/{quoted}\"\n")));
         assert!(out.contains(&format!("+++ \"b/{quoted}\"\n")));
         assert!(out.contains(&format!(
-            "Binary files \"a/{quoted}\" and \"b/{quoted}\" differ\n"
+            "Binary files \"a/{quoted}\" and /dev/null differ\n"
         )));
         // Two files in, two sections and one +++ line out: nothing in the name broke a line.
         assert_eq!(
@@ -11494,6 +12529,32 @@ github.acme.com
                 matches!(err, AppError::InvalidArgument(_)),
                 "expected InvalidArgument, got {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn escape_head_branch_path_escapes_url_reserved_characters() {
+        for (branch, expected) in [
+            ("feat#2", "feat%232"),
+            ("100%done", "100%25done"),
+            ("v%23", "v%2523"),
+            ("a#b%c", "a%23b%25c"),
+        ] {
+            assert_eq!(escape_head_branch_path(branch), Some(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn escape_head_branch_path_keeps_slashes_and_plain_names() {
+        for branch in ["release/1.0", "master", "feature/caf\u{e9}"] {
+            assert_eq!(escape_head_branch_path(branch), Some(branch.to_string()));
+        }
+    }
+
+    #[test]
+    fn escape_head_branch_path_refuses_braced_names() {
+        for branch in ["{branch}", "{owner}", "feat{x", "x}"] {
+            assert_eq!(escape_head_branch_path(branch), None);
         }
     }
 

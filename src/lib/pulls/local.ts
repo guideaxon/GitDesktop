@@ -8,6 +8,7 @@ import {
   memoizedStoreLoader,
   reloadToleratingEmptyStore,
 } from "@/lib/plugin-store";
+import { writeWithRollback } from "@/lib/plugin-store-rollback";
 
 export interface LocalPrComment {
   id: string;
@@ -75,10 +76,10 @@ const STORE_FILE = "local-prs.json";
 const getStore = memoizedStoreLoader(STORE_FILE);
 
 // Serialize every read-modify-write on this store (and the reconcile reload) through
-// one in-process queue: autoSave persists on a ~100ms debounce, so two overlapping
-// mutations would both reload the same pre-flush disk snapshot and the later would
-// drop the earlier's change (e.g. the reconcile hook marking several PRs in a parallel
-// forEach). With the force-save in writeAll, each reload sees a current snapshot.
+// one in-process queue: two overlapping mutations would both reload the same disk
+// snapshot before either saves, and the later would drop the earlier's change (e.g.
+// the reconcile hook marking several PRs in a parallel forEach). With the force-save
+// in writeAll (autosave is off for this store), each reload sees a current snapshot.
 // Other writers (a second app instance, the MCP server) are kept out of the
 // reload→save window by the cross-instance store lock each mutation takes.
 let opChain: Promise<unknown> = Promise.resolve();
@@ -95,7 +96,7 @@ async function reloadRaw(): Promise<void> {
 
 /** Re-read `local-prs.json` from disk into the in-memory store. The MCP server
  *  (with `--allow-write`) can mutate this file externally; without a reload the
- *  autoSave store would clobber those writes on the next GUI mutation.
+ *  next GUI mutation's save would clobber those writes.
  *  `ignoreDefaults` fully matches the store to disk (so external deletes drop).
  *  Serialized so it can't land between another mutation's set and its flush. */
 export async function reloadLocalPrs(): Promise<void> {
@@ -140,8 +141,8 @@ async function readByKey(key: string): Promise<LocalPr[]> {
 async function writeAll(key: string, prs: LocalPr[]): Promise<void> {
   const store = await getStore();
   await store.set(key, prs);
-  // Flush now instead of on autoSave's debounce, so the next serialized reload can't
-  // re-read a pre-write disk snapshot and drop this change.
+  // Autosave is off for this store, so only this save persists the change;
+  // the next serialized reload reads it back, not a pre-write snapshot.
   await store.save();
 }
 
@@ -154,22 +155,25 @@ export async function createLocalPr(
     return withAppStoreLock(STORE_FILE, async () => {
       // Fresh disk state first, so we don't drop a concurrent external MCP write.
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const pr: LocalPr = {
-        id: crypto.randomUUID(),
-        title: input.title,
-        body: input.body,
-        base: input.base,
-        head: input.head,
-        status: "open",
-        approved: false,
-        labels: [],
-        comments: [],
-        createdAt: new Date().toISOString(),
-      };
-      const all = await readByKey(key);
-      await writeAll(key, [pr, ...all]);
-      return pr;
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const pr: LocalPr = {
+          id: crypto.randomUUID(),
+          title: input.title,
+          body: input.body,
+          base: input.base,
+          head: input.head,
+          status: "open",
+          approved: false,
+          labels: [],
+          comments: [],
+          createdAt: new Date().toISOString(),
+        };
+        const all = await readByKey(key);
+        await writeAll(key, [pr, ...all]);
+        return pr;
+      });
     });
   });
 }
@@ -188,17 +192,20 @@ export async function updateLocalPr(
     const identity = await repoIdentity(repo);
     return withAppStoreLock(STORE_FILE, async () => {
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const all = await readByKey(key);
-      const idx = all.findIndex((p) => p.id === id);
-      if (idx === -1)
-        throw new Error(
-          `no local PR with id ${id} — it may have been deleted or belong to a different repository`,
-        );
-      const next = [...all];
-      next[idx] = mutate(all[idx]);
-      await writeAll(key, next);
-      return next[idx];
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const all = await readByKey(key);
+        const idx = all.findIndex((p) => p.id === id);
+        if (idx === -1)
+          throw new Error(
+            `no local PR with id ${id} — it may have been deleted or belong to a different repository`,
+          );
+        const next = [...all];
+        next[idx] = mutate(all[idx]);
+        await writeAll(key, next);
+        return next[idx];
+      });
     });
   });
 }
@@ -209,12 +216,15 @@ export async function deleteLocalPr(repo: string, id: string): Promise<void> {
     await withAppStoreLock(STORE_FILE, async () => {
       // Fresh disk state first, so we don't drop a concurrent external MCP write.
       await reloadRaw();
-      const key = await keyFor(repo, identity);
-      const all = await readByKey(key);
-      await writeAll(
-        key,
-        all.filter((p) => p.id !== id),
-      );
+      const store = await getStore();
+      return writeWithRollback(store, async () => {
+        const key = await keyFor(repo, identity);
+        const all = await readByKey(key);
+        await writeAll(
+          key,
+          all.filter((p) => p.id !== id),
+        );
+      });
     });
   });
 }

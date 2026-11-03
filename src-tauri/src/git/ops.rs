@@ -9,12 +9,12 @@ use crate::git::diff::parse_numstat_z;
 use crate::git::history::validate_hash;
 use crate::git::ignored_guard::{self, ignored_files_in_the_way};
 use crate::git::runner::{
-    acquire_repo_lock, run_git, run_git_mutating, run_git_mutating_raw, run_git_raw,
+    acquire_repo_lock, holder_label, run_git, run_git_mutating, run_git_mutating_raw, run_git_raw,
     run_git_raw_env, run_git_raw_index_retry, run_git_raw_input, run_git_worktree_admin,
-    DEFAULT_TIMEOUT, LOCK_WAIT_TIMEOUT, NETWORK_LOCK_WAIT_TIMEOUT, NETWORK_TIMEOUT,
+    subcommand_of, DEFAULT_TIMEOUT, LOCK_WAIT_TIMEOUT, NETWORK_LOCK_WAIT_TIMEOUT, NETWORK_TIMEOUT,
     WORKTREE_OP_TIMEOUT,
 };
-use crate::git::types::{FileDiff, RepoOpState, RewriteStep, StashEntry, TagInfo};
+use crate::git::types::{FileDiff, RebaseStop, RepoOpState, RewriteStep, StashEntry, TagInfo};
 use crate::state::AppState;
 
 /// Refuses when the working tree has **tracked** changes (staged or unstaged).
@@ -247,24 +247,38 @@ pub(crate) fn rebase_marker_present(repo: &str) -> bool {
     })
 }
 
-/// True when an interactive rebase is paused at an `edit` instruction (the last
-/// executed todo line is `edit`/`e`), as opposed to a conflict. git writes
-/// `rebase-merge/amend` only at a completed edit stop: an `edit` line that itself
-/// failed (a held index.lock, a conflict) leaves the same `done` without it.
+/// Whether a rebase reached an amendable edit pause, rather than a failed edit pick.
 fn rebase_stopped_for_edit(git_dir: &Path) -> bool {
-    if !git_dir.join("rebase-merge/amend").exists() {
-        return false;
+    rebase_stop_kind(git_dir) == Some(RebaseStop::Edit)
+}
+
+/// Git records the in-flight instruction last; trailing blank lines carry no state.
+/// Returns the verb and optional first operand of the last non-blank done line.
+fn last_rebase_instruction(done: &str) -> Option<(&str, Option<&str>)> {
+    let mut tokens = done
+        .lines()
+        .rfind(|l| !l.trim().is_empty())?
+        .split_whitespace();
+    Some((tokens.next()?, tokens.next()))
+}
+
+/// Unreadable or unrecognized rebase state yields `RebaseStop::Other`, never a guessed kind.
+/// For an edit line, git writes `rebase-merge/amend` only once its pick succeeds;
+/// a failed edit pick is in `done` but lacks it. Failed folds also write `amend`,
+/// which `empty_fold_stop` relies on.
+fn rebase_stop_kind(git_dir: &Path) -> Option<RebaseStop> {
+    if !rebase_in_progress(git_dir) {
+        return None;
     }
-    let Ok(done) = std::fs::read_to_string(git_dir.join("rebase-merge/done")) else {
-        return false;
-    };
-    done.lines()
-        .rfind(|l| !l.trim().is_empty())
-        .map(|last| {
-            let cmd = last.split_whitespace().next().unwrap_or("");
-            cmd == "edit" || cmd == "e"
-        })
-        .unwrap_or(false)
+    let done = std::fs::read_to_string(git_dir.join("rebase-merge/done")).unwrap_or_default();
+    Some(match last_rebase_instruction(&done).map(|(verb, _)| verb) {
+        Some("edit" | "e") if git_dir.join("rebase-merge/amend").exists() => RebaseStop::Edit,
+        Some("edit" | "e") => RebaseStop::Pick,
+        Some(v) if is_fold(v) || matches!(v, "pick" | "p" | "reword" | "r") => RebaseStop::Pick,
+        Some("exec" | "x") => RebaseStop::Exec,
+        Some("break" | "b") => RebaseStop::Break,
+        _ => RebaseStop::Other,
+    })
 }
 
 /// Which verb a pending `.git/sequencer` is replaying: `Some(true)` for revert,
@@ -305,6 +319,7 @@ pub(crate) async fn op_state(repo_path: &str) -> AppResult<RepoOpState> {
         cherry_picking: false,
         reverting: false,
         edit_paused: false,
+        rebase_stop: None,
     };
     // An unresolvable git dir reads as "nothing in flight", NEVER an error:
     // `op_in_progress` maps `Err` to true, so failing here would fail-close every
@@ -315,7 +330,12 @@ pub(crate) async fn op_state(repo_path: &str) -> AppResult<RepoOpState> {
     let exists = |name: &str| git_dir.join(name).exists();
 
     let rebasing = exists("rebase-merge") || exists("rebase-apply");
-    let edit_paused = rebasing && rebase_stopped_for_edit(&git_dir);
+    let rebase_stop = if rebasing {
+        rebase_stop_kind(&git_dir)
+    } else {
+        None
+    };
+    let edit_paused = rebase_stop == Some(RebaseStop::Edit);
     let cherry_head = exists("CHERRY_PICK_HEAD");
     let revert_head = exists("REVERT_HEAD");
     // The sequencer only decides the verb when neither head marker names it —
@@ -332,6 +352,7 @@ pub(crate) async fn op_state(repo_path: &str) -> AppResult<RepoOpState> {
         cherry_picking: cherry_head || sequencer == Some(false),
         reverting: revert_head || sequencer == Some(true),
         edit_paused,
+        rebase_stop,
     })
 }
 
@@ -340,6 +361,157 @@ pub(crate) async fn op_state(repo_path: &str) -> AppResult<RepoOpState> {
 pub(crate) async fn has_unmerged(repo: &str) -> AppResult<bool> {
     let out = run_git(Some(repo), &["ls-files", "--unmerged"], DEFAULT_TIMEOUT).await?;
     Ok(!out.stdout_lossy().trim().is_empty())
+}
+
+fn is_fold(verb: &str) -> bool {
+    matches!(verb, "fixup" | "f" | "squash" | "s")
+}
+
+// Git's refusal (measured on 2.51.1) needs runner-pinned LC_ALL=C; wording/env drift disables recovery, leaving git's stop.
+const EMPTY_FOLD_REFUSAL: &str =
+    "You asked to amend the most recent commit, but doing so would make\nit empty.";
+
+/// A consumed intermediate fold needs a remaining chain fold non-empty against its own parent.
+/// Unreadable state or failed probes leave git's original refusal untouched.
+/// Returns git's own message file for the recovery amend and the remaining todo-line
+/// count, which `recover_empty_folds` requires to shrink on every pass.
+async fn empty_fold_stop(git_dir: &Path, repo: &str, failure: &str) -> Option<(String, usize)> {
+    if !rebase_in_progress(git_dir)
+        || !failure.contains(EMPTY_FOLD_REFUSAL)
+        || has_unmerged(repo).await.ok()?
+    {
+        return None;
+    }
+    let merge = git_dir.join("rebase-merge");
+    let done = std::fs::read_to_string(merge.join("done")).ok()?;
+    let (verb, stopped) = last_rebase_instruction(&done)?;
+    let stopped = stopped?;
+    if !is_fold(verb) || validate_hash(stopped).is_err() {
+        return None;
+    }
+    let stopped_sha = std::fs::read_to_string(merge.join("stopped-sha")).ok()?;
+    let stopped_sha = stopped_sha.trim();
+    if validate_hash(stopped_sha).is_err()
+        || !(stopped_sha.starts_with(stopped) || stopped.starts_with(stopped_sha))
+    {
+        return None;
+    }
+    let amend = std::fs::read_to_string(merge.join("amend")).ok()?;
+    let head = run_git(Some(repo), &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+        .await
+        .ok()?;
+    if head.stdout_lossy().trim() != amend.trim() {
+        return None;
+    }
+    let todo = std::fs::read_to_string(merge.join("git-rebase-todo")).ok()?;
+    let lines: Vec<_> = todo
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let mut first = lines.first()?.split_whitespace();
+    if !is_fold(first.next()?) {
+        return None;
+    }
+    let next = first.next()?;
+    if stopped.starts_with(next)
+        || next.starts_with(stopped)
+        || stopped_sha.starts_with(next)
+        || next.starts_with(stopped_sha)
+    {
+        return None;
+    }
+    let mut non_empty = false;
+    for line in &lines {
+        let mut tokens = line.split_whitespace();
+        if !is_fold(tokens.next()?) {
+            break;
+        }
+        let fold = tokens.next()?;
+        validate_hash(fold).ok()?;
+        let diff = run_git_raw(
+            Some(repo),
+            &["diff-tree", "--quiet", &format!("{fold}^"), fold],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .ok()?;
+        match diff.code {
+            0 => {}
+            1 => {
+                non_empty = true;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if !non_empty {
+        return None;
+    }
+    let fixups = std::fs::read_to_string(merge.join("current-fixups")).ok()?;
+    let squash = fixups
+        .lines()
+        .any(|l| matches!(l.split_whitespace().next(), Some("squash" | "s")));
+    let message = merge.join(if squash {
+        "message-squash"
+    } else {
+        "message-fixup"
+    });
+    std::fs::read_to_string(&message).ok()?;
+    Some((message.to_str()?.to_string(), lines.len()))
+}
+
+/// Callers hold the working-tree domain across the probe and every runner call.
+/// A failed rescue keeps the prior error.
+async fn recover_empty_folds<F, Fut>(
+    repo: &str,
+    git_dir: &Path,
+    mut resumed: AppResult<crate::git::runner::GitOutput>,
+    continue_args: &[&str],
+    continue_timeout: std::time::Duration,
+    run: F,
+) -> AppResult<crate::git::runner::GitOutput>
+where
+    F: Fn(Vec<String>, std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = AppResult<crate::git::runner::GitOutput>>,
+{
+    let mut previous = usize::MAX;
+    for _ in 0..128 {
+        let Ok(out) = &resumed else { break };
+        if out.code == 0 {
+            break;
+        }
+        let Some((message, remaining)) =
+            empty_fold_stop(git_dir, repo, &out.full_failure_text()).await
+        else {
+            break;
+        };
+        if remaining >= previous {
+            break;
+        }
+        previous = remaining;
+        let args = [
+            "commit",
+            "--amend",
+            "--allow-empty",
+            "--no-verify",
+            "--no-post-rewrite",
+            "--cleanup=strip",
+            "-F",
+            &message,
+        ]
+        .map(str::to_string)
+        .to_vec();
+        if !matches!(run(args, DEFAULT_TIMEOUT).await, Ok(out) if out.code == 0) {
+            break;
+        }
+        resumed = run(
+            continue_args.iter().map(|a| (*a).to_string()).collect(),
+            continue_timeout,
+        )
+        .await;
+    }
+    resumed
 }
 
 /// The branch state `git reset` clears once it moves HEAD, both `--hard` and `--soft`
@@ -576,6 +748,7 @@ pub(crate) async fn op_abort(state: &AppState, repo_path: &str, op: &str) -> App
 /// Finishes an in-progress operation once every conflict is resolved and
 /// staged. A merge concludes with its commit; rebase/cherry-pick/revert continue
 /// with `core.editor=true` so git never tries to open an editor.
+/// Empty-fold recovery applies to any rebase continued here, terminal-started included.
 ///
 /// `false` means the pending cherry-pick was dropped as empty instead of
 /// committed (the resolution left nothing to commit); `true` that the operation
@@ -591,7 +764,8 @@ pub async fn git_op_continue(
 }
 
 /// Testable core of [`git_op_continue`] — takes a plain `&AppState` so real-repo
-/// tokio tests can drive it. Same `bool` contract.
+/// tokio tests can drive it. Same `bool` contract. One working-tree hold covers
+/// continuation, recovery/skip, classification, and journal close.
 pub(crate) async fn op_continue(state: &AppState, repo_path: &str, op: &str) -> AppResult<bool> {
     validate_op(op)?;
     let args: Vec<&str> = match op {
@@ -601,10 +775,40 @@ pub(crate) async fn op_continue(state: &AppState, repo_path: &str, op: &str) -> 
         "merge" => vec!["commit", "--no-edit", "--cleanup=strip"],
         other => vec!["-c", "core.editor=true", other, "--continue"],
     };
+    // Only lock-free runners inside this compound, including recovery probes.
+    let domain = state.working_tree_lock(repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
+    )
+    .await?;
     // Raw: a `--continue` refused over unresolved paths reports `<path>: needs
     // merge` on STDOUT with stderr empty (measured, git 2.51.1), which a
     // stderr-only error renders as "git exited with code 1".
-    let out = run_git_mutating_raw(state, repo_path, &args, DEFAULT_TIMEOUT).await?;
+    let out = run_git_raw_index_retry(repo_path, &args, DEFAULT_TIMEOUT).await?;
+    let out = if op == "rebase" && out.code != 0 {
+        // This includes terminal-started rebases continued here: git's own advice
+        // for this stop is the same commit-and-continue recovery.
+        if let Some(git_dir) = absolute_git_dir(repo_path).await {
+            recover_empty_folds(
+                repo_path,
+                &git_dir,
+                Ok(out),
+                &args,
+                DEFAULT_TIMEOUT,
+                |args, timeout| async move {
+                    let args: Vec<_> = args.iter().map(String::as_str).collect();
+                    run_git_raw_index_retry(repo_path, &args, timeout).await
+                },
+            )
+            .await?
+        } else {
+            out
+        }
+    } else {
+        out
+    };
     if out.code != 0 {
         // A resolution that keeps the target's side leaves the pick with nothing to
         // commit: `--continue` then exits 1 asking for `--skip`, on stderr, with
@@ -615,13 +819,9 @@ pub(crate) async fn op_continue(state: &AppState, repo_path: &str, op: &str) -> 
         if op == "cherry-pick"
             && (out.stderr.contains("is now empty") || out.stderr.contains("--allow-empty"))
         {
-            let skip = run_git_mutating_raw(
-                state,
-                repo_path,
-                &["cherry-pick", "--skip"],
-                DEFAULT_TIMEOUT,
-            )
-            .await?;
+            let skip =
+                run_git_raw_index_retry(repo_path, &["cherry-pick", "--skip"], DEFAULT_TIMEOUT)
+                    .await?;
             if skip.code == 0 {
                 // The skip ended the pick just as a commit would, so the journal's
                 // paused record closes here too.
@@ -669,6 +869,16 @@ pub(crate) async fn op_continue(state: &AppState, repo_path: &str, op: &str) -> 
 /// removal is `git_discard_paths`' recycle-bin path).
 #[tauri::command]
 pub async fn git_discard_untracked_lines(
+    state: State<'_, AppState>,
+    repo_path: String,
+    path: String,
+    lines: Vec<u32>,
+) -> AppResult<()> {
+    git_discard_untracked_lines_core(&state, repo_path, path, lines).await
+}
+
+pub(crate) async fn git_discard_untracked_lines_core(
+    state: &AppState,
     repo_path: String,
     path: String,
     lines: Vec<u32>,
@@ -676,8 +886,24 @@ pub async fn git_discard_untracked_lines(
     if lines.is_empty() {
         return Err(AppError::InvalidArgument("no lines selected".into()));
     }
-    let full = Path::new(&repo_path).join(&path);
+    let rel = discard_rel_path(&path).map_err(|why| line_discard_refusal(&path, why))?;
+    // Status and rewrite share one hold; lock-free runners avoid re-acquiring it.
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a discard").await?;
+    let top = crate::git::runner::worktree_toplevel(&repo_path).await?;
+    let listed = untracked_paths(&top).await?;
+    if !listed.contains(&rel) {
+        return Err(line_discard_refusal(&path, DISCARD_NOT_NEW));
+    }
     tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
+        if linked_component(&top, &rel, true)? {
+            return Err(line_discard_refusal(&path, DISCARD_LINKED));
+        }
+        let full = Path::new(&top).join(&rel);
+        #[cfg(windows)]
+        let full = crate::fsops::verbatim_path(&full).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no verbatim form")
+        })?;
         let content = std::fs::read_to_string(&full)?;
         let drop: std::collections::HashSet<u32> = lines.into_iter().collect();
         std::fs::write(&full, remove_lines(&content, &drop))?;
@@ -718,9 +944,8 @@ fn remove_lines(content: &str, drop: &std::collections::HashSet<u32>) -> String 
 /// checks and a rewrite that has no stash and no reflog to recover from. The hold
 /// is why the reset runs on the lock-free runners: `run_git_mutating` re-acquires
 /// the same non-reentrant mutex and deadlocks, so its one-shot index.lock retry rides
-/// `run_git_raw_index_retry` instead. The `--mixed` arm keeps `run_git_mutating`: it
-/// has no guards to protect, so there is no check-then-act window and the retry is
-/// worth more than a hold.
+/// `run_git_raw_index_retry` instead. The `--mixed` arm holds the same lock across
+/// its pin checks and reset, using that lock-free runner too.
 ///
 /// The hold's reach ends at this process, as `run_git_mutating`'s own doc says: a
 /// separate MCP-server process holds its own lock, and no lock constrains a
@@ -743,15 +968,16 @@ pub async fn git_reset(
     git_reset_core_expecting(&state, repo_path, hash, mode, expected_head, expected_ref).await
 }
 
-/// The refusal a hard reset gets when HEAD is no longer the tip the user confirmed.
+/// The refusal a reset gets when HEAD is no longer the tip the user confirmed.
 /// KEEP IN STEP: one wording family with branches.rs's ref-move refusal and
 /// commit.rs's `UNDO_HEAD_MOVED` ("… — nothing was <verb>.").
 const RESET_HEAD_MOVED: &str = "The branch changed since you confirmed — nothing was reset.";
 
-/// The refusal a hard reset gets when HEAD sits on another branch (or none) than the one
+/// The refusal a reset gets when HEAD sits on another branch (or none) than the one
 /// the user confirmed, even at the same commit. KEEP IN STEP with the family above, and
 /// with the "HEAD moved while the dialog was open — nothing was reset." toasts in
-/// SyncControls.tsx and BranchSwitcher.tsx that answer a switch the frontend sees first.
+/// SyncControls.tsx, BranchSwitcher.tsx and HistoryDialogs.tsx that answer a switch the
+/// frontend sees first.
 const RESET_BRANCH_SWITCHED: &str =
     "The checked-out branch changed since you confirmed — nothing was reset.";
 
@@ -780,6 +1006,50 @@ fn reset_tree_rollback_failed(oid: &str) -> String {
 const RESET_TREE_ROLLBACK_UNREAD: &str =
     "Updating your files failed, and the branch couldn't be moved back.";
 
+// KEEP IN STEP: the rollback family's "it now points at" and `refuse_if_switched`'s
+// "your files were not updated" apply to these tip refusals; unread-tip rollback
+// outcomes follow `roll_back_reset`'s per-outcome leads, hint and error-detail ordering.
+/// The tip moved again after the reset's swap, so the other process's commit stays.
+fn reset_tip_moved(label: &str, now: &str) -> String {
+    format!(
+        "Another Git process moved {label} right after the reset moved it, so your files were not updated. It now points at {}. {SWITCH_ROLLBACK_HINT}",
+        crate::git::commit::short_oid(now)
+    )
+}
+
+/// The ref was deleted after the reset's swap, so no current tip can be named.
+fn reset_tip_deleted(label: &str) -> String {
+    format!(
+        "Another Git process deleted {label} right after the reset moved it, so your files were not updated. {SWITCH_ROLLBACK_HINT}"
+    )
+}
+
+/// The unread-tip refusal follows `roll_back_reset`'s per-outcome leads, hint and
+/// error-detail ordering so the user knows whether the move-back succeeded.
+fn reset_tip_unread(
+    label: &str,
+    target: &str,
+    err: &AppError,
+    rolled: crate::git::commit::RolledBack,
+) -> String {
+    use crate::git::commit::RolledBack;
+    let short = crate::git::commit::short_oid(target);
+    match rolled {
+        RolledBack::Restored => format!(
+            "Couldn't confirm where {label} points after the reset moved it, so it was moved back and your files were not updated.\n{err}"
+        ),
+        RolledBack::Lost => format!(
+            "Couldn't confirm where {label} points after the reset moved it, and another Git process moved it before it could be moved back. Your files were not updated. {SWITCH_ROLLBACK_HINT}\n{err}"
+        ),
+        RolledBack::Stuck(why) => format!(
+            "Couldn't confirm where {label} points after the reset moved it, and it couldn't be moved back: it now points at {short}. Your files were not updated. {SWITCH_ROLLBACK_HINT}\n{err}\n{why}"
+        ),
+        RolledBack::Unread(why) => format!(
+            "Couldn't confirm where {label} points after the reset moved it to {short}, and it couldn't be moved back. Your files were not updated. {SWITCH_ROLLBACK_HINT}\n{err}\n{why}"
+        ),
+    }
+}
+
 #[cfg(test)]
 tokio::task_local! {
     /// Awaited by the hard reset it is scoped to, after its guards and before the
@@ -802,10 +1072,34 @@ pub(crate) async fn git_reset_core(
     git_reset_core_expecting(state, repo_path, hash, mode, None, ExpectedRef::Any).await
 }
 
-/// `expected_head` and `expected_ref` are consulted in the hard arm only: the reset then
-/// runs only while HEAD is still that full oid on that branch (or detached, as it says),
-/// checked first under the guards' hold, and the ref moves only while it still holds that
-/// oid. The mixed arm ignores both, since its callers name an explicit user-chosen commit.
+async fn check_reset_pin(
+    repo_path: &str,
+    expected_head: Option<&str>,
+    expected_ref: &ExpectedRef,
+) -> AppResult<()> {
+    if expected_ref.moved(repo_path).await? {
+        return Err(AppError::Git {
+            code: 1,
+            stderr: RESET_BRANCH_SWITCHED.to_string(),
+        });
+    }
+    if let Some(expected) = expected_head {
+        let current = run_git_raw(Some(repo_path), &["rev-parse", "HEAD"], DEFAULT_TIMEOUT).await?;
+        // A non-zero exit is an unborn HEAD.
+        if current.code != 0 || current.stdout_lossy().trim() != expected {
+            return Err(AppError::Git {
+                code: 1,
+                stderr: RESET_HEAD_MOVED.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Both arms check `expected_head` and `expected_ref` under the working-tree hold when
+/// sent. The hard arm also compares-and-swaps the ref against that oid. Mixed has no
+/// compare-and-swap: an outside commit between the pin check and `reset --mixed`
+/// stays unseen.
 pub(crate) async fn git_reset_core_expecting(
     state: &AppState,
     repo_path: String,
@@ -825,13 +1119,12 @@ pub(crate) async fn git_reset_core_expecting(
         }
     };
     if !hard {
-        run_git_mutating(
-            state,
-            &repo_path,
-            &["reset", "--mixed", &hash],
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
+        let domain = state.working_tree_lock(&repo_path).await;
+        let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a reset").await?;
+        check_reset_pin(&repo_path, expected_head.as_deref(), &expected_ref).await?;
+        run_git_raw_index_retry(&repo_path, &["reset", "--mixed", &hash], DEFAULT_TIMEOUT)
+            .await?
+            .exit_verdict()?;
         return Ok(());
     }
     // One hold across both guards and the rewrite — see this function's doc for
@@ -840,23 +1133,7 @@ pub(crate) async fn git_reset_core_expecting(
     let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a reset").await?;
     // Identity before tree state: a dirty-tree refusal would mislead when the real
     // problem is a tip the user never saw.
-    if expected_ref.moved(&repo_path).await? {
-        return Err(AppError::Git {
-            code: 1,
-            stderr: RESET_BRANCH_SWITCHED.to_string(),
-        });
-    }
-    if let Some(expected) = &expected_head {
-        let current =
-            run_git_raw(Some(&repo_path), &["rev-parse", "HEAD"], DEFAULT_TIMEOUT).await?;
-        // A non-zero exit is an unborn HEAD.
-        if current.code != 0 || current.stdout_lossy().trim() != expected {
-            return Err(AppError::Git {
-                code: 1,
-                stderr: RESET_HEAD_MOVED.to_string(),
-            });
-        }
-    }
+    check_reset_pin(&repo_path, expected_head.as_deref(), &expected_ref).await?;
     ensure_clean_tree(&repo_path).await?;
     if op_state(&repo_path).await?.mid_op() {
         return Err(AppError::InvalidArgument(
@@ -914,6 +1191,20 @@ pub(crate) async fn git_reset_core_expecting(
         true,
     )
     .await?;
+    // A move landing between this read and `read-tree` taking index.lock stays unseen:
+    // the window shrinks, but never closes. A raced tip belongs to the other process.
+    let tip_refusal = match cas.oid(&repo_path).await {
+        Ok(Some(now)) if now == peeled => None,
+        Ok(Some(now)) => Some(reset_tip_moved(cas.label(), &now)),
+        Ok(None) => Some(reset_tip_deleted(cas.label())),
+        Err(e) => {
+            let rolled = cas.roll_back(&repo_path, old.as_deref(), Some(&peeled)).await;
+            Some(reset_tip_unread(cas.label(), &peeled, &e, rolled))
+        }
+    };
+    if let Some(stderr) = tip_refusal {
+        return Err(AppError::Git { code: 1, stderr });
+    }
     #[cfg(test)]
     crate::git::commit::run_phase_hook(&RESET_TREE_HOOK).await;
     let tree = run_git_raw_index_retry(
@@ -1037,15 +1328,22 @@ pub(crate) async fn git_revert_core(
 ) -> AppResult<()> {
     validate_hash(&hash)?;
     let mainline = mainline_arg(mainline)?;
-    let already_unmerged = unmerged_paths(&repo_path).await;
     let mut args = vec!["revert", "--no-edit"];
     if let Some(n) = &mainline {
         args.extend(["-m", n.as_str()]);
     }
     args.push(&hash);
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
+    )
+    .await?;
+    let already_unmerged = unmerged_paths(&repo_path).await;
     // Raw: a conflicted revert splits its report — `could not revert` on stderr,
     // the `CONFLICT (…` file list on stdout — so the error needs both halves.
-    let out = run_git_mutating_raw(state, &repo_path, &args, DEFAULT_TIMEOUT).await?;
+    let out = run_git_raw_index_retry(&repo_path, &args, DEFAULT_TIMEOUT).await?;
     if out.code != 0 {
         return Err(classify_failure(
             &repo_path,
@@ -1080,28 +1378,45 @@ pub(crate) async fn git_cherry_pick_core(
 ) -> AppResult<bool> {
     validate_hash(&hash)?;
     let mainline = mainline_arg(mainline)?;
-    let already_unmerged = unmerged_paths(&repo_path).await;
     let mut args = vec!["cherry-pick"];
     if let Some(n) = &mainline {
         args.extend(["-m", n.as_str()]);
     }
     args.push(&hash);
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
+    )
+    .await?;
+    let already_unmerged = unmerged_paths(&repo_path).await;
     // Raw: a conflicted pick splits its report — `could not apply` on stderr, the
     // `CONFLICT (…` file list on stdout — so the error needs both halves.
-    let out = run_git_mutating_raw(state, &repo_path, &args, DEFAULT_TIMEOUT).await?;
+    let out = run_git_raw_index_retry(&repo_path, &args, DEFAULT_TIMEOUT).await?;
     if out.code == 0 {
         return Ok(true);
     }
     // The already-applied sentence arrives on stderr (measured); gating on the raw
     // stream keeps the stdout backfill from widening what counts as "empty".
     if out.stderr.contains("is now empty") || out.stderr.contains("--allow-empty") {
-        let _ = run_git_mutating_raw(
-            state,
-            &repo_path,
-            &["cherry-pick", "--skip"],
-            DEFAULT_TIMEOUT,
-        )
-        .await;
+        let skip = run_git_raw_index_retry(&repo_path, &["cherry-pick", "--skip"], DEFAULT_TIMEOUT)
+            .await?;
+        if skip.code != 0 {
+            let err = classify_failure(
+                &repo_path,
+                "cherry-pick",
+                &already_unmerged,
+                skip.code,
+                skip.full_failure_text(),
+            )
+            .await;
+            let short = &hash[..hash.len().min(7)];
+            return Err(match err {
+                AppError::Git { .. } => skip_failure_git(short, &skip),
+                other => other,
+            });
+        }
         return Ok(false);
     }
     Err(classify_failure(
@@ -1114,11 +1429,72 @@ pub(crate) async fn git_cherry_pick_core(
     .await)
 }
 
+fn skip_failure_git(short: &str, skip: &crate::git::runner::GitOutput) -> AppError {
+    AppError::Git {
+        code: skip.code,
+        stderr: format!(
+            "{short} is already applied, but skipping it failed.\n{}",
+            skip.full_failure_text()
+        ),
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CherryPickRangeResult {
     pub applied: usize,
     pub skipped: usize,
+}
+
+/// The failed step of an already-started pick; Skip is the empty-pick --skip.
+#[derive(Debug, Clone, Copy)]
+enum FailedStep {
+    Pick,
+    Skip,
+}
+
+/// Shapes range failures while preserving the existing pick-failure shapes.
+fn range_failure_error(
+    err: AppError,
+    step: FailedStep,
+    short: &str,
+    target_branch: &str,
+    recovery: &str,
+    stale_hints: &str,
+    rolled_back: bool,
+) -> AppError {
+    let failed_skip = matches!(step, FailedStep::Skip);
+    let failed_step = if failed_skip {
+        format!("Skipping {short}, which was already applied, failed")
+    } else {
+        format!("Pick {short} failed, usually a conflict")
+    };
+    let failing_action = if failed_skip {
+        format!("{failed_step}.")
+    } else {
+        format!("The failing pick was {short}.")
+    };
+    match err {
+        AppError::Git { code, stderr } if rolled_back => AppError::Git {
+            code,
+            stderr: format!(
+                "The cherry-pick was rolled back — {target_branch} is unchanged.\n{failed_step}; nothing from this batch was kept.\n{stderr}{stale_hints}"
+            ),
+        },
+        AppError::Git { code, stderr } => AppError::Git {
+            code,
+            stderr: format!("{recovery}\n{failing_action}\n{stderr}{stale_hints}"),
+        },
+        // Non-Git skip failures use Command so the completed rollback is visible.
+        // Pick failures keep their existing variants after rollback for compatibility.
+        other if rolled_back && failed_skip => AppError::Command(format!(
+            "The cherry-pick was rolled back — {target_branch} is unchanged.\n{failed_step}; nothing from this batch was kept.\n{other}"
+        )),
+        other if rolled_back => other,
+        // A failed rollback needs the full remedy even when the original variant
+        // cannot carry text, so every non-Git failure uses Command here.
+        other => AppError::Command(format!("{recovery}\n{failing_action}\n{other}")),
+    }
 }
 
 /// Copies the given commits (oldest-first) onto `target_branch`, then leaves
@@ -1315,7 +1691,7 @@ pub(crate) async fn cherry_pick_onto_with_timeouts(
         // below, so none of them exits with HEAD on `target` unless the rollback itself
         // fails, which the error then says. The exception returns before it: a
         // single-commit conflict, which stops for the user instead.
-        let mut failure: Option<(String, AppError)> = None;
+        let mut failure: Option<(String, AppError, FailedStep)> = None;
         'picks: for hash in hashes {
             // Raw plus an explicit code check, never a mutating runner: this loop
             // runs inside the compound's own working-tree hold. A conflicted pick
@@ -1329,7 +1705,7 @@ pub(crate) async fn cherry_pick_onto_with_timeouts(
             let out = match run_git_raw(Some(repo_path), &pick_args, pick_timeout).await {
                 Ok(out) => out,
                 Err(e) => {
-                    failure = Some((hash.clone(), e));
+                    failure = Some((hash.clone(), e, FailedStep::Pick));
                     break 'picks;
                 }
             };
@@ -1341,12 +1717,27 @@ pub(crate) async fn cherry_pick_onto_with_timeouts(
             // the raw stream keeps the stdout half from widening what counts as
             // "empty".
             if out.stderr.contains("is now empty") || out.stderr.contains("--allow-empty") {
-                let _ = run_git(
-                    Some(repo_path),
+                let skip = match run_git_raw_index_retry(
+                    repo_path,
                     &["cherry-pick", "--skip"],
                     DEFAULT_TIMEOUT,
                 )
-                .await;
+                .await
+                {
+                    Ok(skip) => skip,
+                    Err(e) => {
+                        failure = Some((hash.clone(), e, FailedStep::Skip));
+                        break 'picks;
+                    }
+                };
+                if skip.code != 0 {
+                    let err = AppError::Git {
+                        code: skip.code,
+                        stderr: skip.full_failure_text(),
+                    };
+                    failure = Some((hash.clone(), err, FailedStep::Skip));
+                    break 'picks;
+                }
                 skipped += 1;
                 continue;
             }
@@ -1374,11 +1765,11 @@ pub(crate) async fn cherry_pick_onto_with_timeouts(
             if matches!(err, AppError::Conflict { .. }) {
                 return Err(err);
             }
-            failure = Some((hash.clone(), err));
+            failure = Some((hash.clone(), err, FailedStep::Pick));
             break 'picks;
         }
 
-        if let Some((hash, err)) = failure {
+        if let Some((hash, err, step)) = failure {
             // Roll everything back: abort the in-progress pick, drop the commits
             // already applied in this batch, and return home. Every attempt stays
             // best-effort, but the two that decide whether the repo actually came
@@ -1447,28 +1838,15 @@ pub(crate) async fn cherry_pick_onto_with_timeouts(
                 ""
             };
             let short = &hash[..hash.len().min(7)];
-            return Err(match err {
-                AppError::Git { code, stderr } if rolled_back => AppError::Git {
-                    code,
-                    stderr: format!(
-                        "The cherry-pick was rolled back — {target_branch} is unchanged.\nPick {short} failed, usually a conflict; nothing from this batch was kept.\n{stderr}{stale_hints}"
-                    ),
-                },
-                AppError::Git { code, stderr } => AppError::Git {
-                    code,
-                    stderr: format!(
-                        "{recovery}\nThe failing pick was {short}.\n{stderr}{stale_hints}"
-                    ),
-                },
-                other if rolled_back => other,
-                // Timeout carries only a u64 and GitNotFound carries nothing, so a
-                // variant-preserving wrap isn't available for every arm — one
-                // `Command` carrying the whole explanation beats a scheme where
-                // which variant survives depends on the failure class.
-                other => AppError::Command(format!(
-                    "{recovery}\nThe failing pick was {short}.\n{other}"
-                )),
-            });
+            return Err(range_failure_error(
+                err,
+                step,
+                short,
+                target_branch,
+                &recovery,
+                stale_hints,
+                rolled_back,
+            ));
         }
 
         Ok(CherryPickRangeResult { applied, skipped })
@@ -1517,9 +1895,11 @@ pub(crate) async fn git_discard_all_core(state: &AppState, repo_path: String) ->
     // point-of-acquisition semantics.
     let domain = state.working_tree_lock(&repo_path).await;
     let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a discard").await?;
+    // Names from git status are root-relative, so join them onto the checkout root.
+    let top = crate::git::runner::worktree_toplevel(&repo_path).await?;
 
     let status_out = run_git(
-        Some(&repo_path),
+        Some(&top),
         &[
             "status",
             "--porcelain=v2",
@@ -1529,29 +1909,24 @@ pub(crate) async fn git_discard_all_core(state: &AppState, repo_path: String) ->
         DEFAULT_TIMEOUT,
     )
     .await?;
-    let status = crate::git::status::parse_status_v2(&status_out.stdout_lossy());
-    let untracked: Vec<String> = status
-        .entries
-        .iter()
-        .filter(|e| e.unstaged == Some(crate::git::types::ChangeKind::Untracked))
-        .map(|e| e.path.clone())
-        .collect();
+    let untracked = discard_all_untracked(&status_out.stdout)?;
 
     if !untracked.is_empty() {
-        let repo = repo_path.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            for path in untracked {
-                let full = Path::new(&repo).join(&path);
-                crate::fsops::trash_delete(&full).map_err(AppError::Io)?;
-            }
-            Ok::<(), AppError>(())
-        })
-        .await
-        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))??;
+        let top = top.clone();
+        let entries: Vec<_> = untracked
+            .into_iter()
+            .map(|path| {
+                let rel = discard_rel_path(&path).map_err(|why| discard_refusal(&path, why))?;
+                Ok((path, rel))
+            })
+            .collect::<AppResult<_>>()?;
+        tauri::async_runtime::spawn_blocking(move || trash_entries(&top, &entries))
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))??;
     }
 
     let head_exists = run_git_raw(
-        Some(&repo_path),
+        Some(&top),
         &["rev-parse", "--verify", "--quiet", "HEAD"],
         DEFAULT_TIMEOUT,
     )
@@ -1559,12 +1934,7 @@ pub(crate) async fn git_discard_all_core(state: &AppState, repo_path: String) ->
     .code
         == 0;
     if head_exists {
-        run_git(
-            Some(&repo_path),
-            &["reset", "--hard", "HEAD"],
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
+        run_git(Some(&top), &["reset", "--hard", "HEAD"], DEFAULT_TIMEOUT).await?;
     }
     Ok(())
 }
@@ -1647,12 +2017,211 @@ pub(crate) fn stash_saved_nothing(stdout: &str) -> bool {
     stdout.trim_start().starts_with("No local changes to save")
 }
 
-/// One selected file to discard, paired with whether it's untracked (which
-/// decides recycle-bin vs. `git restore`).
+/// One selected file to discard. Its `untracked` flag must match git status both
+/// ways or the whole batch is refused. Flagged paths go to the recycle bin, or are
+/// deleted outright when Windows reserves the name; unflagged ones are restored
+/// from the index.
 #[derive(serde::Deserialize)]
 pub struct DiscardPath {
     pub path: String,
     pub untracked: bool,
+}
+
+const DISCARD_OUTSIDE: &str = "it isn't inside this repository's working tree";
+const DISCARD_GIT_DIR: &str = "it's inside the repository's .git folder";
+pub(crate) const DISCARD_LINKED: &str = "it's reached through a symbolic link or junction";
+const DISCARD_NOT_NEW: &str = "Git doesn't list it as a new file, so refresh and try again";
+const DISCARD_NOW_NEW: &str = "Git lists it as a new file, so refresh and try again";
+const DISCARD_WIN_TRAILING: &str =
+    "Windows reads a name ending in a dot or space as a different path";
+const DISCARD_WIN_SHELL_FOLDER: &str = "Windows treats a name ending in .{GUID} as a shell link";
+const DISCARD_UNDECODABLE: &str = "its name isn't valid UTF-8; rename it and try again";
+
+/// Shared lexical gate for caller-supplied repo-relative paths that writes join
+/// onto the working tree; returns git's spelling without resolving filesystem
+/// names. Each caller wraps the reason in its own operation sentence.
+pub(crate) fn discard_rel_path(raw: &str) -> Result<String, &'static str> {
+    let s = if cfg!(windows) {
+        raw.replace('\\', "/")
+    } else {
+        raw.to_string()
+    };
+    if s.is_empty() || s.contains('\0') || s.starts_with('/') {
+        return Err(DISCARD_OUTSIDE);
+    }
+    if cfg!(windows) && s.contains(':') {
+        return Err(DISCARD_OUTSIDE);
+    }
+    let body = s.strip_suffix('/').unwrap_or(&s);
+    if body.is_empty() {
+        return Err(DISCARD_OUTSIDE);
+    }
+    for seg in body.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(DISCARD_OUTSIDE);
+        }
+        let trimmed = seg.trim_end_matches(['.', ' ']);
+        if cfg!(windows) && trimmed.is_empty() {
+            return Err(DISCARD_OUTSIDE);
+        }
+        if (cfg!(windows) && trimmed.eq_ignore_ascii_case(".git"))
+            || (!cfg!(windows) && seg == ".git")
+        {
+            return Err(DISCARD_GIT_DIR);
+        }
+        if cfg!(windows) && seg.ends_with(['.', ' ']) {
+            return Err(DISCARD_WIN_TRAILING);
+        }
+        if cfg!(windows)
+            && seg.rsplit_once(".{").is_some_and(|(_, suffix)| {
+                suffix.strip_suffix('}').is_some_and(|guid| {
+                    guid.len() == 36
+                        && guid.bytes().enumerate().all(|(i, byte)| {
+                            if matches!(i, 8 | 13 | 18 | 23) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit()
+                            }
+                        })
+                })
+            })
+        {
+            return Err(DISCARD_WIN_SHELL_FOLDER);
+        }
+    }
+    Ok(s)
+}
+
+/// The path as refusal text: strips the bidi and zero-width format characters
+/// below and masks controls, so they can't reorder or hide part of the name.
+pub(crate) fn discard_shown(raw: &str) -> String {
+    let shown: String = raw
+        .chars()
+        .filter(|&c| {
+            !matches!(
+                c as u32,
+                0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069
+                    | 0x00AD | 0x061C | 0xFEFF
+            )
+        })
+        .map(|c| {
+            if c.is_control() {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                c
+            }
+        })
+        .collect();
+    if shown.is_empty() {
+        "an empty path".to_string()
+    } else {
+        shown
+    }
+}
+
+fn discard_refusal(raw: &str, why: &str) -> AppError {
+    let shown = discard_shown(raw);
+    AppError::InvalidArgument(format!(
+        "Can't discard {shown} — {why}. Nothing was discarded."
+    ))
+}
+
+fn line_discard_refusal(raw: &str, why: &str) -> AppError {
+    let shown = discard_shown(raw);
+    AppError::InvalidArgument(format!(
+        "Can't discard lines from {shown} — {why}. Nothing was changed."
+    ))
+}
+
+/// Exact UTF-8 status names only; caller holds the working-tree lock.
+async fn untracked_paths(top: &str) -> AppResult<std::collections::HashSet<String>> {
+    let out = run_git(
+        Some(top),
+        &["status", "--porcelain=v2", "--untracked-files=all", "-z"],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    Ok(untracked_from_status(&out.stdout))
+}
+
+fn untracked_from_status(stdout: &[u8]) -> std::collections::HashSet<String> {
+    untracked_records(stdout)
+        .into_iter()
+        .filter_map(|name| std::str::from_utf8(name).ok().map(str::to_string))
+        .collect()
+}
+
+fn untracked_records(stdout: &[u8]) -> Vec<&[u8]> {
+    let mut paths = Vec::new();
+    let mut records = stdout.split(|&b| b == 0);
+    while let Some(record) = records.next() {
+        if let Some(path) = record.strip_prefix(b"? ") {
+            paths.push(path);
+        } else if record.starts_with(b"2 ") {
+            records.next();
+        }
+    }
+    paths
+}
+
+fn discard_all_untracked(stdout: &[u8]) -> AppResult<Vec<String>> {
+    untracked_records(stdout)
+        .into_iter()
+        .map(|name| {
+            std::str::from_utf8(name)
+                .map(str::to_string)
+                .map_err(|_| discard_refusal(&String::from_utf8_lossy(name), DISCARD_UNDECODABLE))
+        })
+        .collect()
+}
+
+/// Probe below the root without following links; line rewrites also probe the leaf.
+pub(crate) fn linked_component(top: &str, rel: &str, include_leaf: bool) -> std::io::Result<bool> {
+    let segments: Vec<_> = rel.strip_suffix('/').unwrap_or(rel).split('/').collect();
+    let count = segments.len().saturating_sub(usize::from(!include_leaf));
+    let mut p = Path::new(top).to_path_buf();
+    for seg in segments.iter().take(count) {
+        p.push(seg);
+        #[cfg(windows)]
+        let spelling = crate::fsops::verbatim_path(&p).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no verbatim form")
+        })?;
+        #[cfg(not(windows))]
+        let spelling = &p;
+        match std::fs::symlink_metadata(spelling) {
+            Ok(m) if m.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            // Nothing below a missing path or a non-directory can be a link.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
+}
+
+fn refuse_linked(top: &str, entries: &[(String, String)]) -> AppResult<()> {
+    for (raw, rel) in entries {
+        if linked_component(top, rel, false)? {
+            return Err(discard_refusal(raw, DISCARD_LINKED));
+        }
+    }
+    Ok(())
+}
+
+/// Every entry must pass the link walk before the first recycle-bin operation.
+fn trash_entries(top: &str, entries: &[(String, String)]) -> AppResult<()> {
+    refuse_linked(top, entries)?;
+    for (_, rel) in entries {
+        crate::fsops::trash_delete(&Path::new(top).join(rel))?;
+    }
+    Ok(())
 }
 
 /// Discards working-tree changes for a selection of files: tracked files are
@@ -1672,38 +2241,62 @@ pub(crate) async fn git_discard_paths_core(
     repo_path: String,
     paths: Vec<DiscardPath>,
 ) -> AppResult<()> {
-    let untracked: Vec<String> = paths
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let relative: Vec<String> = paths
         .iter()
-        .filter(|p| p.untracked)
-        .map(|p| p.path.clone())
-        .collect();
-    // Literal pathspecs: a `[slug]`-style path would otherwise also restore its
-    // glob-siblings, discarding edits the user never selected. The untracked half
-    // below takes the path as a filesystem name instead, so it must stay raw.
-    let tracked: Vec<String> = paths
-        .iter()
-        .filter(|p| !p.untracked)
-        .map(|p| crate::git::pathspec::literal(&p.path))
-        .collect();
+        .map(|p| discard_rel_path(&p.path).map_err(|why| discard_refusal(&p.path, why)))
+        .collect::<AppResult<_>>()?;
 
-    if !untracked.is_empty() {
-        let repo = repo_path.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            for path in untracked {
-                let full = Path::new(&repo).join(&path);
-                crate::fsops::trash_delete(&full).map_err(AppError::Io)?;
+    // Status, trash and restore share ONE hold. Only lock-free runners belong
+    // inside it: run_git_mutating would re-acquire this non-reentrant lock.
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a discard").await?;
+    let top = crate::git::runner::worktree_toplevel(&repo_path).await?;
+    let listed = untracked_paths(&top).await?;
+
+    // Every path's flag must agree with git status, or the whole batch is refused.
+    // Resolve every mismatch before de-duplicating, trashing or restoring paths.
+    for (p, rel) in paths.iter().zip(&relative) {
+        if p.untracked {
+            if !listed.contains(rel) {
+                return Err(discard_refusal(&p.path, DISCARD_NOT_NEW));
             }
-            Ok::<(), AppError>(())
-        })
-        .await
-        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))??;
+        } else if listed.contains(rel) {
+            return Err(discard_refusal(&p.path, DISCARD_NOW_NEW));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut trash = Vec::new();
+    let mut tracked = Vec::new();
+    for (p, rel) in paths.into_iter().zip(relative) {
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        if p.untracked {
+            trash.push((p.path, rel));
+        } else {
+            // Literal pathspecs: a `[slug]`-style path would otherwise also restore its
+            // glob-siblings. Trash entries instead use normalized filesystem names.
+            tracked.push(crate::git::pathspec::literal(&rel));
+        }
+    }
+
+    if !trash.is_empty() {
+        let top = top.clone();
+        tauri::async_runtime::spawn_blocking(move || trash_entries(&top, &trash))
+            .await
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))??;
     }
 
     // Chunked to stay under the Windows ~32K command-line limit on big selections.
     for batch in tracked.chunks(100) {
         let mut args = vec!["restore", "--"];
         args.extend(batch.iter().map(String::as_str));
-        run_git_mutating(state, &repo_path, &args, DEFAULT_TIMEOUT).await?;
+        run_git_raw_index_retry(&top, &args, DEFAULT_TIMEOUT)
+            .await?
+            .exit_verdict()?;
     }
     Ok(())
 }
@@ -1900,11 +2493,19 @@ pub async fn git_stash_pop(state: State<'_, AppState>, repo_path: String) -> App
 }
 
 pub(crate) async fn git_stash_pop_core(state: &AppState, repo_path: String) -> AppResult<()> {
+    let args = ["stash", "pop"];
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
+    )
+    .await?;
     let already_unmerged = unmerged_paths(&repo_path).await;
     // Raw: a conflicted pop reports entirely on stdout and leaves stderr empty
     // (measured, git 2.51.1), so a stderr-only error is blind to the whole report
     // — and to the fact that git kept the stash entry.
-    let out = run_git_mutating_raw(state, &repo_path, &["stash", "pop"], DEFAULT_TIMEOUT).await?;
+    let out = run_git_raw_index_retry(&repo_path, &args, DEFAULT_TIMEOUT).await?;
     if out.code != 0 {
         return Err(classify_failure(
             &repo_path,
@@ -2140,27 +2741,26 @@ pub async fn git_unignore_rules(repo_path: String, rules: Vec<UnignoreRule>) -> 
         };
         // Strip a leading UTF-8 BOM for processing (it is not whitespace, so it
         // rides on the first line and breaks the pattern match), and restore it
-        // on write. Preserve the file's existing line-ending convention — `lines()`
-        // drops both \n and \r\n, so a naive `join("\n")` would silently rewrite a
-        // Windows CRLF .gitignore to LF.
+        // on write. Kept lines retain their own terminators; an emptied file
+        // keeps its final line's terminator.
         let (has_bom, content) = match raw.strip_prefix('\u{feff}') {
             Some(rest) => (true, rest),
             None => (false, raw.as_str()),
         };
-        let ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
-        let kept: Vec<&str> = content
-            .lines()
-            .filter(|l| {
-                !patterns
-                    .iter()
-                    .any(|p| crate::fsops::trim_ignore_pattern(l) == p)
-            })
-            .collect();
-        let mut next = kept.join(ending);
-        // Keep the trailing newline if the original had one, even when every
-        // line was removed (so the file's convention is preserved, not truncated).
-        if content.ends_with('\n') {
-            next.push_str(ending);
+        let mut next = String::with_capacity(content.len());
+        let mut final_ending = "";
+        for (text, ending) in content.split_inclusive('\n').map(split_line_ending) {
+            final_ending = ending;
+            if !patterns
+                .iter()
+                .any(|p| crate::fsops::trim_ignore_pattern(text) == p)
+            {
+                next.push_str(text);
+                next.push_str(ending);
+            }
+        }
+        if next.is_empty() {
+            next.push_str(final_ending);
         }
         if has_bom {
             next.insert(0, '\u{feff}');
@@ -2168,6 +2768,16 @@ pub async fn git_unignore_rules(repo_path: String, rules: Vec<UnignoreRule>) -> 
         tokio::fs::write(&path, next).await.map_err(AppError::Io)?;
     }
     Ok(())
+}
+
+fn split_line_ending(piece: &str) -> (&str, &str) {
+    if let Some(text) = piece.strip_suffix("\r\n") {
+        (text, "\r\n")
+    } else if let Some(text) = piece.strip_suffix('\n') {
+        (text, "\n")
+    } else {
+        (piece, "")
+    }
 }
 
 /// Outcome of an applied suggestion — what actually happened, for honest toasts.
@@ -2248,6 +2858,14 @@ pub(crate) async fn replace_file_lines(
         )));
     }
 
+    let git_spelling = discard_rel_path(file_path).map_err(|why| {
+        let shown = discard_shown(file_path);
+        AppError::InvalidArgument(format!(
+            "Can't apply the suggestion to {shown} — {why}. Nothing was changed."
+        ))
+    })?;
+    let rel = Path::new(&git_spelling);
+
     // Hold the repo's mutating lock across the WHOLE dirty-check → read → verify →
     // write → stage sequence, not just the final `git add`: otherwise two concurrent
     // Apply calls on different ranges of one file interleave and the second silently
@@ -2282,7 +2900,7 @@ pub(crate) async fn replace_file_lines(
     // Dirty check BEFORE the edit: any porcelain output for this path means the
     // file already had staged/unstaged changes, so we must not auto-stage. Literal
     // pathspec — a glob-sibling's dirtiness must not decide this file's fate.
-    let spec = crate::git::pathspec::literal(file_path);
+    let spec = crate::git::pathspec::literal(&git_spelling);
     let status = run_git(
         Some(repo_path),
         &["status", "--porcelain", "--", &spec],
@@ -2295,15 +2913,15 @@ pub(crate) async fn replace_file_lines(
     let raw = tokio::fs::read_to_string(&canon_target)
         .await
         .map_err(AppError::Io)?;
-    // Same BOM/EOL idiom as `git_unignore_rules`: strip a leading BOM and restore
-    // it, and preserve the file's line ending (`lines()` drops both \n and \r\n).
+    // Preserve each line's own terminator and restore any leading BOM.
     let (has_bom, content) = match raw.strip_prefix('\u{feff}') {
         Some(rest) => (true, rest),
         None => (false, raw.as_str()),
     };
-    let ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
-
-    let existing: Vec<&str> = content.lines().collect();
+    let existing: Vec<(&str, &str)> = content
+        .split_inclusive('\n')
+        .map(split_line_ending)
+        .collect();
     let start = (start_line - 1) as usize;
     let end = start + expected_lines.len();
     // Range beyond EOF, or any line differing, is a mismatch — the file drifted.
@@ -2311,7 +2929,7 @@ pub(crate) async fn replace_file_lines(
         && existing[start..end]
             .iter()
             .zip(expected_lines.iter())
-            .all(|(have, want)| *have == want.as_str());
+            .all(|((have, _), want)| *have == want.as_str());
     if !matches {
         // Drift is a legitimate state, not a caller bug — use `Command` so its
         // bare Display surfaces cleanly in the UI toast (InvalidArgument's
@@ -2321,15 +2939,33 @@ pub(crate) async fn replace_file_lines(
         )));
     }
 
-    let mut next_lines: Vec<&str> = Vec::with_capacity(
-        existing.len() - expected_lines.len() + replacement_lines.len(),
-    );
-    next_lines.extend_from_slice(&existing[..start]);
-    next_lines.extend(replacement_lines.iter().map(String::as_str));
-    next_lines.extend_from_slice(&existing[end..]);
-    let mut next = next_lines.join(ending);
-    // Preserve the file's trailing-newline presence (even if the edit emptied it).
-    if content.ends_with('\n') {
+    let replaced = &existing[start..end];
+    // The last replacement inherits the range's final ending, including unterminated EOF.
+    // Extra lines use its first terminator, falling back to the preceding line's.
+    let fallback = replaced
+        .iter()
+        .map(|(_, ending)| *ending)
+        .find(|ending| !ending.is_empty())
+        .or_else(|| start.checked_sub(1).map(|i| existing[i].1))
+        .unwrap_or("\n");
+    let mut next = String::with_capacity(content.len());
+    for (text, ending) in &existing[..start] {
+        next.push_str(text);
+        next.push_str(ending);
+    }
+    for (j, text) in replacement_lines.iter().enumerate() {
+        let ending = if j == replacement_lines.len() - 1 {
+            replaced[replaced.len() - 1].1
+        } else if j < replaced.len() - 1 {
+            replaced[j].1
+        } else {
+            fallback
+        };
+        next.push_str(text);
+        next.push_str(ending);
+    }
+    for (text, ending) in &existing[end..] {
+        next.push_str(text);
         next.push_str(ending);
     }
     if has_bom {
@@ -2367,7 +3003,7 @@ pub async fn git_stash_count(repo_path: String) -> AppResult<u32> {
 pub async fn git_stash_list(repo_path: String) -> AppResult<Vec<StashEntry>> {
     let out = run_git(
         Some(&repo_path),
-        &["stash", "list", "--format=%gd%x00%s%x00%cI"],
+        &["stash", "list", "--format=%gd%x00%H%x00%s%x00%cI"],
         DEFAULT_TIMEOUT,
     )
     .await?;
@@ -2375,9 +3011,9 @@ pub async fn git_stash_list(repo_path: String) -> AppResult<Vec<StashEntry>> {
     let entries = text
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\0');
-            let (Some(refname), Some(message), Some(date)) =
-                (parts.next(), parts.next(), parts.next())
+            let mut parts = line.splitn(4, '\0');
+            let (Some(refname), Some(sha), Some(message), Some(date)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
             else {
                 return None;
             };
@@ -2390,6 +3026,7 @@ pub async fn git_stash_list(repo_path: String) -> AppResult<Vec<StashEntry>> {
                 .ok()?;
             Some(StashEntry {
                 index,
+                sha: sha.to_string(),
                 message: message.to_string(),
                 date: date.to_string(),
             })
@@ -2423,7 +3060,7 @@ pub struct OrphanedStash {
 }
 
 /// The files a stash-shaped ref holds, including untracked ones, keyed by a
-/// ref spec (`stash@{N}` for a live stash, or a raw sha for a dangling one).
+/// ref spec: `stash@{N}`, or any stash commit's sha, live or dangling.
 async fn stash_files_at(repo: &str, spec: &str) -> AppResult<Vec<StashFile>> {
     let out = run_git(
         Some(repo),
@@ -2471,25 +3108,36 @@ async fn stash_files_at(repo: &str, spec: &str) -> AppResult<Vec<StashFile>> {
 /// One file's diff from a stash-shaped ref. Tracked changes diff the stash
 /// against its base (`^1`); untracked files live in the stash's third parent
 /// (`^3`, created by `--include-untracked`), so an empty tracked diff falls
-/// back to that. `spec` is `stash@{N}` for a live stash or a raw sha.
+/// back to that. `spec` is `stash@{N}`, or any stash commit's sha, live or
+/// dangling.
 async fn stash_file_diff_at(repo: &str, spec: &str, file_path: &str) -> AppResult<FileDiff> {
     let base = format!("{spec}^1");
-    // Literal pathspec: the path comes from the stash's own file list, so a
-    // `[slug]`-style name would splice a glob-sibling's hunks into this file's diff.
-    let path_spec = crate::git::pathspec::literal(file_path);
-    let out = run_git(
-        Some(repo),
-        &["diff", "--no-color", &base, spec, "--", &path_spec],
-        DEFAULT_TIMEOUT,
+    let out = crate::git::diff::diff_with_rename_pairing(
+        repo,
+        file_path,
+        &["diff", "--no-ext-diff", "--no-color", &base, spec],
+        &["diff", "--no-ext-diff", "--name-status", "-z", &base, spec],
     )
     .await?;
-    let mut text = out.stdout_lossy();
+    let old_path = out.old_path;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if text.trim().is_empty() {
         // Not a tracked change — try the untracked-files parent if present.
         let untracked = format!("{spec}^3");
+        // Literal pathspec: a `[slug]`-style path would splice a glob-sibling's
+        // untracked file from the stash's untracked parent into this diff.
+        let path_spec = crate::git::pathspec::literal(file_path);
         if let Ok(o) = run_git(
             Some(repo),
-            &["diff", "--no-color", &base, &untracked, "--", &path_spec],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                &base,
+                &untracked,
+                "--",
+                &path_spec,
+            ],
             DEFAULT_TIMEOUT,
         )
         .await
@@ -2507,6 +3155,7 @@ async fn stash_file_diff_at(repo: &str, spec: &str, file_path: &str) -> AppResul
         is_truncated,
         text,
         undecodable: false,
+        old_path,
     })
 }
 
@@ -2615,7 +3264,7 @@ pub async fn git_orphaned_stashes(repo_path: String) -> AppResult<Vec<OrphanedSt
     Ok(out)
 }
 
-/// The files a dangling (orphaned) stash holds, browsed by sha.
+/// The files any stash commit holds, live or dangling, browsed by sha.
 #[tauri::command]
 pub async fn git_orphaned_stash_files(
     repo_path: String,
@@ -2625,7 +3274,7 @@ pub async fn git_orphaned_stash_files(
     stash_files_at(&repo_path, &sha).await
 }
 
-/// One file's diff from a dangling (orphaned) stash, by sha.
+/// One file's diff from any stash commit, live or dangling, by sha.
 #[tauri::command]
 pub async fn git_orphaned_stash_file_diff(
     repo_path: String,
@@ -2657,15 +3306,17 @@ pub(crate) async fn git_restore_orphaned_core(
     sha: String,
 ) -> AppResult<()> {
     validate_hash(&sha)?;
-    let already_unmerged = unmerged_paths(&repo_path).await;
-    // Raw, for the same stdout-only conflict report as `git_stash_pop_core`.
-    let out = run_git_mutating_raw(
-        state,
-        &repo_path,
-        &["stash", "apply", &sha],
-        DEFAULT_TIMEOUT,
+    let args = ["stash", "apply", &sha];
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
     )
     .await?;
+    let already_unmerged = unmerged_paths(&repo_path).await;
+    // Raw, for the same stdout-only conflict report as `git_stash_pop_core`.
+    let out = run_git_raw_index_retry(&repo_path, &args, DEFAULT_TIMEOUT).await?;
     if out.code != 0 {
         return Err(classify_failure(
             &repo_path,
@@ -2697,10 +3348,17 @@ pub(crate) async fn git_stash_apply_core(
 ) -> AppResult<()> {
     let spec = format!("stash@{{{index}}}");
     let sub = if pop { "pop" } else { "apply" };
+    let args = ["stash", sub, &spec];
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(&args)),
+    )
+    .await?;
     let already_unmerged = unmerged_paths(&repo_path).await;
     // Raw, for the same stdout-only conflict report as `git_stash_pop_core`.
-    let out =
-        run_git_mutating_raw(state, &repo_path, &["stash", sub, &spec], DEFAULT_TIMEOUT).await?;
+    let out = run_git_raw_index_retry(&repo_path, &args, DEFAULT_TIMEOUT).await?;
     if out.code != 0 {
         let op = if pop { "stash-pop" } else { "stash-apply" };
         return Err(classify_failure(
@@ -2948,12 +3606,13 @@ pub(crate) async fn git_rebase_core(
     branch: String,
 ) -> AppResult<()> {
     validate_branch_arg(&branch)?;
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a rebase").await?;
     let rev = crate::git::branches::branch_first_rev(&repo_path, &branch).await;
     let already_unmerged = unmerged_paths(&repo_path).await;
     // Raw: a conflicted rebase splits its report — `could not apply` plus the
     // resolve hints on stderr, the `CONFLICT (…` file list on stdout.
-    let out = run_git_mutating_raw(
-        state,
+    let out = run_git_raw_index_retry(
         &repo_path,
         &["-c", "core.editor=true", "rebase", &rev],
         DEFAULT_TIMEOUT,
@@ -2986,12 +3645,13 @@ async fn rebase_onto(
 ) -> AppResult<()> {
     validate_branch_arg(new_base)?;
     validate_branch_arg(old_base)?;
+    let domain = state.working_tree_lock(repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a rebase").await?;
     let new_base = &crate::git::branches::branch_first_rev(repo_path, new_base).await;
     let old_base = &crate::git::branches::branch_first_rev(repo_path, old_base).await;
     let already_unmerged = unmerged_paths(repo_path).await;
     // Raw, for the same split report as `git_rebase_core`.
-    let out = run_git_mutating_raw(
-        state,
+    let out = run_git_raw_index_retry(
         repo_path,
         &[
             "-c",
@@ -3889,7 +4549,7 @@ pub(crate) async fn finish_local_pr_merge(
             let merging = git_path_exists(worktree_path, "MERGE_HEAD").await;
             let staged = run_git_raw(
                 Some(worktree_path),
-                &["diff", "--cached", "--quiet"],
+                &["diff", "--no-ext-diff", "--cached", "--quiet"],
                 DEFAULT_TIMEOUT,
             )
             .await?;
@@ -4602,7 +5262,7 @@ pub(crate) async fn finish_remote_pr_resolve(
     let merging = git_path_exists(worktree_path, "MERGE_HEAD").await;
     let staged = run_git_raw(
         Some(worktree_path),
-        &["diff", "--cached", "--quiet"],
+        &["diff", "--no-ext-diff", "--cached", "--quiet"],
         DEFAULT_TIMEOUT,
     )
     .await?;
@@ -4979,11 +5639,11 @@ pub(crate) async fn rewrite_commits_with_timeouts(
     }
 
     // One hold across read → rebase → rollback covers this process's in-app ops; the MCP
-    // server's separate AppState lock and the lock-free edit path are outside it, and
-    // the start-tip gate catches what the hold misses. A poll can briefly show a paused
-    // rebase's banner (the `break` pause). Commits another git process makes WHILE the
-    // rebase runs are unsupported, as in any `git rebase`: a rollback may drop them (the
-    // reflog keeps them). Lock-free runners only while held (see `run_git_mutating`).
+    // server's separate AppState lock is outside it. The start-tip gate catches
+    // pre-start changes; a poll can briefly show `break`, or `exec` while a group
+    // or reword script runs. Commits another git process makes WHILE the rebase runs
+    // are unsupported: a rollback may drop them (the reflog keeps them). Only
+    // lock-free runners may run while held (see `run_git_mutating`).
     let domain = state.working_tree_lock(repo_path).await;
     let guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a history rewrite").await?;
 
@@ -5123,25 +5783,38 @@ pub(crate) async fn rewrite_commits_with_timeouts(
 
 /// Rewrites the unpushed tip via a **real, resumable** `git rebase -i` — used when
 /// the plan contains an `edit` (the atomic replay engine can't pause). Generates
-/// the todo (pick/edit the leader, fixup the folds, reword/squash messages via a
-/// non-interactive `exec … commit --amend -F`) and swaps it in through
+/// the todo (pick/edit the leader, fixup the folds, reword/squash messages via
+/// non-interactive reword scripts) and swaps it in through
 /// `GIT_SEQUENCE_EDITOR`, so no editor ever opens. Stopping at an `edit` (or at a
 /// conflict before one) leaves the rebase in progress for the banner to take over —
 /// a normal outcome, not an error. Steps plus `dropped` must cover `base..HEAD`
 /// exactly once; anything else refuses, since the generated todo replaces git's.
 #[tauri::command]
 pub async fn git_rebase_edit(
+    state: State<'_, AppState>,
     repo_path: String,
     base: String,
     steps: Vec<RewriteStep>,
     dropped: Option<Vec<String>>,
 ) -> AppResult<()> {
-    git_rebase_edit_with_timeout(repo_path, base, steps, dropped, DEFAULT_TIMEOUT).await
+    rebase_edit(&state, repo_path, base, steps, dropped).await
 }
 
-/// [`git_rebase_edit`] with the timeout of the `rebase --continue` that runs the plan
-/// after the start-tip gate injectable; every other git call keeps `DEFAULT_TIMEOUT`.
-pub(crate) async fn git_rebase_edit_with_timeout(
+/// Testable core of [`git_rebase_edit`].
+pub(crate) async fn rebase_edit(
+    state: &AppState,
+    repo_path: String,
+    base: String,
+    steps: Vec<RewriteStep>,
+    dropped: Option<Vec<String>>,
+) -> AppResult<()> {
+    rebase_edit_with_timeout(state, repo_path, base, steps, dropped, DEFAULT_TIMEOUT).await
+}
+
+/// [`rebase_edit`] with an injectable timeout for the plan's continue and each
+/// recovery re-drive; every other git call keeps `DEFAULT_TIMEOUT`.
+pub(crate) async fn rebase_edit_with_timeout(
+    state: &AppState,
     repo_path: String,
     base: String,
     steps: Vec<RewriteStep>,
@@ -5164,9 +5837,13 @@ pub(crate) async fn git_rebase_edit_with_timeout(
     for h in &dropped {
         validate_hash(h)?;
     }
+    // Lock-free runners only across start, gate and continue; journal finish is outside.
+    let domain = state.working_tree_lock(&repo_path).await;
+    let guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a history rewrite").await?;
+
     // Refuse while a sequencer op is mid-flight, BEFORE the scratch-dir clear below:
-    // it would delete that rebase's pending message files, and its `exec … -F msg`
-    // lines would fail on --continue. [`op_state`]'s detection is the one marker set.
+    // it would delete that rebase's pending message files and scripts, and its pending
+    // `exec` lines would fail on --continue. [`op_state`]'s detection is the one marker set.
     if op_in_progress(&repo_path).await {
         return Err(AppError::InvalidArgument(MID_OP_REFUSAL.into()));
     }
@@ -5261,6 +5938,21 @@ pub(crate) async fn git_rebase_edit_with_timeout(
             continue_timeout,
         )
         .await;
+        let resumed = recover_empty_folds(
+            &repo_path,
+            &git_dir,
+            resumed,
+            &REBASE_CONTINUE_ARGS,
+            continue_timeout,
+            |args, timeout| {
+                let repo = repo_path.as_str();
+                async move {
+                    let args: Vec<_> = args.iter().map(String::as_str).collect();
+                    run_git_raw_env(Some(repo), &args, &CONTINUE_EDITOR_ENV, timeout).await
+                }
+            },
+        )
+        .await;
         let rebasing = rebase_in_progress(&git_dir);
         // Every stop with the rebase alive is left in progress on purpose: the user's
         // edit intent stands and the banner owns the rebase.
@@ -5281,6 +5973,8 @@ pub(crate) async fn git_rebase_edit_with_timeout(
         Err(live_rebase_error(L_EDITINTERRUPTED, "", failure))
     }
     .await;
+
+    drop(guard);
 
     crate::oplog::finish(
         &repo_path,
@@ -5321,8 +6015,9 @@ const REBASE_DIR_EXISTS: &str = "It seems that there is already a rebase-merge d
 /// older git ignores instead of refusing. `--no-autosquash` and `--no-rebase-merges`
 /// keep git's own fallback todo a plain pick list, which the missing-commits check
 /// compares ours against; `--no-verify` skips the pre-rebase hook. post-checkout fires
-/// at the start; post-rewrite fires at the finish (the replay's scripts map its squash
-/// groups and rewords) and, on the edit path, after each reword's amend too.
+/// at the start; post-rewrite fires at the finish, with the scripts mapping rewords
+/// on both routes and fold groups on the replay route; on the edit route git's
+/// native folds also fire their own `post-rewrite amend`.
 const REBASE_START_ARGS: [&str; 22] = [
     "-c",
     "core.editor=true",
@@ -5422,7 +6117,7 @@ async fn read_head_name(repo: &str) -> AppResult<String> {
 }
 
 /// The rebase todo for `steps` and `dropped`, and the files its `exec` lines read
-/// (path, content) under `dir`: message files and the replay's scripts. It opens with
+/// (path, content) under `dir`: message files and scripts. It opens with
 /// `break`, so the rebase pauses on `base` before any pick and the start-tip gate can
 /// run; drops are explicit lines, since `missingCommitsCheck=error` refuses a bare
 /// omission.
@@ -5431,7 +6126,8 @@ async fn read_head_name(repo: &str) -> AppResult<String> {
 /// generated script ([`group_script`]) instead of picking its leader: a picked leader
 /// whose change is already present stops as an empty pick, and an inline exec chain
 /// is cut by git's `sh -c` at ~8 KiB (87+ folds, measured on Windows). A replay
-/// reword amends through its own script too ([`reword_script`]).
+/// reword amends through its own script too ([`reword_script`]). The edit route
+/// keeps native folds and uses reword scripts for every composed message.
 fn rebase_todo(
     route: TodoRoute,
     steps: &[RewriteStep],
@@ -5473,7 +6169,7 @@ fn rebase_todo(
                 if let Some(file) = message_file {
                     let script = dir.join(format!("reword-{i}.sh"));
                     todo.push_str(&format!("exec sh {}\n", sh_quote(&shell_path(&script))));
-                    files.push((script, reword_script(&git, &file)));
+                    files.push((script, reword_script(&git, &file, route)));
                 }
             }
             TodoRoute::Edit => {
@@ -5485,9 +6181,9 @@ fn rebase_todo(
                 // The edit path's message is already composed: a hook must not stall
                 // a rebase the user resumes from the banner.
                 if let Some(file) = message_file {
-                    todo.push_str(&format!(
-                        "exec {git} commit --amend --no-verify -F {file}\n"
-                    ));
+                    let script = dir.join(format!("reword-{i}.sh"));
+                    todo.push_str(&format!("exec sh {}\n", sh_quote(&shell_path(&script))));
+                    files.push((script, reword_script(&git, &file, route)));
                 }
             }
         }
@@ -5545,17 +6241,20 @@ fn group_script(git: &str, leader: &str, folds: &[String], message_file: Option<
     script
 }
 
-/// The sh script a replay reword runs (LF only) after its pick: it amends with the new
-/// message, then points the pick's rewritten-list line at the amended commit. git
-/// records that line before the exec, so it would otherwise send the pick's notes and
-/// post-rewrite to the orphaned pre-amend commit; `--no-post-rewrite` leaves the
-/// finish's mapping as the only one. The commit hooks still run. A temp file and `mv`
-/// stand in for `sed -i`, whose syntax differs between GNU and BSD sed.
-fn reword_script(git: &str, message_file: &str) -> String {
+/// The LF-only reword script runs after its pick or, on the edit route, after
+/// a group's native fixups. Every rewritten-list line naming the pre-amend commit
+/// must point at the amended one, so notes and rebase-finish mappings reach it.
+/// This amend emits no post-rewrite event; only replay runs commit hooks. A temp
+/// file and `mv` stand in for `sed -i`, whose syntax differs between GNU and BSD sed.
+fn reword_script(git: &str, message_file: &str, route: TodoRoute) -> String {
+    let verify = match route {
+        TodoRoute::Replay => "",
+        TodoRoute::Edit => " --no-verify",
+    };
     format!(
         "set -e\n\
          pre=$({git} rev-parse HEAD)\n\
-         {git} commit --amend --no-post-rewrite -F {message_file}\n\
+         {git} commit --amend{verify} --no-post-rewrite -F {message_file}\n\
          new=$({git} rev-parse HEAD)\n\
          list=$({git} rev-parse --git-path rebase-merge/rewritten-list)\n\
          if [ -f \"$list\" ]; then sed \"s/ $pre\\$/ $new/\" \"$list\" > \"$list.gd-tmp\" \
@@ -7126,13 +7825,65 @@ mod tests {
         assert_eq!(rev(&repo, "HEAD").await, base);
     }
 
-    /// The mixed arm serves History's reset and the MCP `reset_to_commit`, which name
-    /// an explicit commit, so a pin never reaches it.
+    /// A stale tip pin refuses before the mixed reset touches the ref, index or tree.
     #[tokio::test]
-    async fn mixed_reset_ignores_expected_head() {
+    async fn mixed_reset_refuses_stale_expected_head() {
         let (dir, repo) = setup_repo("reset-mixed-pin").await;
         let base = rev(&repo, "HEAD").await;
         commit_file(&repo, dir.path(), "a.txt", "v1\n", "second").await;
+        let tip = rev(&repo, "HEAD").await;
+        let branch = head_branch(&repo).await;
+        let state = AppState::default();
+
+        let result = git_reset_core_expecting(
+            &state,
+            repo.clone(),
+            base,
+            Some("mixed".into()),
+            Some("0".repeat(40)),
+            ExpectedRef::Branch(branch),
+        )
+        .await;
+
+        assert_reset_head_moved(result);
+        assert_eq!(rev(&repo, "HEAD").await, tip);
+        assert_eq!(tree_text(dir.path(), "a.txt"), "v1\n");
+        assert_eq!(git(&repo, &["status", "--porcelain"]).await, "");
+    }
+
+    #[tokio::test]
+    async fn mixed_reset_refuses_switched_expected_branch() {
+        let (dir, repo) = setup_repo("reset-mixed-branch-pin").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v1\n", "second").await;
+        let tip = rev(&repo, "HEAD").await;
+        let branch = head_branch(&repo).await;
+        let state = AppState::default();
+
+        let result = git_reset_core_expecting(
+            &state,
+            repo.clone(),
+            base,
+            Some("mixed".into()),
+            Some(tip.clone()),
+            ExpectedRef::Branch("not-this-branch".into()),
+        )
+        .await;
+
+        assert_reset_switched(result, "mixed branch pin");
+        assert_eq!(head_branch(&repo).await, branch);
+        assert_eq!(rev(&repo, "HEAD").await, tip);
+        assert_eq!(tree_text(dir.path(), "a.txt"), "v1\n");
+        assert_eq!(git(&repo, &["status", "--porcelain"]).await, "");
+    }
+
+    #[tokio::test]
+    async fn mixed_reset_with_matching_pin_keeps_working_tree() {
+        let (dir, repo) = setup_repo("reset-mixed-matched-pin").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v1\n", "second").await;
+        let tip = rev(&repo, "HEAD").await;
+        let branch = head_branch(&repo).await;
         let state = AppState::default();
 
         git_reset_core_expecting(
@@ -7140,11 +7891,11 @@ mod tests {
             repo.clone(),
             base.clone(),
             Some("mixed".into()),
-            Some("0".repeat(40)),
-            ExpectedRef::Branch("not-this-branch".into()),
+            Some(tip),
+            ExpectedRef::Branch(branch),
         )
         .await
-        .expect("a mixed reset runs whatever the pin says");
+        .expect("a mixed reset runs with a matching pin");
 
         assert_eq!(rev(&repo, "HEAD").await, base);
         assert_eq!(tree_text(dir.path(), "a.txt"), "v1\n");
@@ -7375,6 +8126,122 @@ mod tests {
             }
             other => panic!("{case}: expected the branch-switched refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reset_tip_unread_wording_matches_the_rollback_outcome() {
+        use crate::git::commit::RolledBack;
+        let err = AppError::Timeout(30);
+        for label in ["main", "HEAD"] {
+            let restored = format!(
+                "Couldn't confirm where {label} points after the reset moved it, so it was moved back and your files were not updated.\ngit operation timed out after 30s"
+            );
+            let lost = format!(
+                "Couldn't confirm where {label} points after the reset moved it, and another Git process moved it before it could be moved back. Your files were not updated. Check the branch in a terminal; the reflog has every tip.\ngit operation timed out after 30s"
+            );
+            let stuck = format!(
+                "Couldn't confirm where {label} points after the reset moved it, and it couldn't be moved back: it now points at 1234567. Your files were not updated. Check the branch in a terminal; the reflog has every tip.\ngit operation timed out after 30s\nref lock held"
+            );
+            let unread = format!(
+                "Couldn't confirm where {label} points after the reset moved it to 1234567, and it couldn't be moved back. Your files were not updated. Check the branch in a terminal; the reflog has every tip.\ngit operation timed out after 30s\nrollback timed out"
+            );
+            for (rolled, expected) in [
+                (RolledBack::Restored, restored),
+                (RolledBack::Lost, lost),
+                (RolledBack::Stuck("ref lock held".into()), stuck),
+                (RolledBack::Unread("rollback timed out".into()), unread),
+            ] {
+                assert_eq!(
+                    reset_tip_unread(label, "1234567890abcdef", &err, rolled),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_hard_refuses_a_commit_right_after_its_swap() {
+        let (dir, repo) = setup_repo("reset-hard-commit-after").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v1\n", "second").await;
+        let tip = rev(&repo, "HEAD").await;
+        let branch = head_branch(&repo).await;
+        let full = head_ref(&repo).await;
+        let before = std::fs::read(dir.path().join("a.txt")).unwrap();
+        let state = AppState::default();
+
+        let result = RESET_SWAPPED_HOOK
+            .scope(
+                crate::git::commit::racing_git(
+                    &repo,
+                    &[&["commit", "--allow-empty", "-qm", "raced commit"]],
+                ),
+                reset_hard_on(
+                    &state,
+                    &repo,
+                    &base,
+                    &tip,
+                    ExpectedRef::Branch(branch.clone()),
+                ),
+            )
+            .await;
+
+        let racer = rev(&repo, "HEAD").await;
+        assert_ne!(racer, base);
+        assert_ne!(racer, tip);
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%s"]).await.trim(),
+            "raced commit"
+        );
+        match result {
+            Err(AppError::Git { stderr, .. }) => {
+                assert_eq!(stderr, reset_tip_moved(&branch, &racer));
+            }
+            other => panic!("expected the raced-tip refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), before);
+        assert_eq!(head_branch(&repo).await, branch);
+        assert_eq!(rev(&repo, &full).await, racer);
+        assert_eq!(orig_head(&repo).await, None);
+    }
+
+    #[tokio::test]
+    async fn reset_hard_refuses_a_deleted_ref_right_after_its_swap() {
+        let (dir, repo) = setup_repo("reset-hard-deleted-after").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v1\n", "second").await;
+        let tip = rev(&repo, "HEAD").await;
+        let branch = head_branch(&repo).await;
+        let full = head_ref(&repo).await;
+        let before = std::fs::read(dir.path().join("a.txt")).unwrap();
+        let state = AppState::default();
+
+        let result = RESET_SWAPPED_HOOK
+            .scope(
+                crate::git::commit::racing_git(&repo, &[&["update-ref", "-d", &full]]),
+                reset_hard_on(
+                    &state,
+                    &repo,
+                    &base,
+                    &tip,
+                    ExpectedRef::Branch(branch.clone()),
+                ),
+            )
+            .await;
+
+        match result {
+            Err(AppError::Git { stderr, .. }) => {
+                assert_eq!(stderr, reset_tip_deleted(&branch));
+            }
+            other => panic!("expected the deleted-tip refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), before);
+        assert_eq!(head_ref(&repo).await, full);
+        assert_eq!(
+            crate::git::commit::ref_oid(&repo, &full).await.unwrap(),
+            None
+        );
+        assert_eq!(orig_head(&repo).await, None);
     }
 
     /// Another process switches branches right after the swap landed, which the swap (it
@@ -8545,17 +9412,31 @@ mod tests {
             edit: true,
         };
         // "two"'s patch (v1→v2) can't apply onto v0 once "one" is dropped.
-        git_rebase_edit(repo.clone(), base, vec![step], Some(vec![c1]))
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![step],
+            Some(vec![c1]),
+        )
+        .await
+        .unwrap();
         assert!(rebasing(&repo).await, "left for the banner");
         assert!(!git(&repo, &["ls-files", "-u"]).await.trim().is_empty());
         assert!(!op_state(&repo).await.unwrap().edit_paused, "conflicted");
+        assert_eq!(
+            serde_json::to_value(op_state(&repo).await.unwrap()).unwrap()["rebaseStop"],
+            "pick"
+        );
 
         std::fs::write(dir.path().join("a.txt"), "resolved\n").unwrap();
         git(&repo, &["add", "a.txt"]).await;
         assert!(git(&repo, &["ls-files", "-u"]).await.trim().is_empty());
         assert!(!op_state(&repo).await.unwrap().edit_paused, "resolved");
+        assert_eq!(
+            serde_json::to_value(op_state(&repo).await.unwrap()).unwrap()["rebaseStop"],
+            "pick"
+        );
     }
 
     /// Reword keeps each commit's author and author date, and a squash its leader's;
@@ -8604,7 +9485,7 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                git_rebase_edit(repo.clone(), base, plan, None)
+                rebase_edit(&AppState::default(), repo.clone(), base, plan, None)
                     .await
                     .unwrap();
             }
@@ -9036,7 +9917,14 @@ mod tests {
     #[tokio::test]
     async fn rebase_edit_refuses_uncovered_commits() {
         let (_dir, repo, base, c1, c2, c3) = plan_with_an_outside_commit("rebase-uncovered").await;
-        let result = git_rebase_edit(repo.clone(), base, vec![pick(&c1), pick(&c2)], None).await;
+        let result = rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&c1), pick(&c2)],
+            None,
+        )
+        .await;
         let Err(AppError::InvalidArgument(msg)) = &result else {
             panic!("an uncovered commit must refuse, got {result:?}");
         };
@@ -9053,9 +9941,15 @@ mod tests {
         commit_file(&repo, dir.path(), "c.txt", "c\n", "two").await;
         let c2 = rev(&repo, "HEAD").await;
 
-        git_rebase_edit(repo.clone(), base, vec![pick(&c2)], Some(vec![c1]))
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&c2)],
+            Some(vec![c1]),
+        )
+        .await
+        .unwrap();
         assert!(!git_path_exists(&repo, "rebase-merge").await);
         assert!(!git_path_exists(&repo, "rebase-apply").await);
         assert_eq!(subjects(&repo).await, vec!["two", "base"]);
@@ -9078,9 +9972,15 @@ mod tests {
             message: None,
             edit: true,
         };
-        git_rebase_edit(repo.clone(), base, vec![step], Some(vec![c1]))
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![step],
+            Some(vec![c1]),
+        )
+        .await
+        .unwrap();
         // Paused at the edit with the drop applied, not stopped on the todo.
         assert!(git_path_exists(&repo, "rebase-merge").await);
         assert_eq!(subjects(&repo).await, vec!["two", "base"]);
@@ -9503,7 +10403,7 @@ mod tests {
                     let state = AppState::default();
                     rewrite_commits(&state, &repo, &base, &plan, &[]).await
                 } else {
-                    git_rebase_edit(repo.clone(), base.clone(), plan, None).await
+                    rebase_edit(&AppState::default(), repo.clone(), base.clone(), plan, None).await
                 };
                 assert!(
                     matches!(&result, Err(AppError::InvalidArgument(m)) if m == UNCOVERED_REFUSAL),
@@ -10186,9 +11086,15 @@ mod tests {
             message: None,
             edit: true,
         };
-        git_rebase_edit(repo.clone(), base, vec![pick(&below), step], None)
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&below), step],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(rebasing(&repo).await, "paused at the edit");
     }
 
@@ -10270,9 +11176,15 @@ mod tests {
         }
         write_hook(&repo, "commit-msg", hook);
         write_hook(&repo, "pre-commit", marker);
-        git_rebase_edit(repo.clone(), base, plan(&commits), None)
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            plan(&commits),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!rebasing(&repo).await, "a plan with no edit runs through");
         let log = git(&repo, &["log", "-2", "--format=%B"]).await;
         assert!(
@@ -10298,9 +11210,15 @@ mod tests {
             message: None,
             edit: true,
         };
-        git_rebase_edit(repo.clone(), base, vec![pick(&c1), step], None)
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&c1), step],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(rebasing(&repo).await);
         assert_eq!(rev(&repo, "HEAD").await, c2, "stopped at the edit commit");
         assert!(
@@ -10424,6 +11342,705 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rebase_stop_kind_synthetic_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path();
+        assert_eq!(rebase_stop_kind(git_dir), None);
+        let merge = git_dir.join("rebase-merge");
+        std::fs::create_dir(&merge).unwrap();
+        assert_eq!(rebase_stop_kind(git_dir), Some(RebaseStop::Other));
+        for (verb, expected) in [
+            ("pick", RebaseStop::Pick),
+            ("p", RebaseStop::Pick),
+            ("reword", RebaseStop::Pick),
+            ("r", RebaseStop::Pick),
+            ("squash", RebaseStop::Pick),
+            ("s", RebaseStop::Pick),
+            ("fixup", RebaseStop::Pick),
+            ("f", RebaseStop::Pick),
+            ("exec", RebaseStop::Exec),
+            ("x", RebaseStop::Exec),
+            ("break", RebaseStop::Break),
+            ("b", RebaseStop::Break),
+            ("edit", RebaseStop::Pick),
+            ("e", RebaseStop::Pick),
+            ("label", RebaseStop::Other),
+            ("", RebaseStop::Other),
+        ] {
+            std::fs::write(merge.join("done"), format!("{verb} \n\n")).unwrap();
+            assert_eq!(rebase_stop_kind(git_dir), Some(expected), "{verb}");
+        }
+        std::fs::write(merge.join("amend"), "oid\n").unwrap();
+        for verb in ["edit", "e"] {
+            std::fs::write(merge.join("done"), format!("pick earlier\n{verb} oid\n\n")).unwrap();
+            assert_eq!(rebase_stop_kind(git_dir), Some(RebaseStop::Edit));
+            assert!(rebase_stopped_for_edit(git_dir));
+        }
+        std::fs::write(merge.join("done"), [0xff]).unwrap();
+        assert_eq!(rebase_stop_kind(git_dir), Some(RebaseStop::Other));
+        std::fs::remove_file(merge.join("done")).unwrap();
+        std::fs::create_dir(merge.join("done")).unwrap();
+        assert_eq!(rebase_stop_kind(git_dir), Some(RebaseStop::Other));
+        std::fs::remove_dir_all(&merge).unwrap();
+        std::fs::create_dir(git_dir.join("rebase-apply")).unwrap();
+        assert_eq!(rebase_stop_kind(git_dir), Some(RebaseStop::Other));
+    }
+
+    #[test]
+    fn repo_op_state_serializes_rebase_stop() {
+        for (kind, wire) in [
+            (None, None),
+            (Some(RebaseStop::Edit), Some("edit")),
+            (Some(RebaseStop::Pick), Some("pick")),
+            (Some(RebaseStop::Exec), Some("exec")),
+            (Some(RebaseStop::Break), Some("break")),
+            (Some(RebaseStop::Other), Some("other")),
+        ] {
+            let value = serde_json::to_value(RepoOpState {
+                merging: false,
+                rebasing: kind.is_some(),
+                cherry_picking: false,
+                reverting: false,
+                edit_paused: kind == Some(RebaseStop::Edit),
+                rebase_stop: kind,
+            })
+            .unwrap();
+            assert!(value.get("rebaseStop").is_some());
+            assert_eq!(value["rebaseStop"], serde_json::to_value(wire).unwrap());
+            assert!(value.get("rebase_stop").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_stop_kind_exec_break_and_edit() {
+        for (line, kind, edit_paused) in [
+            ("exec false", "exec", false),
+            ("break", "break", false),
+            ("edit", "edit", true),
+        ] {
+            let (dir, repo) = setup_repo("stop-kind").await;
+            let base = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "x", "x\n", "one").await;
+            let tip = rev(&repo, "HEAD").await;
+            if kind == "break" {
+                pause_foreign_rebase(&repo, &base).await;
+            } else {
+                let line = if edit_paused {
+                    format!("edit {tip}")
+                } else {
+                    format!("pick {tip}\n{line}")
+                };
+                let todo = write_test_todo(&repo, "stop-kind-todo", &format!("break\n{line}\n"));
+                start_with_todo(&repo, &base, &plan_start(&repo).await, &todo)
+                    .await
+                    .unwrap();
+                let out = run_git_raw_env(
+                    Some(&repo),
+                    &REBASE_CONTINUE_ARGS,
+                    &CONTINUE_EDITOR_ENV,
+                    DEFAULT_TIMEOUT,
+                )
+                .await
+                .unwrap();
+                assert_eq!(out.code == 0, edit_paused, "{}", out.stderr);
+            }
+            let state = op_state(&repo).await.unwrap();
+            assert_eq!(state.edit_paused, edit_paused);
+            assert_eq!(serde_json::to_value(state).unwrap()["rebaseStop"], kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_stop_kind_conflicted_and_emptied_pick() {
+        for empty in [false, true] {
+            let (dir, repo) = setup_repo("stop-kind-pick").await;
+            let base = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "a.txt", "v1\n", "one").await;
+            let a = rev(&repo, "HEAD").await;
+            if empty {
+                commit_file(&repo, dir.path(), "y", "y\n", "two").await;
+            } else {
+                commit_file(&repo, dir.path(), "a.txt", "v2\n", "two").await;
+            }
+            let b = rev(&repo, "HEAD").await;
+            let lines = if empty {
+                format!("pick {a}\npick {a}\npick {b}")
+            } else {
+                format!("pick {b}\npick {a}")
+            };
+            let todo = write_test_todo(&repo, "stop-kind-pick-todo", &format!("break\n{lines}\n"));
+            start_with_todo(&repo, &base, &plan_start(&repo).await, &todo)
+                .await
+                .unwrap();
+            let out = run_git_raw_env(
+                Some(&repo),
+                &REBASE_CONTINUE_ARGS,
+                &CONTINUE_EDITOR_ENV,
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_ne!(out.code, 0);
+            assert!(rebasing(&repo).await);
+            assert_eq!(has_unmerged(&repo).await.unwrap(), !empty);
+            assert_eq!(
+                serde_json::to_value(op_state(&repo).await.unwrap()).unwrap()["rebaseStop"],
+                "pick"
+            );
+            if !empty {
+                std::fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+                git(&repo, &["add", "a.txt"]).await;
+                assert!(!has_unmerged(&repo).await.unwrap());
+                assert_eq!(
+                    serde_json::to_value(op_state(&repo).await.unwrap()).unwrap()["rebaseStop"],
+                    "pick"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_empty_fold_guards() {
+        let (dir, repo) = setup_repo("edit-route-guards").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "x", "x\n", "leader").await;
+        let a = rev(&repo, "HEAD").await;
+        git(&repo, &["revert", "--no-edit", &a]).await;
+        let b = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "y", "y\n", "last fold").await;
+        let c = rev(&repo, "HEAD").await;
+        let todo = write_test_todo(
+            &repo,
+            "guard-todo",
+            &format!("break\npick {a}\nfixup {b}\nfixup {c}\n"),
+        );
+        start_with_todo(&repo, &base, &plan_start(&repo).await, &todo)
+            .await
+            .unwrap();
+        let out = run_git_raw_env(
+            Some(&repo),
+            &REBASE_CONTINUE_ARGS,
+            &CONTINUE_EDITOR_ENV,
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(out.code, 0);
+        let failure = out.full_failure_text();
+        let git_dir = git_dir_of(&repo).await;
+        let todo = git_dir.join("rebase-merge/git-rebase-todo");
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_some());
+        let amend = git_dir.join("rebase-merge/amend");
+        let original_amend = std::fs::read_to_string(&amend).unwrap();
+        std::fs::write(&amend, format!("{c}\n")).unwrap();
+        assert!(
+            empty_fold_stop(&git_dir, &repo, &failure).await.is_none(),
+            "a mismatched amend oid must refuse recovery"
+        );
+        std::fs::write(&amend, original_amend).unwrap();
+        // HEAD resolves to a non-empty commit, but todo operands must be hashes.
+        std::fs::write(&todo, "fixup HEAD\n").unwrap();
+        assert!(
+            empty_fold_stop(&git_dir, &repo, &failure).await.is_none(),
+            "the remaining-fold loop must reject a non-hash operand"
+        );
+        std::fs::write(&todo, format!("fixup {c}\nfixup HEAD\n")).unwrap();
+        assert!(
+            empty_fold_stop(&git_dir, &repo, &failure).await.is_some(),
+            "after a non-empty fold, later operands are left for git to parse on continue"
+        );
+        std::fs::write(&todo, format!("fixup {c}\n")).unwrap();
+        let stopped = git_dir.join("rebase-merge/stopped-sha");
+        let done = git_dir.join("rebase-merge/done");
+        let original_done = std::fs::read_to_string(&done).unwrap();
+        std::fs::write(&done, format!("fixup {b}\n")).unwrap();
+        std::fs::write(&stopped, format!("{}\n", &b[..12])).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_some());
+        std::fs::write(&done, format!("fixup {}\n", &b[..12])).unwrap();
+        std::fs::write(&stopped, format!("{b}\n")).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_some());
+        std::fs::write(&stopped, "").unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_none());
+        std::fs::write(&stopped, format!("{b}\n")).unwrap();
+        std::fs::write(&done, original_done).unwrap();
+        std::fs::write(&todo, format!("\n # comment\nf {c}\n")).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_some());
+        std::fs::write(&todo, format!("\n# comment\nfixup {b}\nfixup {c}\n")).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_none());
+        std::fs::write(&todo, format!("pick {c}\n")).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, &failure).await.is_none());
+        std::fs::write(&todo, format!("fixup {c}\n")).unwrap();
+        assert!(empty_fold_stop(&git_dir, &repo, "unrelated failure")
+            .await
+            .is_none());
+        let missing_repo = dir.path().join("missing-repo");
+        assert!(
+            empty_fold_stop(&git_dir, missing_repo.to_str().unwrap(), &failure)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_route_reword_maps_its_commit_to_the_final_one() {
+        for fast_forward in [true, false] {
+            let (dir, repo) = setup_repo("edit-route-reword-parent").await;
+            let base = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "1.txt", "1\n", "one").await;
+            let c1 = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "2.txt", "2\n", "two").await;
+            let original = rev(&repo, "HEAD").await;
+            git(&repo, &["notes", "add", "-m", "note-x", &original]).await;
+            let log = track_rewrites(&repo).await;
+            let reword = RewriteStep {
+                hashes: vec![original.clone()],
+                message: Some("reworded".into()),
+                edit: false,
+            };
+            // Dropping the parent forces a fresh pick before the reword amend.
+            let (steps, dropped) = if fast_forward {
+                (vec![pick(&c1), reword], vec![])
+            } else {
+                (vec![reword], vec![c1.clone()])
+            };
+            rebase_edit(
+                &AppState::default(),
+                repo.clone(),
+                base.clone(),
+                steps,
+                Some(dropped),
+            )
+            .await
+            .unwrap();
+            let head = rev(&repo, "HEAD").await;
+            assert_eq!(
+                rev(&repo, "HEAD^").await,
+                if fast_forward { c1 } else { base }
+            );
+            assert_eq!(
+                subjects(&repo).await.first().map(String::as_str),
+                Some("reworded")
+            );
+            assert_eq!(
+                git(&repo, &["notes", "show", "HEAD"]).await.trim(),
+                "note-x"
+            );
+            let log = std::fs::read_to_string(log).unwrap();
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.starts_with("post-rewrite "))
+                    .collect::<Vec<_>>(),
+                ["post-rewrite rebase"]
+            );
+            assert_eq!(
+                log.lines()
+                    .filter_map(|line| line.strip_prefix(&format!("{original} ")))
+                    .collect::<Vec<_>>(),
+                [head.as_str()],
+                "ff={fast_forward}: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_squash_recovery_keeps_git_combined_message() {
+        let mut expected = String::new();
+        for recover in [false, true] {
+            let (dir, repo) = setup_repo("edit-route-native-squash").await;
+            let base = rev(&repo, "HEAD").await;
+            // The control's extra file keeps every native squash non-empty;
+            // identical commit messages let git itself supply the expected message.
+            if !recover {
+                std::fs::write(dir.path().join("anchor"), "anchor\n").unwrap();
+            }
+            commit_file(&repo, dir.path(), "x", "x\n", "leader\n\nleader body").await;
+            let a = rev(&repo, "HEAD").await;
+            std::fs::remove_file(dir.path().join("x")).unwrap();
+            git(&repo, &["add", "-u"]).await;
+            git(&repo, &["commit", "-m", "cancel leader\n\ncancel body"]).await;
+            let b = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "y", "y\n", "last fold\n\nlast body").await;
+            let c = rev(&repo, "HEAD").await;
+            let todo = write_test_todo(
+                &repo,
+                "squash-todo",
+                &format!("break\npick {a}\nsquash {b}\nsquash {c}\n"),
+            );
+            start_with_todo(&repo, &base, &plan_start(&repo).await, &todo)
+                .await
+                .unwrap();
+            let out = run_git_raw_env(
+                Some(&repo),
+                &REBASE_CONTINUE_ARGS,
+                &CONTINUE_EDITOR_ENV,
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            if recover {
+                assert_ne!(out.code, 0);
+                assert!(out.full_failure_text().contains(EMPTY_FOLD_REFUSAL));
+                let (message, _) =
+                    empty_fold_stop(&git_dir_of(&repo).await, &repo, &out.full_failure_text())
+                        .await
+                        .unwrap();
+                assert!(Path::new(&message).ends_with("message-squash"));
+                assert!(op_continue(&AppState::default(), &repo, "rebase")
+                    .await
+                    .unwrap());
+            } else {
+                assert_eq!(out.code, 0, "{}", out.full_failure_text());
+            }
+            assert!(!rebasing(&repo).await);
+            assert_eq!(
+                git(&repo, &["rev-list", "--count", &format!("{base}..HEAD")])
+                    .await
+                    .trim(),
+                "1"
+            );
+            let message = git(&repo, &["log", "-1", "--format=%B"]).await;
+            if recover {
+                assert_eq!(message, expected);
+            } else {
+                expected = message;
+                assert!(
+                    expected.contains("leader body")
+                        && expected.contains("cancel body")
+                        && expected.contains("last body")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_recovered_chain_that_nets_empty_stays_stopped() {
+        let (dir, repo) = setup_repo("edit-route-net-empty").await;
+        let base = rev(&repo, "HEAD").await;
+        let branch = read_head_name(&repo).await.unwrap();
+        commit_file(&repo, dir.path(), "x", "x\n", "A").await;
+        let a = rev(&repo, "HEAD").await;
+        git(&repo, &["revert", "--no-edit", &a]).await;
+        let b = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "y", "y\n", "D").await;
+        let d = rev(&repo, "HEAD").await;
+        git(&repo, &["revert", "--no-edit", &d]).await;
+        let original_tip = rev(&repo, "HEAD").await;
+        let result = rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base.clone(),
+            vec![RewriteStep {
+                hashes: vec![a, b, d, original_tip.clone()],
+                message: None,
+                edit: false,
+            }],
+            None,
+        )
+        .await;
+        let Err(AppError::Git { stderr, .. }) = result else {
+            panic!("expected an interrupted rebase: {result:?}");
+        };
+        assert_eq!(stderr.lines().next(), Some(L_EDITINTERRUPTED));
+        assert!(rebasing(&repo).await);
+        let git_dir = git_dir_of(&repo).await;
+        let done = std::fs::read_to_string(git_dir.join("rebase-merge/done")).unwrap();
+        let (verb, stopped) = last_rebase_instruction(&done).unwrap();
+        assert_eq!(verb, "fixup");
+        assert!(
+            original_tip.starts_with(stopped.unwrap()),
+            "recovery must advance past B to E"
+        );
+        assert_eq!(rev(&repo, "HEAD^").await, base);
+        assert_eq!(git(&repo, &["show", "HEAD:y"]).await.trim(), "y");
+        assert_eq!(
+            run_git_raw(
+                Some(&repo),
+                &["diff-tree", "--quiet", "HEAD^", "HEAD"],
+                DEFAULT_TIMEOUT
+            )
+            .await
+            .unwrap()
+            .code,
+            1
+        );
+        op_abort(&AppState::default(), &repo, "rebase")
+            .await
+            .unwrap();
+        assert!(!rebasing(&repo).await);
+        assert_eq!(rev(&repo, "HEAD").await, original_tip);
+        assert_eq!(read_head_name(&repo).await.unwrap(), branch);
+        assert!(git(&repo, &["status", "--porcelain"])
+            .await
+            .trim()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_route_empty_fold_phase_and_mapping_matrix() {
+        for phase in ["before-edit", "after-edit", "edit-leader"] {
+            for message in [None, Some("combined")] {
+                let (dir, repo) = setup_repo("edit-route-empty-matrix").await;
+                let base = rev(&repo, "HEAD").await;
+                let mut steps = Vec::new();
+                if phase == "after-edit" {
+                    commit_file(&repo, dir.path(), "pause", "pause\n", "pause").await;
+                    let mut step = pick(&rev(&repo, "HEAD").await);
+                    step.edit = true;
+                    steps.push(step);
+                }
+                commit_file_by(&repo, dir.path(), "x", "leader").await;
+                git(
+                    &repo,
+                    &[
+                        "commit",
+                        "--amend",
+                        "--no-edit",
+                        "--date=2001-02-03T04:05:06+0530",
+                    ],
+                )
+                .await;
+                let a = rev(&repo, "HEAD").await;
+                let author = git(&repo, &["log", "-1", "--format=%an|%ae|%aI"]).await;
+                git(&repo, &["revert", "--no-edit", &a]).await;
+                let b = rev(&repo, "HEAD").await;
+                commit_file(&repo, dir.path(), "y", "y\n", "last fold").await;
+                let c = rev(&repo, "HEAD").await;
+                let members = vec![a, b, c];
+                steps.push(RewriteStep {
+                    hashes: members.clone(),
+                    message: message.map(str::to_string),
+                    edit: phase == "edit-leader",
+                });
+                if phase == "before-edit" {
+                    commit_file(&repo, dir.path(), "pause", "pause\n", "pause").await;
+                    let mut step = pick(&rev(&repo, "HEAD").await);
+                    step.edit = true;
+                    steps.push(step);
+                }
+                for (i, h) in members.iter().enumerate() {
+                    git(&repo, &["notes", "add", "-m", &format!("note-{i}"), h]).await;
+                }
+                let log = track_rewrites(&repo).await;
+                write_hook(&repo, "pre-commit", "exit 1");
+                write_hook(&repo, "commit-msg", "exit 1");
+                rebase_edit(
+                    &AppState::default(),
+                    repo.clone(),
+                    base.clone(),
+                    steps,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(op_continue(&AppState::default(), &repo, "rebase")
+                    .await
+                    .unwrap());
+                assert!(!rebasing(&repo).await);
+                let group = if phase == "before-edit" {
+                    "HEAD~1"
+                } else {
+                    "HEAD"
+                };
+                let final_sha = rev(&repo, group).await;
+                let count = git(&repo, &["rev-list", "--count", &format!("{base}..HEAD")]).await;
+                assert_eq!(count.trim(), if phase == "edit-leader" { "1" } else { "2" });
+                assert_eq!(
+                    git(&repo, &["log", "-1", "--format=%B", group])
+                        .await
+                        .trim(),
+                    message.unwrap_or("leader")
+                );
+                assert_eq!(
+                    git(&repo, &["log", "-1", "--format=%an|%ae|%aI", group]).await,
+                    author
+                );
+                assert!(!dir.path().join("x").exists());
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("y"))
+                        .unwrap()
+                        .trim(),
+                    "y"
+                );
+                let log = std::fs::read_to_string(log).unwrap();
+                // Only the final native fold emits amend; recovery and reword amends do not.
+                assert_eq!(
+                    log.lines()
+                        .filter(|l| l.starts_with("post-rewrite "))
+                        .collect::<Vec<_>>(),
+                    ["post-rewrite amend", "post-rewrite rebase"],
+                    "phase={phase} message={message:?}: {log}"
+                );
+                for h in &members {
+                    assert_eq!(
+                        log.lines()
+                            .filter(|l| l.starts_with(&format!("{h} ")))
+                            .collect::<Vec<_>>(),
+                        [format!("{h} {final_sha}")]
+                    );
+                }
+                let notes = git(&repo, &["notes", "show", group]).await;
+                for i in 0..members.len() {
+                    assert!(notes.contains(&format!("note-{i}")), "{notes}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_reword_mappings_and_hooks() {
+        for group in [false, true] {
+            let (dir, repo) = setup_repo("edit-route-mappings").await;
+            let base = rev(&repo, "HEAD").await;
+            commit_file_by(&repo, dir.path(), "x", "leader").await;
+            let leader = rev(&repo, "HEAD").await;
+            let mut members = vec![leader];
+            if group {
+                commit_file(&repo, dir.path(), "y", "y\n", "fold").await;
+                members.push(rev(&repo, "HEAD").await);
+            }
+            for (i, member) in members.iter().enumerate() {
+                git(&repo, &["notes", "add", "-m", &format!("note-{i}"), member]).await;
+            }
+            let log = track_rewrites(&repo).await;
+            write_hook(&repo, "pre-commit", "exit 1");
+            write_hook(&repo, "commit-msg", "exit 1");
+            rebase_edit(
+                &AppState::default(),
+                repo.clone(),
+                base,
+                vec![RewriteStep {
+                    hashes: members.clone(),
+                    message: Some("combined".into()),
+                    edit: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+            let head = rev(&repo, "HEAD").await;
+            let log = std::fs::read_to_string(log).unwrap();
+            let expected = format!(
+                "post-rewrite rebase\n{}",
+                members
+                    .iter()
+                    .map(|h| format!("{h} {head}\n"))
+                    .collect::<String>()
+            );
+            let notes = git(&repo, &["notes", "show", "HEAD"]).await;
+            for i in 0..members.len() {
+                assert!(notes.contains(&format!("note-{i}")), "{notes}");
+            }
+            assert_eq!(
+                git(&repo, &["log", "-1", "--format=%s"]).await.trim(),
+                "combined"
+            );
+            // Native fixup emits amend; the app's reword must not emit another one.
+            let events = log
+                .lines()
+                .filter(|line| line.starts_with("post-rewrite "))
+                .collect::<Vec<_>>();
+            let log = if group {
+                assert_eq!(events, ["post-rewrite amend", "post-rewrite rebase"]);
+                let native = log.strip_prefix("post-rewrite amend\n").unwrap();
+                let (mapping, rest) = native.split_once('\n').unwrap();
+                let (old, new) = mapping.split_once(' ').unwrap();
+                assert_eq!(old, members[0]);
+                validate_hash(new).unwrap();
+                assert_ne!(new, head);
+                rest
+            } else {
+                assert_eq!(events, ["post-rewrite rebase"]);
+                log.as_str()
+            };
+            assert_eq!(log, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_whole_empty_chain_stays_stopped() {
+        for empty_tail in [false, true] {
+            let (dir, repo) = setup_repo("edit-route-whole-empty").await;
+            let base = rev(&repo, "HEAD").await;
+            commit_file(&repo, dir.path(), "x", "x\n", "leader").await;
+            let leader = rev(&repo, "HEAD").await;
+            git(&repo, &["revert", "--no-edit", &leader]).await;
+            let mut members = vec![leader.clone(), rev(&repo, "HEAD").await];
+            if empty_tail {
+                for _ in 0..2 {
+                    git(&repo, &["commit", "--allow-empty", "-m", "empty fold"]).await;
+                    members.push(rev(&repo, "HEAD").await);
+                }
+            }
+            let result = rebase_edit(
+                &AppState::default(),
+                repo.clone(),
+                base,
+                vec![RewriteStep {
+                    hashes: members,
+                    message: None,
+                    edit: false,
+                }],
+                None,
+            )
+            .await;
+            let Err(AppError::Git { stderr, .. }) = result else {
+                panic!("expected an interrupted rebase: {result:?}");
+            };
+            assert_eq!(stderr.lines().next(), Some(L_EDITINTERRUPTED));
+            assert!(rebasing(&repo).await);
+            assert_eq!(rev(&repo, "HEAD").await, leader);
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_route_conflicting_fold_resolves_in_place() {
+        let (dir, repo) = setup_repo("edit-route-fold-conflict").await;
+        let base = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v1\n", "A").await;
+        let a = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "y", "y\n", "C").await;
+        let c = rev(&repo, "HEAD").await;
+        commit_file(&repo, dir.path(), "a.txt", "v2\n", "B").await;
+        let b = rev(&repo, "HEAD").await;
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![
+                RewriteStep {
+                    hashes: vec![c, b],
+                    message: None,
+                    edit: false,
+                },
+                pick(&a),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(has_unmerged(&repo).await.unwrap());
+        let done =
+            std::fs::read_to_string(git_dir_of(&repo).await.join("rebase-merge/done")).unwrap();
+        assert_eq!(
+            done.lines().last().unwrap().split_whitespace().next(),
+            Some("fixup")
+        );
+        // Resolve to A's parent so the pending pick of A also applies cleanly.
+        std::fs::write(dir.path().join("a.txt"), "v0\n").unwrap();
+        git(&repo, &["add", "a.txt"]).await;
+        assert!(op_continue(&AppState::default(), &repo, "rebase")
+            .await
+            .unwrap());
+        assert!(!rebasing(&repo).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .trim(),
+            "v1"
+        );
+    }
+
     /// The replay drops a fold group's commits and runs its script (every commit
     /// staged, one commit); the edit route keeps git's own `fixup` lines.
     #[test]
@@ -10529,17 +12146,37 @@ mod tests {
              && mv \"$list.gd-tmp\" \"$list\"; fi\n"
         );
         assert!(!files.iter().any(|(_, c)| c.contains('\r')), "LF only");
-        let (edit, _) = rebase_todo(TodoRoute::Edit, &steps, &[], dir, "git");
+        let (edit, edit_files) = rebase_todo(TodoRoute::Edit, &steps, &[], dir, "git");
         assert_eq!(
             edit,
             "break\n\
              pick a1\nfixup a2\nfixup a3\n\
              pick b1\nfixup b2\n\
-             exec 'git' commit --amend --no-verify -F 'd/msg-1'\n\
+             exec sh 'd/reword-1.sh'\n\
              pick c1\n\
              pick d1\n\
-             exec 'git' commit --amend --no-verify -F 'd/msg-3'\n"
+             exec sh 'd/reword-3.sh'\n"
         );
+        assert_eq!(edit_files.len(), 4);
+        for i in [1, 3] {
+            let body = &edit_files
+                .iter()
+                .find(|(p, _)| shell_path(p) == format!("d/reword-{i}.sh"))
+                .unwrap()
+                .1;
+            assert_eq!(
+                body,
+                &format!(
+                    "set -e\n\
+                 pre=$('git' rev-parse HEAD)\n\
+                 'git' commit --amend --no-verify --no-post-rewrite -F 'd/msg-{i}'\n\
+                 new=$('git' rev-parse HEAD)\n\
+                 list=$('git' rev-parse --git-path rebase-merge/rewritten-list)\n\
+                 if [ -f \"$list\" ]; then sed \"s/ $pre\\$/ $new/\" \"$list\" > \"$list.gd-tmp\" \
+                 && mv \"$list.gd-tmp\" \"$list\"; fi\n"
+                )
+            );
+        }
     }
 
     /// A path reaches the shell as-is off Windows, where `\` is a filename byte.
@@ -10570,7 +12207,8 @@ mod tests {
             message: None,
             edit: true,
         };
-        let result = git_rebase_edit_with_timeout(
+        let result = rebase_edit_with_timeout(
+            &AppState::default(),
             repo.clone(),
             base,
             vec![pick(&c1), step],
@@ -10620,7 +12258,7 @@ mod tests {
             } else {
                 vec![pick(&c1), edit(&c2)]
             };
-            let result = git_rebase_edit(repo.clone(), base, plan, None).await;
+            let result = rebase_edit(&AppState::default(), repo.clone(), base, plan, None).await;
             let lock = git_dir_of(&repo).await.join("index.lock");
             let Err(AppError::Git { stderr, .. }) = &result else {
                 panic!("edit_first={edit_first}: a stop short of the edit must be reported, got {result:?}");
@@ -10664,9 +12302,15 @@ mod tests {
             edit: true,
         };
         // "two"'s patch (v1→v2) can't apply onto v0.
-        git_rebase_edit(repo.clone(), base, vec![pick(&c2), step], None)
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&c2), step],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(rebasing(&repo).await, "left for the banner");
         assert!(!git(&repo, &["ls-files", "-u"]).await.trim().is_empty());
     }
@@ -10776,7 +12420,14 @@ mod tests {
         commit_file(&repo, dir.path(), "c.txt", "c\n", "one").await;
         let c1 = rev(&repo, "HEAD").await;
 
-        let result = git_rebase_edit(repo.clone(), base, vec![pick(&below), pick(&c1)], None).await;
+        let result = rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            base,
+            vec![pick(&below), pick(&c1)],
+            None,
+        )
+        .await;
         let Err(AppError::InvalidArgument(msg)) = &result else {
             panic!("an out-of-range step must refuse, got {result:?}");
         };
@@ -11394,7 +13045,7 @@ mod tests {
             message: None,
             edit: true,
         };
-        let result = git_rebase_edit(repo.clone(), base, vec![step], None).await;
+        let result = rebase_edit(&AppState::default(), repo.clone(), base, vec![step], None).await;
         assert!(
             result.is_err(),
             "must refuse a new edit-rebase while one is in progress"
@@ -11446,7 +13097,14 @@ mod tests {
         // Reachable through the guard that clears another op's pending files. The
         // message is load-bearing: the dirty-tree guard below it also refuses this
         // tree, so only the wording proves WHICH guard caught it.
-        let refused = git_rebase_edit(repo.clone(), tip, vec![pick(&f1)], None).await;
+        let refused = rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            tip,
+            vec![pick(&f1)],
+            None,
+        )
+        .await;
         let Err(AppError::InvalidArgument(msg)) = &refused else {
             panic!("edit-rebase must refuse over sequencer state, got {refused:?}");
         };
@@ -11499,6 +13157,7 @@ mod tests {
             cherry_picking: false,
             reverting: false,
             edit_paused: false,
+            rebase_stop: None,
         };
         assert!(!clear.mid_op(), "a quiet repo is not mid-op");
         for set in [
@@ -11794,6 +13453,251 @@ mod tests {
             .await
             .unwrap_err();
         assert_both_streams(&err, "revert", "could not revert");
+    }
+
+    #[tokio::test]
+    async fn empty_cherry_pick_skips_under_one_hold() {
+        let (dir, repo) = setup_repo("empty-cherry-pick").await;
+        commit_file(&repo, dir.path(), "a.txt", "already applied\n", "applied").await;
+        let target = rev(&repo, "HEAD").await;
+        let state = AppState::default();
+        let created = git_cherry_pick_core(&state, repo.clone(), target.clone(), None)
+            .await
+            .expect("an already-applied pick must finish its skip");
+        assert!(!created);
+        assert_eq!(rev(&repo, "HEAD").await, target);
+        assert!(!dir.path().join(".git/CHERRY_PICK_HEAD").exists());
+        assert!(!dir.path().join(".git/sequencer").exists());
+        assert!(!op_state(&repo).await.unwrap().cherry_picking);
+    }
+
+    #[test]
+    fn skip_failure_git_keeps_the_code_and_both_streams() {
+        let skip = crate::git::runner::GitOutput {
+            code: 17,
+            stderr: "stderr details".into(),
+            stdout: b"stdout details".to_vec(),
+        };
+        let err = skip_failure_git("abc1234", &skip);
+        let AppError::Git { code, stderr } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(code, 17);
+        assert_eq!(
+            stderr,
+            "abc1234 is already applied, but skipping it failed.\nstderr details\nstdout details"
+        );
+    }
+
+    #[test]
+    fn range_failure_git_messages_keep_the_exit_code() {
+        for (step, rolled_back, expected) in [
+            (
+                FailedStep::Pick,
+                true,
+                "The cherry-pick was rolled back — target is unchanged.\nPick abc1234 failed, usually a conflict; nothing from this batch was kept.\ngit details\nretired hints",
+            ),
+            (
+                FailedStep::Skip,
+                true,
+                "The cherry-pick was rolled back — target is unchanged.\nSkipping abc1234, which was already applied, failed; nothing from this batch was kept.\ngit details\nretired hints",
+            ),
+            (
+                FailedStep::Pick,
+                false,
+                "Recovery needed.\nThe failing pick was abc1234.\ngit details\nretired hints",
+            ),
+            (
+                FailedStep::Skip,
+                false,
+                "Recovery needed.\nSkipping abc1234, which was already applied, failed.\ngit details\nretired hints",
+            ),
+        ] {
+            let err = range_failure_error(
+                AppError::Git {
+                    code: 17,
+                    stderr: "git details".into(),
+                },
+                step,
+                "abc1234",
+                "target",
+                "Recovery needed.",
+                "\nretired hints",
+                rolled_back,
+            );
+            let AppError::Git { code, stderr } = err else {
+                panic!("{step:?}, rolled_back={rolled_back}: {err:?}");
+            };
+            assert_eq!(code, 17);
+            assert_eq!(stderr, expected, "{step:?}, rolled_back={rolled_back}");
+        }
+    }
+
+    #[test]
+    fn range_failure_non_git_messages_and_variants() {
+        for (step, rolled_back, prefix) in [
+            (FailedStep::Pick, true, ""),
+            (
+                FailedStep::Skip,
+                true,
+                "The cherry-pick was rolled back — target is unchanged.\nSkipping abc1234, which was already applied, failed; nothing from this batch was kept.\n",
+            ),
+            (
+                FailedStep::Pick,
+                false,
+                "Recovery needed.\nThe failing pick was abc1234.\n",
+            ),
+            (
+                FailedStep::Skip,
+                false,
+                "Recovery needed.\nSkipping abc1234, which was already applied, failed.\n",
+            ),
+        ] {
+            for (original, text) in [
+                (AppError::Command("spawn failed".into()), "spawn failed"),
+                (AppError::Timeout(7), "git operation timed out after 7s"),
+                (AppError::GitNotFound, "git executable not found"),
+            ] {
+                let original_variant = std::mem::discriminant(&original);
+                let err = range_failure_error(
+                    original,
+                    step,
+                    "abc1234",
+                    "target",
+                    "Recovery needed.",
+                    "\nretired hints",
+                    rolled_back,
+                );
+                if matches!(step, FailedStep::Pick) && rolled_back {
+                    assert_eq!(std::mem::discriminant(&err), original_variant);
+                } else {
+                    assert!(matches!(err, AppError::Command(_)), "{err:?}");
+                }
+                assert_eq!(
+                    err.to_string(),
+                    format!("{prefix}{text}"),
+                    "{step:?}, rolled_back={rolled_back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflict_cores_read_baselines_under_one_hold() {
+        fn holds_conflict_baseline(body: &str) -> bool {
+            let code = body
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let Some((before_lock, _)) = code.split_once("acquire_repo_lock(") else {
+                return false;
+            };
+            let Some((_, assignment)) = before_lock.rsplit_once("let ") else {
+                return false;
+            };
+            let Some((binding, prefix)) = assignment.split_once('=') else {
+                return false;
+            };
+            if prefix.contains(';') {
+                return false;
+            }
+            let binding = binding.trim();
+            let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim();
+            let named = binding != "_"
+                && binding.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic())
+                && binding.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+            let code: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
+            let (Some(lock), Some(read), Some(op)) = (
+                code.find("acquire_repo_lock("),
+                code.find("unmerged_paths("),
+                code.find("run_git_raw_index_retry("),
+            ) else {
+                return false;
+            };
+            named
+                && lock < read
+                && read < op
+                && !code.contains("run_git_mutating")
+                && !code[..op].contains(&format!("drop({binding})"))
+        }
+        assert!(!holds_conflict_baseline(
+            "unmerged_paths(repo).await; let _guard = acquire_repo_lock(domain).await; run_git_raw_index_retry();"
+        ));
+        assert!(!holds_conflict_baseline(
+            "let _guard = acquire_repo_lock(domain).await; unmerged_paths(repo).await; run_git_mutating_raw(); run_git_raw_index_retry();"
+        ));
+        assert!(!holds_conflict_baseline(
+            "let _ = acquire_repo_lock(domain).await; unmerged_paths(repo).await; run_git_raw_index_retry();"
+        ));
+        assert!(!holds_conflict_baseline(
+            "let other = (); acquire_repo_lock(domain).await; unmerged_paths(repo).await; run_git_raw_index_retry();"
+        ));
+        assert!(!holds_conflict_baseline(
+            "let held = acquire_repo_lock(domain).await; unmerged_paths(repo).await; drop(held); run_git_raw_index_retry();"
+        ));
+        assert!(holds_conflict_baseline(
+            "let held = acquire_repo_lock(domain).await; unmerged_paths(repo).await; run_git_raw_index_retry(); drop(held);"
+        ));
+        let source = include_str!("ops.rs").replace("\r\n", "\n");
+        let production = source.split_once("\nmod tests {").unwrap().0;
+        for name in [
+            "git_revert_core",
+            "git_cherry_pick_core",
+            "git_stash_pop_core",
+            "git_restore_orphaned_core",
+            "git_stash_apply_core",
+        ] {
+            let tail = production.split_once(&format!("fn {name}(")).unwrap().1;
+            let body = tail.split_once("\n}").unwrap().0;
+            assert!(holds_conflict_baseline(body), "{name}");
+        }
+    }
+
+    #[test]
+    fn cherry_pick_skip_results_are_bound() {
+        fn skip_results_are_bound(source: &str) -> bool {
+            let code: String = source
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            let sites: Vec<_> = code.match_indices("[\"cherry-pick\",\"--skip\"]").collect();
+            !sites.is_empty()
+                && sites.iter().all(|(at, _)| {
+                    let Some(run) = code[..*at].rfind("run_git") else {
+                        return false;
+                    };
+                    let lead = &code[..run];
+                    let start = lead.rfind([';', '{', '}']).map_or(0, |pos| pos + 1);
+                    let Some(assignment) = lead[start..].strip_prefix("let") else {
+                        return false;
+                    };
+                    let Some((binding, _)) = assignment.split_once('=') else {
+                        return false;
+                    };
+                    binding.starts_with(|ch: char| ch.is_ascii_alphabetic())
+                        && binding.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+                })
+        }
+        assert!(!skip_results_are_bound(
+            "let _ = run_git(repo, &[\"cherry-pick\", \"--skip\"], timeout).await;"
+        ));
+        assert!(!skip_results_are_bound(
+            "let _skip = run_git(repo, &[\"cherry-pick\", \"--skip\"], timeout).await;"
+        ));
+        assert!(!skip_results_are_bound(
+            "run_git(repo, &[\"cherry-pick\", \"--skip\"], timeout).await;"
+        ));
+        assert!(skip_results_are_bound(
+            "let skip = run_git(repo, &[\"cherry-pick\", \"--skip\"], timeout).await?;"
+        ));
+        let source = include_str!("ops.rs").replace("\r\n", "\n");
+        let production = source.split_once("\nmod tests {").unwrap().0;
+        assert!(skip_results_are_bound(production));
     }
 
     #[tokio::test]
@@ -12350,6 +14254,91 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebase_reads_unmerged_paths_under_the_lock() {
+        let (dir, repo) = setup_repo("rebase-unmerged-hold").await;
+        let base = head_branch(&repo).await;
+        git(&repo, &["switch", "-c", "feature"]).await;
+        commit_file(&repo, dir.path(), "a.txt", "feature\n", "feature").await;
+        git(&repo, &["switch", &base]).await;
+        commit_file(&repo, dir.path(), "a.txt", "base\n", "base edit").await;
+        let state = std::sync::Arc::new(AppState::default());
+        let domain = state.working_tree_lock(&repo).await;
+        let guard = acquire_repo_lock_unbounded(&domain, "a commit").await;
+        let rebase = {
+            let state = state.clone();
+            let repo = repo.clone();
+            tokio::spawn(async move { git_rebase_core(&state, repo, "feature".into()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let merge = run_git_raw(Some(&repo), &["merge", "--no-edit", "feature"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(merge.code, 1);
+        assert_eq!(unmerged_paths(&repo).await, vec!["a.txt"]);
+        drop(guard);
+        let err = rebase.await.unwrap().unwrap_err();
+        assert!(matches!(err, AppError::Git { .. }), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebase_onto_reads_unmerged_paths_under_the_lock() {
+        let (dir, repo) = setup_repo("rebase-onto-unmerged-hold").await;
+        let base = head_branch(&repo).await;
+        git(&repo, &["switch", "-c", "feature"]).await;
+        commit_file(&repo, dir.path(), "a.txt", "feature\n", "feature").await;
+        git(&repo, &["switch", &base]).await;
+        commit_file(&repo, dir.path(), "a.txt", "base\n", "base edit").await;
+        let state = std::sync::Arc::new(AppState::default());
+        let domain = state.working_tree_lock(&repo).await;
+        let guard = acquire_repo_lock_unbounded(&domain, "a commit").await;
+        let rebase = {
+            let state = state.clone();
+            let repo = repo.clone();
+            tokio::spawn(async move { rebase_onto(&state, &repo, "feature", &base).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let merge = run_git_raw(Some(&repo), &["merge", "--no-edit", "feature"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(merge.code, 1);
+        assert_eq!(unmerged_paths(&repo).await, vec!["a.txt"]);
+        drop(guard);
+        let err = rebase.await.unwrap().unwrap_err();
+        assert!(matches!(err, AppError::Git { .. }), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebase_resolves_the_target_under_the_lock() {
+        let (dir, repo) = setup_repo("rebase-target-hold").await;
+        git(&repo, &["tag", "target"]).await;
+        git(&repo, &["switch", "-c", "base-work"]).await;
+        commit_file(&repo, dir.path(), "b.txt", "base\n", "base work").await;
+        let branch_tip = rev(&repo, "HEAD").await;
+        git(&repo, &["switch", "-c", "topic", "refs/tags/target"]).await;
+        commit_file(&repo, dir.path(), "topic.txt", "topic\n", "topic work").await;
+        let state = std::sync::Arc::new(AppState::default());
+        let domain = state.working_tree_lock(&repo).await;
+        let guard = acquire_repo_lock_unbounded(&domain, "a commit").await;
+        let rebase = {
+            let state = state.clone();
+            let repo = repo.clone();
+            tokio::spawn(async move { git_rebase_core(&state, repo, "target".into()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        git(&repo, &["branch", "target", &branch_tip]).await;
+        drop(guard);
+        rebase.await.unwrap().unwrap();
+        let ancestor = run_git_raw(
+            Some(&repo),
+            &["merge-base", "--is-ancestor", &branch_tip, "HEAD"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ancestor.code, 0, "the new target branch must be an ancestor");
+    }
+
     #[tokio::test]
     async fn rebase_onto_moves_only_its_own_commits() {
         // The "branched off the wrong branch" scenario: `fix` was branched off
@@ -12575,6 +14564,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unignore_keeps_each_kept_lines_own_ending() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("a\r\nb\nc\n", &["c"], "a\r\nb\n"),
+            ("a\r\nb\n", &["zzz"], "a\r\nb\n"),
+            ("a\rb\nc\n", &["c"], "a\rb\n"),
+            ("\u{feff}a\r\nb\n", &["a"], "\u{feff}b\n"),
+            ("a\nb", &["a"], "b"),
+            ("a\nb", &["b"], "a\n"),
+            ("a\n*.log", &["*.log"], "a\n"),
+            ("*.log\r\n", &["*.log"], "\r\n"),
+            ("a\r\nb\n", &["a", "b"], "\n"),
+            ("*.log", &["*.log"], ""),
+            ("\u{feff}*.log\n", &["*.log"], "\u{feff}\n"),
+            ("", &["*.log"], ""),
+            ("\u{feff}", &["*.log"], "\u{feff}"),
+            ("a\r", &["a"], ""),
+        ];
+        for (i, (input, patterns, expected)) in cases.iter().enumerate() {
+            let (dir, repo) = gitignore_dir("per-line", input);
+            git_unignore_rules(repo, patterns.iter().map(|p| rule(p)).collect())
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join(".gitignore")).unwrap(),
+                expected.as_bytes(),
+                "case {}",
+                i + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_lines_refuses_git_dir_and_windows_spellings() {
+        let (dir, repo) = setup_repo("replace-gate").await;
+        commit_file(&repo, dir.path(), "a.txt", "a\n", "seed").await;
+        let probe = dir.path().join(".git/gd-probe.txt");
+        std::fs::write(&probe, "a\n").unwrap();
+        let state = AppState::default();
+        let mut cases = vec![(".git/gd-probe.txt", DISCARD_GIT_DIR)];
+        #[cfg(windows)]
+        cases.push(("a.txt.", DISCARD_WIN_TRAILING));
+        for (path, why) in cases.drain(..) {
+            let err = replace_file_lines(
+                &state,
+                &repo,
+                path,
+                1,
+                &lines(&["a"]),
+                &lines(&["b"]),
+                false,
+            )
+            .await
+            .err()
+            .expect("suggestion path must refuse");
+            assert_eq!(err.to_string(), format!(
+                "invalid argument: Can't apply the suggestion to {path} — {why}. Nothing was changed."
+            ));
+        }
+        assert_eq!(std::fs::read(&probe).unwrap(), b"a\n");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"a\n");
+        let mut missing = vec!["missing.txt"];
+        #[cfg(windows)]
+        missing.push("sub\\missing.txt");
+        for path in missing.drain(..) {
+            let err = replace_file_lines(
+                &state,
+                &repo,
+                path,
+                1,
+                &lines(&["a"]),
+                &lines(&["b"]),
+                false,
+            )
+            .await
+            .err()
+            .expect("missing file must refuse");
+            assert_eq!(
+                err.to_string(),
+                format!("invalid argument: file does not exist: {path}")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unignore_preserves_crlf_and_comments() {
         // A Windows .gitignore (CRLF) with a comment and two rules.
         let (dir, repo) = gitignore_dir("crlf", "# build artifacts\r\n*.log\r\nbuild/\r\n");
@@ -12627,6 +14700,56 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn replace_lines_preserves_each_pieces_ending() {
+        type Case<'a> = (&'a str, u32, &'a [&'a str], &'a [&'a str], &'a str);
+        let cases: &[Case<'_>] = &[
+            ("a\nb\nc\n", 2, &["b"], &["B1", "B2"], "a\nB1\nB2\nc\n"),
+            (
+                "a\r\nb\r\nc\r\n",
+                2,
+                &["b"],
+                &["B1", "B2"],
+                "a\r\nB1\r\nB2\r\nc\r\n",
+            ),
+            ("a\r\nb\nc\r\nd\n", 2, &["b"], &["B"], "a\r\nB\nc\r\nd\n"),
+            (
+                "a\r\nb\nc\r\nd\n",
+                3,
+                &["c"],
+                &["X", "Y"],
+                "a\r\nb\nX\r\nY\r\nd\n",
+            ),
+            ("a\r\nb\nc\r\nd\n", 2, &["b"], &[], "a\r\nc\r\nd\n"),
+            ("a\r\nb\nc", 3, &["c"], &["C"], "a\r\nb\nC"),
+            ("a\nb\r\nc", 3, &["c"], &["C1", "C2"], "a\nb\r\nC1\r\nC2"),
+            ("a\r\nb\nc\r\n", 3, &["c"], &["C"], "a\r\nb\nC\r\n"),
+            ("a\nb\nc", 3, &["c"], &[], "a\nb\n"),
+            ("a\nb\n", 1, &["a", "b"], &[], ""),
+        ];
+        for (seed, start, expected, replacement, result) in cases {
+            let (dir, repo) = setup_repo("replace-piece-endings").await;
+            let state = AppState::default();
+            commit_file(&repo, dir.path(), "mixed.txt", seed, "mixed-endings file").await;
+            replace_file_lines(
+                &state,
+                &repo,
+                "mixed.txt",
+                *start,
+                &lines(expected),
+                &lines(replacement),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("mixed.txt")).unwrap(),
+                result.as_bytes(),
+                "seed {seed:?}, start {start}, replacement {replacement:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14160,9 +16283,15 @@ detached
         let tip = rev(&repo, "HEAD").await;
         commit_file(&repo, dir.path(), "d.txt", "d\n", "three").await;
         let c3 = rev(&repo, "HEAD").await;
-        git_rebase_edit(repo.clone(), tip, vec![pick(&c3)], None)
-            .await
-            .unwrap();
+        rebase_edit(
+            &AppState::default(),
+            repo.clone(),
+            tip,
+            vec![pick(&c3)],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(journaled("rebase_edit").await.as_deref(), Some("feature"));
     }
 
@@ -15541,6 +17670,1019 @@ detached
         );
     }
 
+    async fn discard_pin_excludes(repo: &str, dir: &Path) {
+        git(
+            repo,
+            &[
+                "config",
+                "core.excludesFile",
+                dir.join("no-global-excludes").to_str().unwrap(),
+            ],
+        )
+        .await;
+    }
+
+    #[test]
+    fn discard_all_untracked_refuses_undecodable_names() {
+        let stdout = b"2 R. N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 R100 renamed.txt\0\
+            ? phantom.txt\0? real.txt\0\
+            1 .M N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 tracked.txt\0\
+            u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 conflict.txt\0";
+        assert_eq!(discard_all_untracked(stdout).unwrap(), ["real.txt"]);
+        let mut invalid = stdout.to_vec();
+        invalid.extend_from_slice(b"? invalid-\xff.txt\0");
+        for (input, name) in [
+            (invalid.as_slice(), "invalid-\u{FFFD}.txt"),
+            (
+                b"? b.txt\0? a.txt\0? x-\xff.txt\0? y-\xfe.txt\0".as_slice(),
+                "x-\u{FFFD}.txt",
+            ),
+        ] {
+            assert_eq!(
+                discard_message(discard_all_untracked(input).unwrap_err()),
+                format!("Can't discard {name} — its name isn't valid UTF-8; rename it and try again. Nothing was discarded.")
+            );
+        }
+        assert_eq!(
+            discard_all_untracked(b"? b.txt\0? a.txt\0").unwrap(),
+            ["b.txt", "a.txt"]
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[tokio::test]
+    async fn discard_all_refuses_undecodable_untracked_names_before_changing_anything() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, repo) = setup_repo("discard-undecodable").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        commit_file(&repo, dir.path(), "a.txt", "a\n", "seed").await;
+        std::fs::write(dir.path().join("a.txt"), "modified\n").unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "keep\n").unwrap();
+        let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"zz-\xff.txt"));
+        std::fs::write(&bad, "keep too\n").unwrap();
+        let err = git_discard_all_core(&AppState::default(), repo)
+            .await
+            .unwrap_err();
+        assert_eq!(discard_message(err),
+            "Can't discard zz-\u{FFFD}.txt — its name isn't valid UTF-8; rename it and try again. Nothing was discarded.");
+        assert_eq!(std::fs::read(dir.path().join("ok.txt")).unwrap(), b"keep\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"modified\n"
+        );
+        assert_eq!(std::fs::read(bad).unwrap(), b"keep too\n");
+    }
+
+    #[test]
+    fn discard_gate_is_called_by_every_caller_path_core() {
+        fn body(source: &str, name: &str) -> String {
+            let start = source.find(&format!("fn {name}(")).expect(name);
+            let rest = &source[start..];
+            let end = rest.find("\n}").expect(name);
+            rest[..end]
+                .lines()
+                .map(|line| line.split("//").next().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let ops = include_str!("ops.rs");
+        for name in [
+            "replace_file_lines",
+            "git_discard_paths_core",
+            "git_discard_untracked_lines_core",
+            "git_discard_all_core",
+        ] {
+            assert!(body(ops, name).contains("discard_rel_path("), "{name}");
+        }
+        let conflict = include_str!("conflict.rs");
+        for name in [
+            "git_resolve_conflict_core",
+            "git_conflict_sides",
+            "git_checkout_conflict_side_core",
+        ] {
+            assert!(
+                body(conflict, name).contains("conflict_rel_path("),
+                "{name}"
+            );
+        }
+        let gate = body(conflict, "conflict_rel_path");
+        let validate = gate
+            .find("validate_rel_path(")
+            .expect("conflict_rel_path: validate_rel_path");
+        let discard = gate
+            .find("discard_rel_path(")
+            .expect("conflict_rel_path: discard_rel_path");
+        assert!(validate < discard, "conflict_rel_path");
+    }
+
+    fn discard_arg(path: &str, untracked: bool) -> DiscardPath {
+        DiscardPath {
+            path: path.into(),
+            untracked,
+        }
+    }
+
+    fn discard_message(error: AppError) -> String {
+        match error {
+            AppError::InvalidArgument(message) => message,
+            other => panic!("expected discard refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_rel_path_accepts_git_spellings_and_refuses_escapes() {
+        for raw in [
+            "a.txt",
+            "src/new.txt",
+            "sub/",
+            ".gitignore",
+            ".github/x.yml",
+            "x.git",
+            ".git2/a",
+            "dir.with.dots/x",
+        ] {
+            assert_eq!(discard_rel_path(raw), Ok(raw.to_string()), "{raw:?}");
+        }
+        for raw in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "./a",
+            "a/./b",
+            "a//b",
+            ".",
+            "..",
+            "/",
+            "a\0b",
+        ] {
+            assert_eq!(discard_rel_path(raw), Err(DISCARD_OUTSIDE), "{raw:?}");
+        }
+        for raw in [".git", ".git/config", "sub/.git/HEAD"] {
+            assert_eq!(discard_rel_path(raw), Err(DISCARD_GIT_DIR), "{raw:?}");
+        }
+        #[cfg(windows)]
+        {
+            for raw in [
+                ".GIT/config",
+                "sub/.Git",
+                ".git./config",
+                ".git /config",
+                ".git.",
+            ] {
+                assert_eq!(discard_rel_path(raw), Err(DISCARD_GIT_DIR), "{raw:?}");
+            }
+            assert_eq!(discard_rel_path(r"a\b.txt"), Ok("a/b.txt".into()));
+            for raw in [
+                r"a\..\b",
+                "C:/x",
+                "C:x",
+                r"\\server\share\x",
+                r"\\?\C:\x",
+                "a.txt:s",
+                "...",
+                "a/.. /b",
+                ". ",
+            ] {
+                assert_eq!(discard_rel_path(raw), Err(DISCARD_OUTSIDE), "{raw:?}");
+            }
+            for raw in ["dir./x", "dir /x", "a/b./c", "x.", "x "] {
+                assert_eq!(discard_rel_path(raw), Err(DISCARD_WIN_TRAILING), "{raw:?}");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            for raw in [
+                ".GIT/config",
+                "sub/.Git",
+                ".git./config",
+                ".git /config",
+                ".git.",
+            ] {
+                assert_eq!(discard_rel_path(raw), Ok(raw.to_string()), "{raw:?}");
+            }
+            assert_eq!(discard_rel_path(r"a\b"), Ok(r"a\b".into()));
+            assert_eq!(discard_rel_path("..."), Ok("...".into()));
+            for raw in ["dir./x", "dir /x", "a/b./c", "x.", "x "] {
+                assert_eq!(discard_rel_path(raw), Ok(raw.to_string()), "{raw:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_paths_with_no_paths_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        git_discard_paths_core(
+            &AppState::default(),
+            dir.path().to_string_lossy().into_owned(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discard_paths_refuses_an_outside_path_and_discards_nothing() {
+        let (dir, repo) = setup_repo("discard-outside").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        for raw in [
+            victim.to_string_lossy().into_owned(),
+            format!(
+                "../{}/victim.txt",
+                outside.path().file_name().unwrap().to_string_lossy()
+            ),
+        ] {
+            let error = git_discard_paths_core(
+                &AppState::default(),
+                repo.clone(),
+                vec![discard_arg("keep.txt", true), discard_arg(&raw, true)],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                discard_message(error),
+                format!("Can't discard {raw} — {DISCARD_OUTSIDE}. Nothing was discarded.")
+            );
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+                "keep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_paths_refuses_git_metadata_paths() {
+        let (dir, repo) = setup_repo("discard-metadata").await;
+        let before = std::fs::read(dir.path().join(".git/config")).unwrap();
+        for raw in [
+            ".git/config",
+            ".git/HEAD",
+            #[cfg(windows)]
+            ".GIT/HEAD",
+        ] {
+            let error = git_discard_paths_core(
+                &AppState::default(),
+                repo.clone(),
+                vec![discard_arg(raw, true)],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                discard_message(error),
+                format!("Can't discard {raw} — {DISCARD_GIT_DIR}. Nothing was discarded.")
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(".git/config")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_paths_refuses_a_tracked_file_flagged_untracked() {
+        let (dir, repo) = setup_repo("discard-tracked-flag").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        commit_file(&repo, dir.path(), "t.txt", "v0\n", "tracked").await;
+        std::fs::write(dir.path().join("t.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.path().join("u.txt"), "new\n").unwrap();
+        let error = git_discard_paths_core(
+            &AppState::default(),
+            repo,
+            vec![discard_arg("u.txt", true), discard_arg("t.txt", true)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard t.txt — Git doesn't list it as a new file, so refresh and try again. Nothing was discarded.");
+        assert_eq!(
+            nlf(std::fs::read_to_string(dir.path().join("t.txt")).unwrap()),
+            "dirty\n"
+        );
+        assert!(dir.path().join("u.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn discard_paths_refuses_a_staged_new_file_flagged_untracked() {
+        let (dir, repo) = setup_repo("discard-staged-flag").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("n.txt"), "new\n").unwrap();
+        git(&repo, &["add", "n.txt"]).await;
+        let error = git_discard_paths_core(
+            &AppState::default(),
+            repo.clone(),
+            vec![discard_arg("n.txt", true)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard n.txt — Git doesn't list it as a new file, so refresh and try again. Nothing was discarded.");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            git(&repo, &["diff", "--cached", "--name-only"])
+                .await
+                .trim(),
+            "n.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_paths_refuses_an_untracked_file_flagged_tracked() {
+        let (dir, repo) = setup_repo("discard-untracked-flag").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("u1.txt"), b"first\n").unwrap();
+        std::fs::write(dir.path().join("u2.txt"), b"second\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"dirty\n").unwrap();
+        let error = git_discard_paths_core(
+            &AppState::default(),
+            repo,
+            vec![
+                discard_arg("u1.txt", true),
+                discard_arg("u2.txt", false),
+                discard_arg("a.txt", false),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard u2.txt — Git lists it as a new file, so refresh and try again. Nothing was discarded.");
+        assert_eq!(
+            std::fs::read(dir.path().join("u1.txt")).unwrap(),
+            b"first\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("u2.txt")).unwrap(),
+            b"second\n"
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"dirty\n");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_paths_trashes_a_duplicate_untracked_path_once() {
+        let (dir, repo) = setup_repo("discard-duplicate").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("u.txt"), b"new\n").unwrap();
+        git_discard_paths_core(
+            &AppState::default(),
+            repo,
+            vec![discard_arg("u.txt", true), discard_arg("u.txt", true)],
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("u.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_paths_trashes_confirmed_untracked_and_restores_tracked() {
+        let (dir, repo) = setup_repo("discard-mixed").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("u.txt"), "new\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "dirty\n").unwrap();
+        git_discard_paths_core(
+            &AppState::default(),
+            repo,
+            vec![discard_arg("u.txt", true), discard_arg("a.txt", false)],
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("u.txt").exists());
+        assert_eq!(
+            nlf(std::fs::read_to_string(dir.path().join("a.txt")).unwrap()),
+            "v0\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_paths_waits_for_the_repo_lock_before_the_untracked_sweep() {
+        let (dir, repo) = setup_repo("discard-paths-hold").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+        let state = std::sync::Arc::new(AppState::default());
+        let domain = state.working_tree_lock(&repo).await;
+        let guard = acquire_repo_lock_unbounded(&domain, "a commit").await;
+        let discard = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                git_discard_paths_core(&state, repo, vec![discard_arg("untracked.txt", true)]).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            dir.path().join("untracked.txt").exists(),
+            "the untracked sweep must wait for the lock"
+        );
+        drop(guard);
+        discard.await.unwrap().unwrap();
+        assert!(!dir.path().join("untracked.txt").exists());
+    }
+
+    #[cfg(any(windows, unix))]
+    fn discard_directory_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .output()
+                .expect("run mklink");
+            assert!(
+                made.status.success(),
+                "mklink /J failed: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_untracked_lines_waits_for_the_repo_lock_before_rewriting() {
+        let (dir, repo) = setup_repo("discard-lines-hold").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let file = dir.path().join("untracked.txt");
+        std::fs::write(&file, b"1\r\n2\r\n3").unwrap();
+        let state = std::sync::Arc::new(AppState::default());
+        let domain = state.working_tree_lock(&repo).await;
+        let guard = acquire_repo_lock_unbounded(&domain, "a commit").await;
+        let discard = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                git_discard_untracked_lines_core(&state, repo, "untracked.txt".into(), vec![2])
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(std::fs::read(&file).unwrap(), b"1\r\n2\r\n3");
+        drop(guard);
+        discard.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"1\r\n3");
+    }
+
+    #[test]
+    fn untracked_from_status_skips_rename_origins_and_invalid_utf8() {
+        let stdout = b"2 R. N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 R100 renamed.txt\0\
+            ? phantom.txt\0? real.txt\0\
+            1 .M N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 tracked.txt\0\
+            u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 conflict.txt\0\
+            ? invalid-\xff.txt\0";
+        assert_eq!(
+            untracked_from_status(stdout),
+            std::collections::HashSet::from(["real.txt".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_paths_lists_untracked_files_beside_a_staged_rename() {
+        let (dir, repo) = setup_repo("untracked-paths-rename").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        git(&repo, &["config", "status.renames", "true"]).await;
+        commit_file(
+            &repo,
+            dir.path(),
+            "2 original.txt",
+            "rename me\n",
+            "add original",
+        )
+        .await;
+        std::fs::rename(
+            dir.path().join("2 original.txt"),
+            dir.path().join("renamed.txt"),
+        )
+        .unwrap();
+        git(&repo, &["add", "--all"]).await;
+        std::fs::write(dir.path().join("untracked.txt"), b"new\n").unwrap();
+        let status = run_git(
+            Some(&repo),
+            &["status", "--porcelain=v2", "--untracked-files=all", "-z"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let records: Vec<_> = status.stdout.split(|&byte| byte == 0).collect();
+        assert!(records
+            .windows(2)
+            .any(|pair| { pair[0].starts_with(b"2 ") && pair[1] == b"2 original.txt" }));
+        let listed = untracked_paths(&repo).await.unwrap();
+        assert_eq!(
+            listed,
+            std::collections::HashSet::from(["untracked.txt".to_string()])
+        );
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn discard_linked_component_flags_links_between_root_and_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("real")).unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "precious").unwrap();
+        discard_directory_link(&root.path().join("link"), outside.path());
+        let top = root.path().to_str().unwrap();
+        assert!(linked_component(top, "link/victim.txt", false).unwrap());
+        assert!(!linked_component(top, "real/x.txt", false).unwrap());
+        assert!(!linked_component(top, "link", false).unwrap());
+        assert!(linked_component(top, "link", true).unwrap());
+        assert!(!linked_component(top, "missing/x", false).unwrap());
+        std::fs::write(root.path().join("a"), "a regular file").unwrap();
+        for include_leaf in [false, true] {
+            assert!(!linked_component(top, "a/b/c.txt", include_leaf).unwrap());
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn discard_paths_refuses_an_entry_beyond_a_link() {
+        let (dir, repo) = setup_repo("discard-link").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        discard_directory_link(&dir.path().join("link"), outside.path());
+        let error = git_discard_paths_core(
+            &AppState::default(),
+            repo.clone(),
+            vec![discard_arg("link/victim.txt", true)],
+        )
+        .await
+        .unwrap_err();
+        let message = discard_message(error);
+        #[cfg(windows)]
+        assert_eq!(message, "Can't discard link/victim.txt — it's reached through a symbolic link or junction. Nothing was discarded.");
+        #[cfg(unix)]
+        assert_eq!(message, "Can't discard link/victim.txt — Git doesn't list it as a new file, so refresh and try again. Nothing was discarded.");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        #[cfg(windows)]
+        {
+            let error =
+                git_discard_paths_core(&AppState::default(), repo, vec![discard_arg("link", true)])
+                    .await
+                    .unwrap_err();
+            assert_eq!(discard_message(error), "Can't discard link — Git doesn't list it as a new file, so refresh and try again. Nothing was discarded.");
+            assert!(
+                victim.exists(),
+                "refusing the unlisted junction leaf must preserve its destination"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_paths_resolves_against_the_checkout_root_from_a_subdirectory() {
+        let (dir, repo) = setup_repo("discard-subdir").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        commit_file(&repo, dir.path(), "sub/s.txt", "sub\n", "subdirectory").await;
+        std::fs::write(dir.path().join("a.txt"), "dirty\n").unwrap();
+        let sub = dir.path().join("sub").to_string_lossy().into_owned();
+        git_discard_paths_core(
+            &AppState::default(),
+            sub.clone(),
+            vec![discard_arg("a.txt", false)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nlf(std::fs::read_to_string(dir.path().join("a.txt")).unwrap()),
+            "v0\n"
+        );
+        #[cfg(windows)]
+        {
+            std::fs::write(dir.path().join("top.txt"), "new\n").unwrap();
+            git_discard_paths_core(
+                &AppState::default(),
+                sub,
+                vec![discard_arg("top.txt", true)],
+            )
+            .await
+            .unwrap();
+            assert!(!dir.path().join("top.txt").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_all_resolves_against_the_checkout_root_from_a_subdirectory() {
+        let (dir, repo) = setup_repo("discard-all-subdir").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        commit_file(&repo, dir.path(), "sub/s.txt", "sub\n", "subdirectory").await;
+        std::fs::write(dir.path().join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "new\n").unwrap();
+        std::fs::write(dir.path().join("sub/new.txt"), "new\n").unwrap();
+        git_discard_all_core(
+            &AppState::default(),
+            dir.path().join("sub").to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("top.txt").exists());
+        assert!(!dir.path().join("sub/new.txt").exists());
+        assert_eq!(
+            nlf(std::fs::read_to_string(dir.path().join("a.txt")).unwrap()),
+            "v0\n"
+        );
+    }
+
+    #[test]
+    fn discard_cores_trash_only_through_trash_entries() {
+        let source = include_str!("ops.rs");
+        let strip_comments = |s: &str| -> String {
+            s.lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body = |name: &str| -> String {
+            let (_, tail) = source.split_once(&format!("fn {name}(")).unwrap();
+            strip_comments(tail.split_once("\n}").unwrap().0)
+        };
+        for name in ["git_discard_paths_core", "git_discard_all_core"] {
+            let code = body(name);
+            assert!(code.contains("trash_entries("), "{name}");
+            assert!(!code.contains("trash_delete("), "{name}");
+            assert!(!code.contains("refuse_linked("), "{name}");
+        }
+        let trash = body("trash_entries");
+        let check = trash.find("refuse_linked(").unwrap();
+        assert_eq!(trash.matches("refuse_linked(").count(), 1);
+        assert!(check < trash.find("for ").unwrap());
+        assert!(check < trash.find("trash_delete(").unwrap());
+        let production = strip_comments(source.split_once("\nmod tests {").unwrap().0);
+        assert_eq!(production.matches("trash_delete(").count(), 1);
+        assert_eq!(trash.matches("trash_delete(").count(), 1);
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn discard_trash_entries_refuses_a_linked_entry_before_trashing_any() {
+        let top = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(top.path().join("real.txt"), "keep").unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "precious").unwrap();
+        discard_directory_link(&top.path().join("link"), outside.path());
+        let error = trash_entries(
+            top.path().to_str().unwrap(),
+            &[
+                ("real.txt".into(), "real.txt".into()),
+                ("link/victim.txt".into(), "link/victim.txt".into()),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard link/victim.txt — it's reached through a symbolic link or junction. Nothing was discarded.");
+        assert_eq!(
+            std::fs::read_to_string(top.path().join("real.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "precious"
+        );
+    }
+
+    #[cfg(windows)]
+    async fn setup_discard_trailing_dot_repo(
+        marker: &str,
+    ) -> (tempfile::TempDir, String, tempfile::TempDir) {
+        let (dir, repo) = setup_repo(marker).await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let literal_dir = crate::fsops::verbatim_path(&dir.path().join("dir.")).unwrap();
+        std::fs::create_dir(&literal_dir).unwrap();
+        std::fs::write(literal_dir.join("inside.txt"), b"inside\n").unwrap();
+        std::fs::write(outside.path().join("victim.txt"), b"sentinel\n").unwrap();
+        discard_directory_link(&dir.path().join("dir"), outside.path());
+        (dir, repo, outside)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_paths_refuses_windows_shell_namespace_folders() {
+        for variant in ["full", "shortcut-only", "bare"] {
+            let (top, repo) = setup_repo("discard-shell-folder").await;
+            discard_pin_excludes(&repo, top.path()).await;
+            let outside = tempfile::tempdir().unwrap();
+            let folder = top.path().join("x.{0AFACED1-E828-11D1-9187-B532F1E9575D}");
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(folder.join("f"), b"inside").unwrap();
+            std::fs::write(outside.path().join("f"), b"outside").unwrap();
+            if variant != "bare" {
+                let output = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; $shell = New-Object -ComObject WScript.Shell; $shortcut = $shell.CreateShortcut($env:LNK_PATH); $shortcut.TargetPath = $env:LNK_TARGET; $shortcut.Save()"])
+                    .env("LNK_PATH", folder.join("target.lnk"))
+                    .env("LNK_TARGET", outside.path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+            if variant == "full" {
+                std::fs::write(
+                    folder.join("desktop.ini"),
+                    b"[.ShellClassInfo]\r\nCLSID2={0AFACED1-E828-11D1-9187-B532F1E9575D}\r\n",
+                )
+                .unwrap();
+                assert!(std::process::Command::new("attrib.exe")
+                    .args(["+s", "+r"])
+                    .arg(&folder)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let rel = "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}/f";
+            assert!(untracked_paths(&repo).await.unwrap().contains(rel));
+            let result = git_discard_paths_core(
+                &AppState::default(),
+                repo.clone(),
+                vec![discard_arg(rel, true)],
+            )
+            .await;
+            assert!(std::process::Command::new("attrib.exe")
+                .args(["-s", "-r"])
+                .arg(&folder)
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(std::fs::read(outside.path().join("f")).unwrap(), b"outside");
+            assert_eq!(std::fs::read(folder.join("f")).unwrap(), b"inside");
+            assert_eq!(
+                discard_message(result.unwrap_err()),
+                discard_message(discard_refusal(rel, DISCARD_WIN_SHELL_FOLDER))
+            );
+        }
+    }
+
+    #[test]
+    fn discard_rel_path_checks_windows_shell_folder_suffixes() {
+        for raw in [
+            "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}/f",
+            "sub/x.{0afaced1-e828-11d1-9187-b532f1e9575d}/f",
+            ".{00000000-0000-0000-0000-000000000000}",
+        ] {
+            #[cfg(windows)]
+            assert_eq!(discard_rel_path(raw), Err(DISCARD_WIN_SHELL_FOLDER));
+            #[cfg(not(windows))]
+            assert_eq!(discard_rel_path(raw), Ok(raw.to_string()));
+        }
+        for raw in [
+            "x.{not-a-guid}/f",
+            "x.{0AFACED1-E828-11D1-9187-B532F1E9575Z}/f",
+            "x.{0AFACED1_E828-11D1-9187-B532F1E9575D}/f",
+            "x.{0AFACED1-E828-11D1-9187-B532F1E9575D}.txt",
+        ] {
+            assert_eq!(discard_rel_path(raw), Ok(raw.to_string()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_untracked_lines_rewrites_a_reserved_name_verbatim() {
+        let (dir, repo) = setup_repo("discard-lines-reserved").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let full = crate::fsops::verbatim_path(&dir.path().join("nul.txt")).unwrap();
+        std::fs::write(&full, b"1\r\n2\r\n3").unwrap();
+        assert!(untracked_paths(&repo).await.unwrap().contains("nul.txt"));
+        git_discard_untracked_lines_core(&AppState::default(), repo, "nul.txt".into(), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&full).unwrap(), b"1\r\n3");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_paths_refuses_a_listed_windows_trailing_dot_path() {
+        let (dir, repo, outside) = setup_discard_trailing_dot_repo("discard-trailing-path").await;
+        let status = run_git(
+            Some(&repo),
+            &["status", "--porcelain=v2", "--untracked-files=all", "-z"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(
+            status
+                .stdout
+                .split(|&byte| byte == 0)
+                .any(|record| record == b"? dir./victim.txt"),
+            "git must list the trailing-dot path for this refusal test"
+        );
+        let result = git_discard_paths_core(
+            &AppState::default(),
+            repo,
+            vec![discard_arg("dir./victim.txt", true)],
+        )
+        .await;
+        assert!(
+            outside.path().join("victim.txt").exists(),
+            "outside sentinel was recycled"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard dir./victim.txt — Windows reads a name ending in a dot or space as a different path. Nothing was discarded.");
+        assert_eq!(
+            std::fs::read(outside.path().join("victim.txt")).unwrap(),
+            b"sentinel\n"
+        );
+        let literal_dir = crate::fsops::verbatim_path(&dir.path().join("dir.")).unwrap();
+        assert_eq!(
+            std::fs::read(literal_dir.join("inside.txt")).unwrap(),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_all_refuses_windows_trailing_dot_paths_before_changing_tree_or_index() {
+        let (dir, repo, outside) = setup_discard_trailing_dot_repo("discard-trailing-all").await;
+        std::fs::write(dir.path().join(".git/info/exclude"), b"/dir/\n").unwrap();
+        std::fs::write(dir.path().join("0first.txt"), b"first\n").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"keep\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"staged\n").unwrap();
+        git(&repo, &["add", "a.txt"]).await;
+        std::fs::write(dir.path().join("a.txt"), b"dirty\n").unwrap();
+        let listed = untracked_paths(&repo).await.unwrap();
+        assert!(listed.contains("dir./victim.txt"));
+        assert!(!listed.contains("dir/victim.txt"));
+        let index_before = std::fs::read(dir.path().join(".git/index")).unwrap();
+        let result = git_discard_all_core(&AppState::default(), repo).await;
+        assert_eq!(
+            std::fs::read(dir.path().join("0first.txt")).unwrap(),
+            b"first\n"
+        );
+        assert!(
+            outside.path().join("victim.txt").exists(),
+            "outside sentinel was recycled"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard dir./victim.txt — Windows reads a name ending in a dot or space as a different path. Nothing was discarded.");
+        assert_eq!(
+            std::fs::read(outside.path().join("victim.txt")).unwrap(),
+            b"sentinel\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"keep\n"
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"dirty\n");
+        let literal_dir = crate::fsops::verbatim_path(&dir.path().join("dir.")).unwrap();
+        assert_eq!(
+            std::fs::read(literal_dir.join("inside.txt")).unwrap(),
+            b"inside\n"
+        );
+        assert!(std::fs::symlink_metadata(dir.path().join("dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(dir.path().join(".git/index")).unwrap(),
+            index_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_all_refuses_an_entry_beyond_a_link_before_trashing_or_resetting() {
+        let (dir, repo) = setup_repo("discard-all-link").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"precious\r\nsecond line").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"keep\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"dirty\n").unwrap();
+        discard_directory_link(&dir.path().join("link"), outside.path());
+
+        let error = git_discard_all_core(&AppState::default(), repo)
+            .await
+            .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard link/victim.txt — it's reached through a symbolic link or junction. Nothing was discarded.");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\r\nsecond line");
+        assert_eq!(
+            std::fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"keep\n"
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"dirty\n");
+    }
+
+    #[test]
+    fn discard_refusals_show_empty_paths_and_strip_line_separators() {
+        let separators: String = [0x2028, 0x2029]
+            .into_iter()
+            .map(|code| char::from_u32(code).unwrap())
+            .collect();
+        for raw in ["", separators.as_str()] {
+            assert_eq!(
+                discard_message(discard_refusal(raw, DISCARD_OUTSIDE)),
+                "Can't discard an empty path — it isn't inside this repository's working tree. Nothing was discarded."
+            );
+            assert_eq!(
+                discard_message(line_discard_refusal(raw, DISCARD_OUTSIDE)),
+                "Can't discard lines from an empty path — it isn't inside this repository's working tree. Nothing was changed."
+            );
+        }
+        assert_eq!(discard_shown(&format!("a{separators}.txt")), "a.txt");
+    }
+
+    #[tokio::test]
+    async fn discard_untracked_lines_refuses_outside_tracked_and_ignored_paths() {
+        let (dir, repo) = setup_repo("discard-lines-refusal").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "ignored\n").unwrap();
+        let raw = format!(
+            "../{}/victim.txt",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        for (path, why) in [
+            (&*raw, DISCARD_OUTSIDE),
+            ("a.txt", DISCARD_NOT_NEW),
+            ("ignored.txt", DISCARD_NOT_NEW),
+        ] {
+            let error = git_discard_untracked_lines_core(
+                &AppState::default(),
+                repo.clone(),
+                path.into(),
+                vec![1],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                discard_message(error),
+                format!("Can't discard lines from {path} — {why}. Nothing was changed.")
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert_eq!(
+            nlf(std::fs::read_to_string(dir.path().join("a.txt")).unwrap()),
+            "v0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ignored.txt")).unwrap(),
+            "ignored\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_untracked_lines_removes_only_the_selected_lines() {
+        let (dir, repo) = setup_repo("discard-lines-content").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        std::fs::write(dir.path().join("n.txt"), "1\r\n2\r\n3").unwrap();
+        git_discard_untracked_lines_core(&AppState::default(), repo, "n.txt".into(), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dir.path().join("n.txt")).unwrap(), b"1\r\n3");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discard_untracked_lines_refuses_a_linked_entry() {
+        let (dir, repo) = setup_repo("discard-lines-link").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("link")).unwrap();
+        let error =
+            git_discard_untracked_lines_core(&AppState::default(), repo, "link".into(), vec![1])
+                .await
+                .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard lines from link — it's reached through a symbolic link or junction. Nothing was changed.");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn discard_untracked_lines_refuses_a_linked_ancestor() {
+        let (dir, repo) = setup_repo("discard-lines-ancestor").await;
+        discard_pin_excludes(&repo, dir.path()).await;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"precious\r\nsecond line").unwrap();
+        discard_directory_link(&dir.path().join("link"), outside.path());
+
+        let error = git_discard_untracked_lines_core(
+            &AppState::default(),
+            repo,
+            "link/victim.txt".into(),
+            vec![1],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discard_message(error), "Can't discard lines from link/victim.txt — it's reached through a symbolic link or junction. Nothing was changed.");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\r\nsecond line");
+    }
+
     /// Discarding a path holding glob metacharacters touches ONLY that path.
     /// Pathspecs glob, so a raw `src/app/[slug]/page.tsx` also restores the
     /// character-class sibling `src/app/s/page.tsx` — silently destroying
@@ -15598,6 +18740,7 @@ detached
     #[tokio::test]
     async fn discard_removes_reserved_device_named_files() {
         let (dir, repo) = setup_repo("discard-reserved").await;
+        discard_pin_excludes(&repo, dir.path()).await;
         let root = dir.path().to_path_buf();
         for name in ["nul", "nul.txt"] {
             std::fs::write(verbatim(&root, name), b"x\n").expect("verbatim write");
@@ -15643,6 +18786,7 @@ detached
     #[tokio::test(flavor = "multi_thread")]
     async fn discard_all_holds_the_repo_across_the_untracked_sweep() {
         let (dir, repo) = setup_repo("discard-hold").await;
+        discard_pin_excludes(&repo, dir.path()).await;
         commit_file(&repo, dir.path(), "tracked.txt", "v0\n", "add tracked").await;
         std::fs::write(dir.path().join("tracked.txt"), "dirty\n").unwrap();
         std::fs::write(dir.path().join("untracked.txt"), "u\n").unwrap();
