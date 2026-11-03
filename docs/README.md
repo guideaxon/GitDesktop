@@ -1,5 +1,9 @@
 D:\Github\GitDesktop\src-tauri\target\release
-
+git switch -c sync/upstream-2026-11-02
+ git merge upstream/master
+ 
+git switch master
+git merge --no-ff sync/upstream-2026-11-02
 ---
 
 **How the auto-switch works**
