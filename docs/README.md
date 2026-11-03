@@ -1,10 +1,17 @@
-D:\Github\GitDesktop\src-tauri\target\release
+D:\GAXON\GitDesktop\src-tauri\target\release
+
+gh auth refresh -h github.com -s workflow
+
+---
+
+--Merge with upstream branch
 git switch -c sync/upstream-2026-11-02
  git merge upstream/master
  
 git switch master
 git merge --no-ff sync/upstream-2026-11-02
 ---
+
 
 **How the auto-switch works**
 - Opening a repo reads its `credential.username` for the GitHub host from Git config. It uses `git config --get-urlmatch`, so it sees the same value a push would, including `includeIf` files.
