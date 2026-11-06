@@ -989,6 +989,10 @@ pub async fn agent_scaffold_custom_dockerfile(repo_path: String) -> AppResult<bo
 
 /// The scaffolded starter — a valid, no-op derived Dockerfile (the example tool line is
 /// commented out) that the user edits to add tools.
+///
+/// The Playwright example uses a version placeholder and root only for the install: `@latest`
+/// would pull new code on every rebuild, and a root runtime generally can't start Chromium's
+/// sandbox. No concrete version is written here because it would go stale.
 const CUSTOM_DOCKERFILE_STARTER: &str = concat!(
     "# Custom agent container image for this repository.\n",
     "#\n",
@@ -998,10 +1002,12 @@ const CUSTOM_DOCKERFILE_STARTER: &str = concat!(
     "# image is only ever (re)built after you review it and confirm, so a build runs your\n",
     "# commands. Switch to `USER root` to install system packages, then back to `USER node`.\n",
     "#\n",
-    "# Example: add Playwright + Chromium for browser tests.\n",
+    "# Example: add Playwright + Chromium for browser tests. Pin the version your tests use\n",
+    "# (not @latest) and keep the Chromium sandbox on: never pass --no-sandbox. Install as\n",
+    "# root (`--with-deps` needs it), then switch back to `USER node` so browsers run non-root.\n",
     "FROM gitdesktop-agent:latest\n",
     "USER root\n",
-    "# RUN npx -y playwright@latest install --with-deps chromium\n",
+    "# RUN npx -y playwright@<version> install --with-deps chromium\n",
     "USER node\n",
 );
 

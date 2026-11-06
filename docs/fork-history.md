@@ -7,7 +7,12 @@ customizations survive the merge.
 - **Fork base:** `b5677e89` (2026-10-20, "fix(git,history,repository): close stale
   dialogs and guard squash operations (#577)"), app version 0.13.5. Everything
   before it is upstream history.
-- **Fork commits:** 2, both by GuideAxon, both on 2026-10-20.
+- **Fork commits:** 2 original customizations (GuideAxon, 2026-10-20), plus the
+  browser-automation security hardening below (customization 4).
+- **Last upstream sync:** 2026-11-06, merge of `upstream/master` `49197523`
+  ("add state tabs and review history posting (#653)", v0.13.8). The earlier sync
+  merged `630e992e` (v0.13.7+). One textual conflict, in `RepositoryView.tsx`
+  imports (see [Merge hotspots](#merge-hotspots)).
 - **Uncommitted at the time of writing:** a stray build-path line in `README.md`
   (see [Loose ends](#loose-ends)).
 - Gathered from `git log` / `git show` on `master`. The `upstream` remote is
@@ -86,6 +91,37 @@ Files:
 Small README changes (7 insertions, 3 deletions). Re-check the Install section
 after a merge, since upstream edits there too.
 
+### 4. Browser-automation security hardening (2026-11-06)
+
+Result of auditing this repo for stale or unsafe bundled browsers. GitDesktop is a
+Tauri app on the system WebView2 and has no Playwright, Puppeteer, Remotion or
+Electron dependency, so the changes are guardrails and docs, not dependency bumps.
+
+| Change | Detail |
+| --- | --- |
+| Agent guide rules | A "Browser automation safety" section appended to `CLAUDE.md` and `AGENTS.md` (identical text): bundled Chromium only, `chromiumSandbox: true` set explicitly, never `--no-sandbox`, non-root containers, no weakening flags, CDP and debug-port rules, secrets out of git. |
+| MCP config | `.mcp.json` runs `pnpm exec shadcn mcp` instead of `npx shadcn@latest mcp`. `shadcn` is already a devDependency, so the lockfile pins it and Renovate bumps it. Needs `pnpm install` first. |
+| Agent Dockerfile starter | The commented Playwright example in `src-tauri/src/agent_sandbox.rs` now uses `playwright@<version>` (not `@latest`), says to keep the Chromium sandbox on, and says to install as root then switch back to `USER node`. A doc comment on `CUSTOM_DOCKERFILE_STARTER` records why. |
+| Debug port note | `TROUBLESHOOTING.md`: close GitDesktop when finished with the WebView2 remote-debugging port. |
+
+Files:
+
+- **Edited:** `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `TROUBLESHOOTING.md`,
+  `src-tauri/src/agent_sandbox.rs`.
+- **New:** `changelog.d/changed-agent-dockerfile-starter-playwright.md`.
+
+Audit findings left as they are:
+
+- The vendored `impeccable` skill passes `--no-sandbox` when `CI` is set
+  (`.claude/skills/impeccable/scripts/detector/engines/browser/detect-url.mjs`, and
+  the `.agents/` copy). Puppeteer is not installed and the scan targets the user's
+  own dev server. Left alone because `skills-lock.json` tracks the vendored files.
+- `pnpm audit --prod` reports a moderate `minimatch` and a low `deepmerge` issue,
+  both reached only through the `shadcn` CLI and both already in the lockfile before
+  the 2026-11-06 sync.
+- No committed credentials, Dockerfiles, deep-link WebViews or capability changes
+  were found in this repo or in the upstream commits merged on 2026-11-06.
+
 ## Merge hotspots
 
 Files both sides are likely to touch, ordered by conflict risk. Resolve by keeping
@@ -100,6 +136,14 @@ upstream's change and re-adding the fork lines listed above.
 4. `src-tauri/src/github/pr.rs` and `src-tauri/src/lib.rs` (the invoke handler
    list).
 5. `src/lib/settings/api.ts`: settings type and defaults.
+6. `src/features/repository/RepositoryView.tsx`: upstream edits the import block
+   and moves components out. The 2026-11-06 sync conflicted on one line: keep
+   upstream's `TabPanel` import and the fork's `useAutoSwitchGhAccount` import,
+   in that sort order.
+7. Security hardening files: the appended section at the end of `CLAUDE.md` and
+   `AGENTS.md` (conflicts if upstream appends there too), `.mcp.json`,
+   `TROUBLESHOOTING.md`, and the starter text in `agent_sandbox.rs`. Keep the
+   fork's wording and re-check that `.mcp.json` still points at `pnpm exec`.
 
 ## Sync checklist
 
@@ -111,7 +155,11 @@ upstream's change and re-adding the fork lines listed above.
    `cargo test --manifest-path src-tauri/Cargo.toml`.
 4. In the app, confirm both local providers still appear and resolve a model, and
    the auto-switch checkbox is still in Settings → General.
-5. Update the fork base in this file to the new upstream commit.
+5. Update the fork base and the "Last upstream sync" line in this file to the new
+   upstream commit.
+6. Re-run the security checks: `pnpm audit --prod`, a diff of
+   `src-tauri/capabilities/` and `tauri.conf.json`, and a scan of the merged
+   upstream diff for new process spawns, HTML sinks and dependencies.
 
 ## Loose ends
 

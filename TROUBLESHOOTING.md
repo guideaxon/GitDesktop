@@ -95,6 +95,9 @@ with DevTools open and copy anything red from the Console.
 The environment variable lasts for that PowerShell window only, so a normal launch from
 the Start menu is unaffected.
 
+The debugging port gives full control of the app's webview, so close GitDesktop when you
+are finished.
+
 Note that a fault in the Rust half of the app will not appear in the Console at all. If
 DevTools shows nothing and the app still exits, the crash log above is the useful
 artifact.

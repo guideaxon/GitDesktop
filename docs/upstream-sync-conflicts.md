@@ -35,6 +35,24 @@ pre-sync analysis is in [upstream-sync-review.md](upstream-sync-review.md).
 6. **Lockfiles** (`pnpm-lock.yaml`, `Cargo.lock`): take upstream's, then run
    `pnpm install` and `cargo check` to regenerate. Never hand-merge.
 
+## Sync of 2026-11-06 → upstream `49197523` (v0.13.8, 11 commits)
+
+One conflicted file out of 283 changed upstream.
+
+| File | Upstream | Fork | Resolution |
+| --- | --- | --- | --- |
+| `src/features/repository/RepositoryView.tsx` | Added `import { TabPanel } from "./TabPanel"` and moved `TabPanel` out of the file | Added `import { useAutoSwitchGhAccount } from "./useAutoSwitchGhAccount"` at the same spot | Kept both imports, sorted case-insensitively (`TabPanel`, `useAutoSwitchGhAccount`, `usePrNotifications`). The hook call is still at the top of the component. |
+
+Checked after the merge: `pnpm exec tsc -b --noEmit`, `pnpm changelog:check`, and the
+`agent_sandbox` tests plus clippy. `biome check` reports formatting on this file only
+because of the worktree CRLF false-fail described in the repo safety rules.
+
+Security pass over the upstream diff: no change to `src-tauri/capabilities/` or
+`tauri.conf.json`, no new process-spawning or HTML-injection code outside tests,
+and the new `git_blob_sizes` command validates object ids and rejects traversal,
+absolute paths, symlinks and reserved device names. New dependencies are Vitest and
+Testing Library (dev only) plus routine bumps.
+
 ## Sync of 2026-11-02 → upstream `630e992e` (v0.13.7 plus 29 later commits)
 
 Merged on branch `sync/upstream-2026-11-02` (`git merge upstream/master`). Two files
