@@ -44,10 +44,12 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cd site && pnpm build                  # when the marketing site changed
 pnpm run checks                        # guard scripts + self-tests — CI quality.yml guards job
+pnpm test                              # Vitest component tests (jsdom) — CI frontend.yml installed job
 ```
 
-Frontend changes run the first pair; Rust changes add the cargo pair. Not
-"done" until green.
+Frontend changes run the first pair plus `pnpm test` (CI runs it on every
+`src/**` change, and "which surfaces a suite exercises" is not decidable
+locally); Rust changes add the cargo pair. Not "done" until green.
 
 ⚠ **Formatting fixes stay in scope:** implementers format only their own files,
 via the targeted `pnpm exec biome check --write <files in scope>`, never the
@@ -62,6 +64,51 @@ gate is the CI form over LF-normalized copies: copy each edited file to a
 delete them after. `biome lint` is NOT a gate — it skips the formatter and
 assist layers `biome ci` enforces (a measured false clean, three CI reds).
 Never "fix" a red by converting line endings.
+
+## Frontend testing — two layers, routed by what the test asserts
+
+Two frontend test layers exist; pick by assertion kind, never by habit:
+
+- **Behaviour a user could observe** (render, interact, assert the outcome) →
+  a Vitest interaction test in `src/test/**/*.test.{ts,tsx}` (`pnpm test`; RTL +
+  user-event on jsdom; CI runs it in frontend.yml's installed job). Never add a
+  NEW source-scan pin for behaviour a jsdom test can exercise.
+- **"Every X does Y" class invariants** (roster/adopter scans over `src/`) and
+  **pure-logic `.ts` imports** → `scripts/*.test.mjs` as before (installless:
+  the `guards` job runs that glob with NO node_modules — a vitest-style test
+  there reds every PR).
+
+**Conversion is opportunistic, never a mass rewrite:** when a change touches
+behaviour an existing scan suite pins, convert those pins to interaction tests
+in the same change and delete only the pins the new tests replace; shape-guard
+scans stay scans. A conversion proves itself the way scan suites always have —
+a mutation of the pinned wiring goes red under the NEW tests before the old
+pin is deleted.
+
+Component-layer mechanics (set by the spike; extend, don't re-derive):
+- `src/test/setup.ts` installs a transport that REJECTS any unmocked `invoke()`
+  command (and records it in `unmockedCommands`) — mock at the api-module seam
+  (`vi.mock("@/lib/<area>/api")`), and never spell `invoke("literal")` in a
+  test: the dead-surface guard pairs those with registered Rust commands. A
+  module importing `@tauri-apps/api/core` or a Tauri plugin directly bypasses
+  that transport (four src files outside `src/lib/transport/` do today), so a
+  test reaching one mocks that module itself.
+- The React Compiler is ACTIVE under Vitest (vitest.config.ts merges
+  vite.config.ts) — tests exercise the shipped artifact, so no render-count or
+  referential-identity assertions.
+- jsdom shims live in setup.ts (`matchMedia`, `ResizeObserver`,
+  `Element.prototype.getAnimations` — Base UI's ScrollArea and Dialog need the
+  last one; without it every test still passes, but Vitest reports the thrown
+  errors as unhandled and exits non-zero). Add a shim only on an observed
+  failure, with the failing module cited beside it.
+- tsconfig.test.json puts the test project under `tsc -b`, so every app module
+  a test imports is also typechecked with `types: ["vite/client", "node"]`: a
+  `pnpm build` error naming an app file can come from the test project.
+- The src-wide guard scans read `src/test/` too — a guard red against a test
+  file is fixed in the test, never by widening the guard.
+- Under an agent session vitest picks its minimal reporter, which hides console
+  output from passing tests — act warnings and the unmocked-command warning only
+  show under `pnpm exec vitest run --silent=false`.
 
 ## Frontend conventions
 
@@ -91,8 +138,8 @@ has read one clamped index even when the list shrinks under it. They step with
 from the clamped cursor (don't move them onto `stepHighlight`: it clamps at the
 ends). `scripts/palette-highlight.test.mjs` pins each one, uniform
 palette-shaped pickers in `CALL_SITES` and the rest in per-site `SITE_PINS`.
-Not adopters: `mention-autocomplete.tsx` clamps inline to the same effect, and
-`listKeyboardNav` lists are a separate primitive.
+Not adopters: `mention-autocomplete.tsx` keys its highlight by candidate (a later
+read's rows can land above it); `listKeyboardNav` lists are a separate primitive.
 Destructive paths stay behind confirmation via the
 shared `useConfirm`/`ConfirmDialogHost` primitive (`src/lib/stores/confirm.ts`,
 host in `src/components/confirm-dialog-host.tsx`) — never a bespoke confirm
@@ -199,6 +246,13 @@ dialog (those sites stay unguarded under an `OWNS_CHORD` entry); the
   conditionally rendered `<DiffStat>` in a feature `.tsx` (`&&`, `||`, `??`,
   either ternary branch); a non-row total hidden on purpose takes an
   allowlist entry with its rationale. DiffStat itself keeps no width.
+- Byte sizes render through `formatBytes` (`src/lib/format-bytes.ts`, base 1024,
+  shared by Insights, tag detail and the binary-diff summary); never a local
+  formatter. A full object id is tested with `FULL_OID_RE` (`src/lib/git/oid.ts`:
+  40 or 64 hex, so SHA-256 repos pass). `scripts/oid-width-guard.test.mjs` fails
+  on a new 40-only width in `src/` (a `{40}` quantifier with no `{64}` beside it,
+  a 40-zero literal, a length compared to 40); slices, named constants and split
+  lines are out of its reach.
 - Icon-only copy buttons are `CopyIconButton`
   (`src/components/CopyIconButton.tsx`), never a raw button around `CopyIcon`;
   it always stops click propagation, and the `raw-copy-icon-button` guard in
@@ -344,7 +398,9 @@ dialog (those sites stay unguarded under an `OWNS_CHORD` entry); the
   renders that state as its fallback (`DiffRestingFallback`, sharing its
   message with DiffViewer through `diff-resting-message.ts`), with an aria-busy
   region and its sr-only status beside it rather than inside it, so the first
-  frame already shows the panel's own resting message; still never
+  frame already shows the panel's own resting message. The lazy DiffSurface and
+  DiffContent wrappers (`DiffSurfaceLazy.tsx`) fall back to `DiffPaneFallback`
+  in the same shape, which paints the file's path row. Still never
   `fallback={null}`.
 - Loading placeholders for a bordered row list are `ListRowSkeletons`
   (`src/components/list-row-skeleton.tsx`), with `lines` matching the real row's
@@ -470,6 +526,22 @@ dialog (those sites stay unguarded under an `OWNS_CHORD` entry); the
   it cannot read there, and on a slot host whose slot maps' `preparing` entries
   aren't plain clipped class strings, or that keeps no slot map; its message
   names the spellings it does not read yet.
+- A diff pane's path row and its lazy-chunk fallback both come from
+  `src/features/diff/DiffPathRow.tsx` (`DiffPathRow`, `DiffPaneFallback`; it
+  imports nothing that reaches `./DiffSurface`), so the pane paints its file
+  header before the diff chunk loads. The pane's scroll keys, the hunk-focus
+  landing (`landHunkFocus`) and the layout-switch line anchor's pure math live in
+  `src/features/diff/diff-rows.ts`, shared by the rendered diff and the staging
+  viewer; never a local copy (`scripts/staging-scroll-keep.test.mjs` pins the
+  staging viewer's import). A scrolling diff host keeps its top line across a
+  split/unified switch through `useModeLineAnchor` (`DiffSurface.tsx`), passing
+  its scroller ref, the effective mode, the path and the built diff; an expand of
+  the same diff (Show full diff) calls the hook's `keepLine` before it flips, so
+  the line read before the press is restored after the browser re-lays the rows.
+  Two gaps remain: the staging viewer's Show full diff doesn't keep the line
+  (only a focused press moves focus to the first revealed hunk), and
+  `GitDiffView` hosts without a scroller (agent transcript inline diffs, the
+  conflict view) keep it on neither a switch nor an expand.
 - A file rail's header content (a count, a filter summary) rides `DetailRail`'s
   `header` prop (`src/components/detail-rail.tsx`), which places it in the h-7
   caret strip — never a first-child band inside `children`: the strip is already

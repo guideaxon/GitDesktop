@@ -9,6 +9,7 @@ import type {
   PrDetails,
   PrHeadRef,
   PrInfo,
+  PrListPage,
   PrMergeability,
   PrMergeabilityState,
   PrPollInfo,
@@ -24,7 +25,7 @@ export const forgePrsForBranch = (
   lens: RemoteLens,
 ) => invoke<PrInfo[]>("forge_prs_for_branch", { repoPath, head, lens });
 
-export type PrStateFilter = "open" | "closed";
+export type PrStateFilter = "open" | "closed" | "merged" | "unmerged";
 
 /** The CI rollup for a PR-list page, keyed by number (provider-neutral). `prs` carries
  *  each row's number plus head SHA (the Bitbucket arm needs the SHA). `sampleUrl` is any
@@ -104,6 +105,22 @@ export const forgePrList = (
   filter: RemoteListFilter | null = null,
 ) =>
   invoke<PrInfo[]>("forge_pr_list", { repoPath, state, limit, lens, filter });
+
+/** `forgePrList` plus the read's horizon flag (`PrListPage.capped`). */
+export const forgePrListPage = (
+  repoPath: string,
+  state: PrStateFilter,
+  limit: number | undefined,
+  lens: RemoteLens,
+  filter: RemoteListFilter | null = null,
+) =>
+  invoke<PrListPage>("forge_pr_list_page", {
+    repoPath,
+    state,
+    limit,
+    lens,
+    filter,
+  });
 
 export const forgePrView = (
   repoPath: string,

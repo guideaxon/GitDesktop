@@ -62,6 +62,11 @@ export const capabilities: Capability[] = [
   {
     group: "Diffs & staging",
     label:
+      "Binary files show their size change — old and new size, and how much larger or smaller",
+  },
+  {
+    group: "Diffs & staging",
+    label:
       "Raw ⇄ Preview toggle on markdown & MDX diffs — read the change as rendered prose, repository images included",
     highlight: true,
   },
@@ -73,6 +78,16 @@ export const capabilities: Capability[] = [
     group: "Diffs & staging",
     label:
       "Flat list ⇄ compacted directory tree in the Changes panel — collapsible folders, keyboard-first",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Stage, unstage, discard or stash the shown files of a folder from its context menu in the directory tree view",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Collapse the Staged or Changes section to focus on the other, counts and Stage all / Unstage all still in reach",
   },
   {
     group: "Diffs & staging",
@@ -103,7 +118,7 @@ export const capabilities: Capability[] = [
   {
     group: "Branches & history",
     label:
-      "Push or publish a branch to any remote — no checkout needed, with its progress on the branch's row",
+      "Push or publish a branch to any remote — no checkout needed, with its progress on the branch's row; publishing a new branch asks first and names where it's going",
   },
   {
     group: "Branches & history",
@@ -127,6 +142,11 @@ export const capabilities: Capability[] = [
   {
     group: "Branches & history",
     label: "Paged, filterable commit history with rich detail",
+  },
+  {
+    group: "Branches & history",
+    label:
+      "Search all history by message or SHA — paste a full or short hash to find its commit",
   },
   { group: "Branches & history", label: "File history & line blame" },
   { group: "Branches & history", label: "Commit-author avatars in history" },
@@ -156,7 +176,7 @@ export const capabilities: Capability[] = [
   {
     group: "Rewrite & recovery",
     label:
-      "In-app conflict editor — current / incoming / both, or mark files resolved as they stand on disk",
+      "In-app conflict editor — current / incoming / both, a conflicts-left count with next / previous jumps, or mark files resolved as they stand on disk",
   },
   { group: "Rewrite & recovery", label: "Stash browser" },
   {
@@ -278,6 +298,11 @@ export const capabilities: Capability[] = [
     label:
       "Triage the PR list — All | Mine | Needs review presets and whole-repo filters (GitHub & GitLab), with grouping by your review state (GitHub)",
     highlight: true,
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Open, Merged & Closed PR tabs — merged work kept apart from PRs closed without merging",
   },
   {
     group: "Pull requests & review",
@@ -653,7 +678,7 @@ export const capabilities: Capability[] = [
   {
     group: "Keyboard & Markdown",
     label:
-      "@mention & #reference autocomplete, plus !123 on GitLab — GitHub & GitLab comments, replies, release notes, local PRs & issues",
+      "@mention & #reference autocomplete, plus !123 on GitLab, with open, closed and merged work marked by state — GitHub & GitLab comments, replies, release notes, local PRs & issues",
   },
   {
     group: "Keyboard & Markdown",
@@ -737,6 +762,12 @@ export const capabilities: Capability[] = [
     group: "AI · generate & review",
     ai: true,
     label: "Queue the other review mode while one streams — runs it next",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Post any past review from its history row — posted ones are marked, and posting twice asks first",
   },
   {
     group: "AI · generate & review",

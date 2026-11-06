@@ -60,19 +60,25 @@ import {
   useHoverPrefetch,
   usePendingRepoWrites,
   usePrefetchPr,
-  usePrList,
   usePrListCi,
   usePrListMergeability,
+  usePrListPage,
   usePrReviewState,
 } from "@/lib/git/queries";
 import {
-  providerLabel,
+  type ForgeProvider,
+  listPageRows,
+  type ProviderName,
   type ReviewStateEntry,
   remoteListFilterKey,
+  savedProvider,
+  shownProvider,
+  shownProviderLabel,
+  UNKNOWN_HOST,
 } from "@/lib/git/types";
 import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
 import { listKeyboardNav } from "@/lib/list-keyboard-nav";
-import { type LocalPrStatus, reloadLocalPrs } from "@/lib/pulls/local";
+import { reloadLocalPrs } from "@/lib/pulls/local";
 import {
   LOCAL_PR_RECORD_WRITES_FAMILY,
   localPrKey,
@@ -80,7 +86,9 @@ import {
   useLocalPrs,
   useUpdateLocalPr,
 } from "@/lib/pulls/queries";
+import { localPrAlignTab, prAlignTab } from "@/lib/remote-state-filter";
 import { useLensState, useRemoteSlug } from "@/lib/repo-lens/queries";
+import { useSettings } from "@/lib/settings/queries";
 import {
   containedHolds,
   containedHoldsKey,
@@ -126,13 +134,15 @@ const UNGROUPED_NOTE: Record<UngroupedReason, string> = {
   truncated: "Couldn't check every review — the list is ungrouped.",
 };
 
-/** Which tab a local PR's status belongs on — the Closed tab covers merged and
- *  closed alike. Total over {@link LocalPrStatus}, so a new status has to be
- *  classified here rather than silently reading as open. */
-const LOCAL_ALIGN_TAB: Record<LocalPrStatus, PrStateFilter> = {
-  open: "open",
-  merged: "closed",
-  closed: "closed",
+const PR_STATE_TABS: readonly PrStateFilter[] = ["open", "merged", "unmerged"];
+
+/** Total over PrStateFilter so a new wire value must be labelled; "unmerged"
+ *  renders as Closed, and "closed" (never a tab) keeps a label for totality. */
+const PR_STATE_LABELS: Record<PrStateFilter, string> = {
+  open: "Open",
+  merged: "Merged",
+  unmerged: "Closed",
+  closed: "Closed",
 };
 
 /** The saved team filter couldn't be validated, so the list ran without it — a
@@ -152,9 +162,26 @@ function reviewBucket(
   return entry.updatedAt > entry.lastReviewedAt ? "updated" : "reviewed";
 }
 
+/** The New menu's forge item, named for the shown provider (unknown while the
+ *  probe is pending with nothing saved). */
+function newPrLabel(
+  shown: ForgeProvider | null | undefined,
+  hostName: ProviderName | null,
+): string {
+  if (shown === "gitlab") return "Merge request on GitLab…";
+  return hostName ? `Pull request on ${hostName}…` : "Remote pull request…";
+}
+
 export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   const gh = useForgeStatus(repoPath);
   const provider = gh.data?.provider;
+  // Copy names the saved provider until the probe answers; gates keep the raw probe.
+  const settings = useSettings();
+  const shown = shownProvider(
+    gh.data,
+    savedProvider(settings.data?.recentRepos, repoPath),
+  );
+  const hostName = shownProviderLabel(shown);
   // Merge request reads work for GitHub and GitLab; the noun + section header
   // follow the provider so a GitLab repo reads "merge requests" / "GitLab".
   const isGitLab = provider === "gitlab";
@@ -166,10 +193,10 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   // When browsing the parent, the section header names the parent slug (whose
   // data this is) — falling back to "Upstream" while the slug loads.
   const upstreamSlug = useRemoteSlug(repoPath, "upstream", lens === "upstream");
-  const providerName = providerLabel(provider);
+  const providerName = hostName ?? UNKNOWN_HOST;
   const remoteLabel =
-    lens === "upstream" ? (upstreamSlug ?? "Upstream") : providerName;
-  const remoteNoun = isGitLab ? "merge requests" : "pull requests";
+    lens === "upstream" ? (upstreamSlug ?? "Upstream") : (hostName ?? "Remote");
+  const remoteNoun = shown === "gitlab" ? "merge requests" : "pull requests";
   const ghReady = forgeFeatureReady(gh.data, "pullRequests");
   // The provider's own capabilities, read separately from `forgeFeatureReady` so a
   // not-yet-connected repo never gets told its PROVIDER lacks an axis it has.
@@ -183,10 +210,11 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   const canGroupByReview = forgeFeatureReady(gh.data, "reviewGrouping");
   const probe = forgeProbeState(gh);
   const scopeProbeReason = useScopeProbeReason(repoPath);
-  // "closed" matches the Closed tab: closed and merged alike.
+  // One of PR_STATE_TABS: the Closed tab sends "unmerged" (closed without
+  // merging); the legacy "closed" (not open) is never a tab here.
   const [stateFilter, setStateFilter] = useState<PrStateFilter>("open");
-  // How many remote PRs to load; "Load more" bumps it. A tab switch (open/closed)
-  // resets to the first page.
+  // How many remote PRs to load; "Load more" bumps it. A tab switch resets to
+  // the first page.
   const [requestedLimit, setLimit] = useState(PAGE_SIZE);
   // Read once, high: three gates below key off it (team membership, mergeability,
   // review state) — every network read this panel owns beyond the list itself.
@@ -234,7 +262,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   // covered by the same skeletons a cold load already shows (a held query reports
   // `isPending`, which is what `listPending` below renders), and the gate always
   // opens — see the hook's note on why neither leg can wedge.
-  const prList = usePrList(
+  const prList = usePrListPage(
     repoPath,
     ghReady && listFilter.scopeReady,
     stateFilter,
@@ -244,6 +272,12 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     holdPollMs,
   );
   const loadMore = more.observe(prList);
+  // Every row read below takes this one extraction, so the strip, the rows and
+  // the option source all see the cached page's own `rows` reference.
+  const prRows = listPageRows(prList.data);
+  // Only a settled read may claim the horizon: a placeholder carries another
+  // tab's or limit's flag.
+  const capped = prList.data?.capped === true && !prList.isPlaceholderData;
   // Row CI icons hydrate separately from the list, so the list paints immediately; the
   // backend routes GitHub/GitLab/Bitbucket, so `ghReady` is the readiness gate. Idle
   // while the list serves placeholder rows (tab switch or Load more): otherwise the
@@ -254,14 +288,14 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     ghReady && !prList.isPlaceholderData,
     stateFilter,
     limit,
-    prList.data,
+    prRows,
     lens,
   );
   const ciMap = prListCi.data;
   // Row conflict chips. The extra gates are load-bearing on top of `ghReady`: this call
   // takes seconds on large GitHub repos and every active forge query joins the commit
   // mutation's awaited invalidation set, so it must be idle off this tab and off the
-  // Closed tab, where no row has live mergeability to report.
+  // Merged and Closed tabs, where no row has live mergeability to report.
   // `!isPlaceholderData` covers the first half of a tab switch or Load more: while
   // the LIST is still serving placeholder rows, this stays idle rather than describing
   // a page that isn't on screen. None of these gates stop a chip on their own, though —
@@ -276,7 +310,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
       !prList.isPlaceholderData,
     stateFilter,
     limit,
-    prList.data,
+    prRows,
     lens,
     listFilter.filter,
   );
@@ -343,14 +377,14 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     labelCount,
   } = useLocalRemoteFilter({
     locals: localPrs.data ?? [],
-    remotes: prList.data ?? [],
+    remotes: prRows ?? [],
     stateFilter,
     remotesArePlaceholder: prList.isPlaceholderData,
     authorFilter: listFilter.authorFilter,
     labelFilter: listFilter.labelFilter,
     mineActive: listFilter.mineActive,
     labelsServerSide: listFilter.labelsServerSide,
-    // `usePrList`'s key up to the state axis: every cached page for this lens and
+    // The list key up to the state axis: every cached page for this lens and
     // state feeds the author/label options and counts, whatever limit or filter
     // produced it, so they don't collapse to the active filter.
     optionSourcePrefix: [...repoKeys.prList(repoPath), lens, stateFilter],
@@ -448,6 +482,19 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     () => listFilter.setPreset("needs-review"),
     onPullsTab && canFilterMine && canGroupByReview && listFilter.prefsReady,
   );
+  // The state tabs render on every forge, so only the tab gates them; each goes
+  // through the tab click's own door, which counts the pick as the user's.
+  useHotkeyAction("pr-state-open", () => onUserStateFilter("open"), onPullsTab);
+  useHotkeyAction(
+    "pr-state-merged",
+    () => onUserStateFilter("merged"),
+    onPullsTab,
+  );
+  useHotkeyAction(
+    "pr-state-closed",
+    () => onUserStateFilter("unmerged"),
+    onPullsTab,
+  );
   useHotkeyAction(
     "pr-group-review",
     () => listFilter.setGroupByReview(!listFilter.groupByReview),
@@ -544,9 +591,9 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     }
   }, [pendingCreate, clearPendingCreate, canCreateGhPr, openLocalPrCreate]);
 
-  // Land on the tab that can CONTAIN the PR a navigation opened: this tab is local
-  // state a notification / My work / Automation-history click can't reach, so a merged
-  // PR arrives selected on a tab that will never list it. The target comes from the PR's
+  // Land on the tab that lists the PR a navigation opened: this tab is local state a
+  // notification / My work / Automation-history click can't reach, so a merged PR
+  // arrives selected on a tab that will never list it. The target comes from the PR's
   // own state, which the event can't name — a review posted on a PR that merged
   // afterwards is the reported case. One-shot, retired as soon as it's answered.
   // Every term gates the ARMING, so no doomed or wrong read is ever issued: the tab
@@ -606,10 +653,10 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   );
   useEffect(() => {
     if (alignRemoteNumber === null || !alignDetailsSettled) return;
-    // Anything but OPEN lands on Closed, which holds merged and closed alike. An
-    // ERROR deliberately leaves the intent armed so a Retry still completes the
-    // align; it can't target a different PR, because any reselection clears it.
-    settleAlign(alignRemoteState === "OPEN" ? "open" : "closed", false);
+    // OPEN lands on Open, MERGED on Merged, anything else on Closed. An ERROR
+    // deliberately leaves the intent armed so a Retry still completes the align;
+    // it can't target a different PR, because any reselection clears it.
+    settleAlign(prAlignTab(alignRemoteState ?? ""), false);
   }, [alignRemoteNumber, alignDetailsSettled, alignRemoteState]);
   useEffect(() => {
     if (!pendingPrAlign || selectedPr?.kind !== "local") return;
@@ -625,14 +672,10 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
       return;
     }
     // `archived` is a visibility sub-filter WITHIN a tab, so the aligned tab keeps
-    // hiding the row until that toggle is on. The Record is declared TOTAL for
-    // exhaustiveness but READ as partial: the stored status is untrusted (the app-data
-    // file is hand-editable, a newer build can add a member), and a miss falls back to
-    // the current tab — a no-op align that just retires the intent.
+    // hiding the row until that toggle is on. A status this build doesn't know
+    // lands on Closed, the tab whose predicate lists it.
     settleAlign(
-      (LOCAL_ALIGN_TAB as Partial<Record<string, PrStateFilter>>)[
-        selectedLocalPr.status
-      ] ?? stateFilter,
+      localPrAlignTab(selectedLocalPr.status),
       selectedLocalPr.archived === true,
     );
   }, [
@@ -641,7 +684,6 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
     localPrs.isSuccess,
     localPrs.isFetching,
     selectedLocalPr,
-    stateFilter,
     clearPendingPrAlign,
   ]);
 
@@ -728,7 +770,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   // done, not that it should linger. Per entry by its OWN number, so one
   // create's arrival never hides a still-creating sibling.
   // Deliberately NOT gated on `isPlaceholderData`: the strip and the rows render
-  // from the SAME `prList.data`, so a placeholder page holding the number is
+  // from the SAME `prRows`, so a placeholder page holding the number is
   // already painting that row — gating here would show both at once.
   // Entries persist past their guard release, so this predicate is also what
   // RE-shows the strip when a pre-settle refetch loses the number again — the
@@ -741,7 +783,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
             c.lens === lens &&
             !(
               c.phase === "created" &&
-              (prList.data?.some((p) => p.number === c.number) ?? false)
+              (prRows?.some((p) => p.number === c.number) ?? false)
             ),
         )
       : [];
@@ -752,7 +794,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
   // panel's own filtered page still lacks the row. Pre-arm, containment only
   // hides the strip; the entry and banner stay until the flow ends. Both derives
   // are pure store functions, where their own tests reach them.
-  const containedCreates = containedHolds(creates, prList.data, {
+  const containedCreates = containedHolds(creates, prRows, {
     open: stateFilter === "open",
     lens,
     isPlaceholder: prList.isPlaceholderData,
@@ -999,6 +1041,11 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
         remoteLabel={remoteLabel}
         stateFilter={stateFilter}
         onStateFilter={onUserStateFilter}
+        stateOptions={{
+          values: PR_STATE_TABS,
+          labels: PR_STATE_LABELS,
+          groupLabel: "Pull request state",
+        }}
         presetControl={
           <ConversationPresetSwitcher
             feature="pulls"
@@ -1013,9 +1060,7 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
         }
         lensControl={<RepoLensSwitcher repoPath={repoPath} />}
         newMenu={{
-          ghLabel: isGitLab
-            ? "Merge request on GitLab…"
-            : `Pull request on ${providerName}…`,
+          ghLabel: newPrLabel(shown, hostName),
           ghDisabled: !canCreateGhPr,
           ghReason: ghCreateReason ?? undefined,
           onGh: () => setGhCreateOpen(true),
@@ -1199,7 +1244,8 @@ export function PullRequestsPanel({ repoPath }: { repoPath: string }) {
         // limit (compared against the raw loaded count, not the filtered view).
         // A grow in flight serves the previous page, shorter than the new limit,
         // so the row stays mounted and busy then, even while the read is parked.
-        hasMore={loadMore.growing || (prList.data?.length ?? 0) === limit}
+        hasMore={loadMore.growing || (prRows?.length ?? 0) === limit}
+        remoteCapped={capped}
         remoteCount={stateRemote.length}
         loadingMore={prList.isFetching || loadMore.growing}
         onLoadMore={() => setLimit((n) => n + PAGE_SIZE)}

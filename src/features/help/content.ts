@@ -515,7 +515,9 @@ the last list up, with a line above it saying it couldn't refresh.
   it first. A very large diff opens with up to its first 1,000 lines, and every hunk
   shown in full keeps its hunk buttons; **Show full diff** at the bottom brings in the
   rest. A hunk that limit cuts short gets its buttons once the full diff shows; until
-  then, a drag selection still acts on just its visible lines.
+  then, a drag selection still acts on just its visible lines. Staging, unstaging or
+  discarding a hunk keeps your place in the diff, with keyboard focus on the hunk now in
+  that spot.
 - **Line-level staging** — drag across the line-number gutter to select specific lines,
   spanning as many hunks as you like, then stage or discard just those (or unstage
   them, on a staged file's diff). Discarded lines go back where a discarded hunk would:
@@ -526,13 +528,29 @@ the last list up, with a line above it saying it couldn't refresh.
   replacing it; a plain drag starts a fresh one.
   {{kbd:stage-selected-lines}} stages the selection (or unstages it, on a staged file's
   diff) without reaching for the button, and the command palette offers **Clear line
-  selection**. A file whose change isn't UTF-8 text stages, unstages and discards only
-  as a whole, keeping every byte exact; its diff says so.
+  selection**. Acting on a selection from its bar, clearing it included, keeps keyboard
+  focus in the diff. A file whose change isn't UTF-8 text stages, unstages and discards
+  only as a whole, keeping every byte exact; its diff says so.
 - Select multiple files ({{key:mod}}-click, or Shift-click for a range), then {{secondaryclick}}
-  for **Stage / Unstage / Discard / Stash** of the whole selection — or use the command
-  palette ({{kbd:command-palette}}) for Stage / Unstage selected files.
+  to act on the selection. Each menu action shows how many selected items it applies
+  to, and one that applies to none is left out of the menu; the exception is **Stage**,
+  which stays in view but unavailable when every selected unstaged file has a name
+  Windows reserves. **Stage** and **Discard** take the selected unstaged rows, and
+  **Unstage** the selected staged ones. **Stash**{{ai}}, **Exclude from AI**{{/ai}} and
+  **Ignore** count each selected file once, and a stash takes the whole file, staged and
+  unstaged changes alike, even when only one of its rows is selected. **Untrack** covers
+  the selected files Git can untrack, skipping new files and staged deletions.
+  **Discard** leaves selected conflicted files out and shows "N of M" when it does;
+  **Stash** is unavailable while any file in the repository is conflicted. The command
+  palette ({{kbd:command-palette}}) offers Stage / Unstage selected files too.
 - Filter the list by path, or by category (new / modified / deleted, included /
   excluded) with the funnel button.
+- Click the **Staged** or **Changes** heading to collapse that section, and again to
+  bring it back ({{key:enter}} or {{key:space}} on the focused heading does the same).
+  The heading keeps its file count, and **Stage all** / **Unstage all** still act on
+  every file in a collapsed section. Collapsing drops the section's files from a
+  multi-selection and leaves the diff you have open on screen. Both sections open
+  again when you switch repositories.
 - The **Directory tree view** button in the filter row swaps the flat list for a
   compacted directory tree: single-child folder chains merge into one row, and shared
   prefixes roll up. Click a folder to collapse or expand it ({{key:enter}} or
@@ -540,9 +558,20 @@ the last list up, with a line above it saying it couldn't refresh.
   alike, ← folds the folder you're on or jumps to its parent, and → unfolds a
   folder or steps inside it. Collapsing a folder drops its hidden files from a
   multi-selection, and the diff you have open stays open. Selection, staging,
-  and filtering behave the same in both views; file rows keep their
-  {{secondaryclick}} menu, while a folder row opens the whole-list menu. Your
-  choice is remembered for every repository. *Toggle directory tree view* in
+  and filtering behave the same in both views, and file rows keep their
+  {{secondaryclick}} menu. A folder row's {{secondaryclick}} menu stages, discards
+  or stashes the files shown under it (in Staged: unstages or stashes them), and can
+  copy the folder's path or **Show in Explorer**. Its stage, unstage, discard and
+  stash items count the files they apply to; **Discard** and **Stash** are left out
+  when they'd apply to none, and **Stage** stays unavailable when every file shown
+  has a name Windows reserves. **Discard** leaves conflicted files for the conflict editor
+  and its confirm says how many it skipped. **Stash** stays unavailable, marked
+  "resolve conflicts first", while any file is conflicted. When the filter hides
+  some of the folder's files, the menu says how many it leaves alone. *Stage
+  folder*, *Unstage folder*, *Discard changes in folder* and *Stash changes in
+  folder* in the command palette do the same for the folder you've arrowed to.
+  The view you pick is remembered for every
+  repository. *Toggle directory tree view* in
   the command palette ({{kbd:command-palette}}) flips it too (palette-only by
   default — bind a key in **Settings → Keyboard**).
 - **Discard all changes…** clears the whole working tree after a confirm. It sits on the
@@ -572,6 +601,10 @@ the last list up, with a line above it saying it couldn't refresh.
   between the old and new sides; at **100%** the arrow keys pan the zoomed image, and
   Esc closes either way. The **SVG** preview above a text diff and the image diffs
   inside the stashes dialog open the same viewer.
+- **Other binary files** show their size change under the binary-file notice, such as
+  *1.2 MB → 725 KB · 486 KB smaller (−40%)*, or *Deleted file · 900 KB* for a removed one.
+  When two different sizes round to the same figure, the line gives exact byte counts.
+  A screen reader always hears the exact counts. A changed file mode gets its own line.
 - **Markdown preview** — markdown and MDX diffs add a **Raw / Preview** toggle to the
   diff toolbar. **Preview** renders the file's new version as formatted prose
   (headings, tables, highlighted code fences), so a docs change reads the way it will
@@ -621,9 +654,10 @@ Write a **summary** (there's a 72-character budget indicator) and an optional
   nothing. Undoing a branch's *first* commit also asks — it has no parent to fall
   back to, so the branch ref goes with it. If another Git
   process commits or switches branches after History last showed it, or while the
-  undo runs, Undo stops without undoing anything and says so. Undo also asks you
-  to finish or abort a merge, cherry-pick or revert in progress, and to resolve
-  any conflicts, first. On a detached first commit, or when the latest commit's
+  undo runs, Undo stops without undoing anything and says so. While a merge,
+  cherry-pick or revert is in progress, Undo is held: its menu item says to finish
+  or abort that first, and the shortcut says the same. Undo also asks you to
+  resolve any conflicts first. On a detached first commit, or when the latest commit's
   parent was never fetched (the oldest commit of a shallow clone), there is nothing
   to undo onto, and Undo says so instead. Fetching more history from a terminal
   (\`git fetch --deepen=1\`) gives that commit a parent, and Undo works again once
@@ -634,9 +668,9 @@ Write a **summary** (there's a 72-character budget indicator) and an optional
 > (\`nul\`, \`con\`, \`com3\`): the recycle bin can't take one, so those are removed
 > permanently. On Windows git can't stage such a file at all, so its **Stage**
 > control explains that rather than failing, and **Stage all** stages everything else.
-> **Stash all** works around them too: everything else is stashed and the reserved-named
-> file stays put; if they're the only changes, Stash all explains why nothing can be
-> stashed.`,
+> **Stash** works around them too, whether it's **Stash all** or a stash of selected
+> files or a folder: everything else is stashed and the reserved-named file stays put;
+> if they're the only changes, Stash all explains why nothing can be stashed.`,
   },
   {
     id: "history",
@@ -650,6 +684,24 @@ selection to compare a range.
 
 If the history can't be read, the tab says why and offers **Retry**. A failed refresh or
 **Load more** keeps the commits already loaded under a line saying so.
+
+## Searching history
+
+The box above the list ({{kbd:focus-filter}}) filters the commits already loaded by
+subject, author or SHA. To look past them, choose **Search all history for "…"** below
+the list: it searches the message of every commit on the branch, and a query of 4 to 64
+hex characters also finds the commit with that SHA, so a hash pasted from a terminal, a
+CI log or a review comment lands on its commit even when it isn't loaded yet. A short
+hash that fits several commits lists them, up to the 20 newest; a longer hash narrows
+the list. A match that isn't on this branch shows as a line with its short SHA and an
+**Open commit** button; past three such matches, a last line counts the rest. When
+nothing matches, the list says what it checked. If the message search fails and the SHA
+lookup has nothing to show, the list says the search couldn't run, with a **Retry**.
+Otherwise, when either one fails before it finds anything, a line names the part that
+failed, with a **Retry**, and whatever the other one found stays on screen. A refresh
+that fails over results already on screen keeps them under a line saying so, or under
+the failed part's line when one shows.
+**Back to recent history** returns to the loaded list.
 
 ## Commit actions
 
@@ -699,7 +751,12 @@ If the history can't be read, the tab says why and offers **Retry**. A failed re
   **Changes** tab (stage and commit/amend as usual), then **Continue** from the banner
   there. A quick **Squash N commits…** is also on the context menu when you select adjacent
   commits; both it and **Edit history** wait while a merge, rebase, cherry-pick or revert
-  is in progress, and the menu says to finish the operation in **Changes** first.
+  is in progress, and the menu says to finish the operation in **Changes** first. When
+  there's nothing to edit (every commit is pushed, or with no upstream there are no
+  commits ahead of the default branch; the latest commit is a merge; its parent isn't
+  in a shallow clone; or there's no older commit to rebase onto), **Edit history** is
+  held and the menu says which. If the editor is open when that happens, its footer
+  says so.
 - **Create a branch** or **create a tag** at a commit, **check out** a commit (it asks
   first and explains the detached HEAD you land in), or copy
   its SHA.
@@ -735,8 +792,10 @@ refresh and a **Retry**. A file that fails to blame says why and offers **Retry*
 history and the **Blame file…** picker work the same way: a failed refresh keeps what's
 shown, and a list that can't load says why and offers **Retry**.
 
-> History-rewriting actions (reset, Edit history, squash) only ever touch **unpushed**
-> commits, and a push of rewritten history becomes a safe
+> History-rewriting actions (Edit history, squash) only ever touch **unpushed** commits
+> (in a repository with no remote, the commits your branch adds on top of \`main\` or
+> \`master\`, or every commit while you're on that branch), and a push of rewritten
+> history becomes a safe
 > **force-with-lease --force-if-includes** push (the second flag needs Git 2.30+ — see
 > *Syncing & conflicts*).`,
   },
@@ -874,7 +933,10 @@ The branch name in the header opens the **branch switcher** ({{kbd:show-branches
   with the reason: another push or publish, merging into the current branch, updating the
   current branch, deleting a branch on a remote, and the sync bar's **Fetch**, **Pull**
   and **Push**. The branch menu's shortcuts say why instead of starting, and so does a
-  press in a menu that was already open when the push started.
+  press in a menu that was already open when the push started. A dialog that was already
+  open checks again when you confirm it, so renaming, deleting, archiving or cleaning up
+  branches, resetting a branch to its upstream, and retrying a pull, merge or rebase from
+  its prompt leave the running push to finish.
 - The **Remote** section lists branches on your remotes you haven't checked out locally
   yet — click one to check it out (creating a local tracking branch), or {{secondaryclick}} to
   **Delete on _origin_…**, a server-side delete that removes the branch from the remote for
@@ -1188,7 +1250,13 @@ editor**: each conflict region shows **Current (ours)** over **Incoming (theirs)
 **Accept current**, **Accept incoming**, or **Both**, and the header adds whole-file
 **Accept all current** / **Accept all incoming** and **Open in editor**. Those whole-file
 accepts ask first, since taking a side replaces the file wholesale, conflict regions you
-already settled by hand included. A conflicted file that isn't UTF-8 text skips the
+already settled by hand included. A strip above the regions counts the conflicts left, and
+its **Previous** and **Next** buttons ({{kbd:previous-conflict}} / {{kbd:next-conflict}},
+also in the command palette as **Previous conflict** and **Next conflict**) take you from
+one region to the next, wrapping around at either end; each region's header names its
+place ("Conflict 2 of 3"). When the first conflict starts below the visible part of the
+file, the editor scrolls down to it as it opens.
+A conflicted file that isn't UTF-8 text skips the
 per-region accepts and resolves through the whole-file accepts or your editor, keeping its
 bytes exact. If the file changed on disk after the editor read it (saved from another
 editor, say), **Accept current**, **Accept incoming**, and **Both** write nothing: a message
@@ -1226,12 +1294,15 @@ says so and the button reads **Accept**: it writes the file but leaves it unstag
 moves on. The file stays listed as conflicted: finish it in the conflict editor, or
 remove the markers yourself and **Mark resolved**. When the markers left can't be split
 into regions, **Mark resolved** is offered right away and asks before staging them. The
-banner's sparkle button (**Resolve all with AI** on hover) walks every conflict in turn —
-the walk keeps its place while you peek at another tab (switching repositories ends it).
-It runs on any provider, including local Ollama and keyless Claude Code / Codex agents, and
-skips files matched by your AI ignore patterns. A conflict that includes text that isn't
-UTF-8 isn't sent to the model either; resolve it with the whole-file accepts or your
-editor.{{/ai}}`,
+banner's sparkle button (**Resolve all with AI** on hover) reads the conflicted files first,
+showing a spinner while it does, then walks them in turn. It always leaves out files that
+are already resolved. With more than one file it also leaves out binary files, files too
+large for AI, symbolic links and files reached through one, files your AI ignore patterns
+exclude or whose names aren't readable text, and files with text that isn't UTF-8. One
+notice says what it skipped. The walk keeps its place while you peek at another tab (switching
+repositories ends it). It runs on any provider, including local Ollama and keyless Claude
+Code / Codex agents. A conflict that includes text that isn't UTF-8 is never sent to the
+model; resolve it with the whole-file accepts or your editor.{{/ai}}`,
   },
   {
     id: "pull-requests",
@@ -1274,7 +1345,8 @@ request** dialog offers an **Add upstream remote** button that wires it up for y
 
 ## GitHub PRs
 
-Browse open/closed PRs and open one in a full in-app view: description, commits, changed
+Browse PRs on three tabs (**Open**, **Merged**, and **Closed**, which holds the ones closed
+without merging) and open one in a full in-app view: description, commits, changed
 files with diffs, and CI checks. From there you can **comment** (with quote-reply),
 **review** (approve / comment / request changes), **edit** the title and body (and
 **retarget** the base branch, unless the PR is stacked), manage **labels**,
@@ -1332,8 +1404,10 @@ review, including commits, comments, and labels. The grouping covers the list as
 stands; a list grown past a few hundred rows can outrun the review check, and then it
 says so and leaves the list flat. The command palette carries every scope:
 **Show all pull requests**, **Filter pull requests: mine**, **Filter pull requests: needs
-my review**, and **Toggle grouping by my review**. The assignee, reviewer, author, and
-label axes work on **GitHub** and **GitLab**; **My teams** and the review grouping are
+my review**, and **Toggle grouping by my review**. It carries the state tabs too, as
+**Filter pull requests: open**, **Filter pull requests: merged**, and **Filter pull
+requests: closed**. The assignee, reviewer, author, and label axes work on **GitHub**
+and **GitLab**; **My teams** and the review grouping are
 GitHub-only, and on GitLab those two rows say so. On **Bitbucket** the switch doesn't
 appear, the funnel's **Mine** and **Author** rows name what it can't filter by
 (assignees, review requests, and authors), and a label pick narrows the pull requests
@@ -1353,6 +1427,13 @@ milestone added/removed, cross-referenced, issue linked/unlinked, and locked/unl
 commits since**), so an out-of-date verdict never reads as current. The feed works for
 **GitLab MRs**, **Bitbucket PRs**, and **local PRs** too — see their sections below for the
 events each one reports.
+A locked conversation shows a **locked** badge in the header, with GitHub's lock reason
+when it gives one. When GitHub or GitLab won't take a comment from you, the comment box
+and reactions turn read-only and the disabled button says why.
+{{ai}}Posting an AI review is held the same way.{{/ai}} On an archived GitHub pull
+request, the first refused comment{{ai}} or AI review post{{/ai}} explains the archive,
+and the box and reactions{{ai}}, and AI review posting,{{/ai}} stay read-only until you
+leave that pull request.
 
 CI checks appear as a **rollup summary** — **✓ N passed · ✕ M failed · ● K pending ·
 ⊖ J skipped**, each count with its own icon and word so status never rides on color
@@ -1395,11 +1476,12 @@ tabs and a formatting toolbar (bold, italic, headings, quote, code, links, and b
 / numbered / task lists, with {{key:mod+b}} / {{key:mod+i}} / {{key:mod+k}}); press
 {{key:mod+enter}} to submit a comment or save an edit. The same editor is everywhere
 you write Markdown — issues, discussions, and release notes. On **GitHub** and
-**GitLab** repos, typing **@** suggests people and **#** suggests the recently updated
-**open** issues and pull requests (on GitLab, **#** covers issues and **!** covers
-merge requests). That works in the comment box at the bottom of a pull request, issue,
-discussion, or commit, in replies, edits, line comments on a diff, and release notes,
-and in a local pull request's or issue's description and comment box; arrow keys move
+**GitLab** repos, typing **@** suggests people and **#** suggests recent issues and
+pull requests, open and closed, each marked with its state (on GitLab, **#** covers
+issues and **!** covers merge requests). That works in the comment box
+at the bottom of a pull request, issue, discussion, or commit, in replies,
+edits, line comments on a diff, and release notes, and in a local pull
+request's or issue's description and comment box; arrow keys move
 through the list, Enter or Tab accepts, and Esc dismisses it. The comment box itself
 folds to a one-line strip when you want more of the thread on screen: the caret at the
 left of its button row collapses it, and clicking the strip (or starting a quote reply)
@@ -1736,9 +1818,11 @@ release notes, squash message, script, publish, or repo settings),
 
 ## GitLab merge requests
 
-Point the app at a **GitLab** repo and the same tab lists its **merge requests** (open and
-closed/merged) next to any local PRs. Open one for the description, comments, commits, and a
-highlighted **diff** (with an **Open on GitLab** link) — and the GitLab MR writes:
+Point the app at a **GitLab** repo and the same tab lists its **merge requests** next to
+any local PRs, newest first, with merged and closed ones on their own **Merged** and
+**Closed** tabs. **Load 100 more** keeps adding merge requests up to 500. Open one for
+the description, comments, commits, and a highlighted **diff** (with a **GitLab** button
+that opens it in your browser) — and the GitLab MR writes:
 **comment** on it (and **edit** or **delete** your own comments), **close / reopen** it
 (closing asks first; either way your drafted comment posts alongside, as
 **request changes** does),
@@ -1856,6 +1940,8 @@ On a GitHub or GitLab repo the description and comment box complete **@** mentio
 **#** references (**!** merge requests too on GitLab) like the hosted ones, and render
 them as links you can click through. Rename a branch in GitDesktop (in the app or through
 its MCP server) and open local PRs whose head or base used the old name follow it.
+The create dialog counts the commits the merge would bring in. When the head branch is
+already in the base it says **Nothing to merge** and holds **Create**.
 
 Its Conversation is the same **date-sorted activity feed** as the hosted PRs: it opens with
 a **created** marker, interleaves the branch's **pushed commits** (grouped, each short SHA
@@ -1927,9 +2013,10 @@ pin a fixed limit that applies to every agent-CLI review. Whatever the reviewer 
 wrote is kept when the limit hits, for an automated pull-request review as much as one
 you started yourself: it stays on screen and is saved with the pull request, labelled
 **Timed out — partial output kept**, so it's still there after a restart. It also gets
-its own row under **Previous reviews**, where you can read, copy, or delete it like any
-other record. Kept output is never treated as a finished review — it doesn't feed the
-next run's context and doesn't count as coverage for an automated review, so run it
+its own row under **Previous reviews**, where you can read, copy, post, or delete it like
+any other record (posting kept output asks first, since the text may be incomplete).
+Kept output is never treated as a finished review — it doesn't feed the next run's
+context and doesn't count as coverage for an automated review, so run it
 again for a full one.
 
 **Critical** is the top severity an audit finding can carry — remote code execution,
@@ -1940,8 +2027,14 @@ breach.
 but you don't have to pick between a code review and a security audit: start one
 while the other is running and it **queues**, then starts automatically when the
 first finishes (whose result moves to **Previous reviews**, kept partial output
-included). A chip shows what's up next; **Dismiss** drops it, and cancelling the running
-review still lets the queued one proceed.
+included, where you can still post it). A chip shows what's up next; **Dismiss** drops
+it, and cancelling the running review still lets the queued one proceed.
+
+**Post a past review.** Every row under **Previous reviews** with text carries **Post as
+comment**, which posts that review to the pull request's conversation as written, even
+while another review streams. Once a review is posted, by you or by an automation that
+delivered it, its row says **Posted to the conversation** with the time, and the button
+becomes **Post again**, which asks before adding a second comment.
 
 **Agentic review.** The panel's **Agentic review** toggle gives the reviewer read-only
 tools so that, instead of relying on the prompt's truncated summary, it pulls the **full PR
@@ -3807,8 +3900,8 @@ Sections:
   pull-request entry opens that PR on the tab its event happened on, under the
   fork/upstream view it belongs to, so a new comment or approval lands on
   **Conversation** — and a review entry scrolls to the review itself. The
-  pull-request list itself switches to **Open** or **Closed** to match the PR's
-  current state, so one merged since the event still arrives selected. A failed
+  pull-request list itself switches to **Open**, **Merged**, or **Closed** to match the
+  PR's current state, so one merged since the event still arrives selected. A failed
   create's entry opens that repository's pull-request list. When the
   checkout an entry points to has been removed, GitDesktop opens another copy of
   that repository when it knows one; with none left it says so and changes

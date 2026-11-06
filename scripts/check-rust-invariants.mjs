@@ -123,6 +123,12 @@ const REFSPEC_ALLOWLIST = [
   },
   {
     file: "git/branches.rs",
+    fn: "git_unpushed_count",
+    rationale:
+      "interpolates only git_default_branch's own output: a remote HEAD's target or the literals main/master",
+  },
+  {
+    file: "git/branches.rs",
     fn: "git_branch_merge_states",
     rationale:
       "validates each pair's head/base with validate_branch_name inline",
@@ -420,6 +426,12 @@ const BARE_REV_ALLOWLIST = [
     fn: "preview_rev_failure",
     rationale:
       "classifies a failed `git show <rev>:<path>`: `base` is that same rev minus its trailing `~`/`^` navigation suffixes, so it must resolve exactly as the read did",
+  },
+  {
+    file: "git/history.rs",
+    fn: "off_branch_commits",
+    rationale:
+      "`head` is the commit id head_commit resolved once, refused at fn entry unless is_full_hex_id, never a branch name",
   },
   {
     file: "git/ops.rs",
